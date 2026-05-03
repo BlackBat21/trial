@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 3.1.1 (Restored Interactive Domain Prompt + Day-based Expiry TUI)
+# Version : 3.1.2 (Bugfix: Force-kill active SSH sessions on user delete)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="3.1.1"
+readonly SCRIPT_VERSION="3.1.2"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
@@ -63,7 +63,6 @@ parse_args() {
         esac
     done
 
-    # RESTORED INTERACTIVE PROMPT
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
         read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
@@ -247,7 +246,7 @@ WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable xray
 
-    # Nginx Configuration (Moved to Port 81 to leave 80 open for Python proxy)
+    # Nginx Configuration
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
     cat > "${NGINX_CONF_DIR}/autoxray-443.conf" <<NGINX_CONF
 server {
@@ -272,7 +271,7 @@ server {
 }
 NGINX_CONF
 
-    # AutoScriptX Python Proxy (Binds to 80, forwards Xray to 81, upgrades everything else to SSH 22)
+    # AutoScriptX Python Proxy
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
 import socket, threading
@@ -344,16 +343,13 @@ harden_system() {
     ufw --force reset; ufw default deny incoming; ufw default allow outgoing
     ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw --force enable
     
-    # Destroy AWS/Cloud-Init overrides that block passwords
     rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
 
-    # Force SSH to accept passwords
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
     echo -e "PasswordAuthentication yes\nKbdInteractiveAuthentication yes" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
-    # Whitelist VPN Shell
     grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
 
     systemctl restart ssh || systemctl restart sshd
@@ -361,7 +357,7 @@ harden_system() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ADVANCED TUI MANAGER (WITH DAY-BASED EXPIRY MATH)
+#  ADVANCED TUI MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_manage_script() {
@@ -435,7 +431,9 @@ delete_account() {
     if grep -q "^${del_user}," "$CSV_DB"; then
         svc=$(grep "^${del_user}," "$CSV_DB" | cut -d, -f2)
         if [[ "$svc" == "SSH" ]]; then
-            userdel -r "$del_user" 2>/dev/null || true
+            # FIX: Forcefully sever the SSH connection before deleting the user
+            pkill -9 -u "$del_user" 2>/dev/null || true
+            userdel -f -r "$del_user" 2>/dev/null || true
         elif [[ "$svc" == "Xray" ]]; then
             jq --arg user "$del_user" '
               .inbounds |= map(
