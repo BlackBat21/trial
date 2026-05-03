@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Ubuntu 24 VPS Edition
-# Version : 3.0.1 (Bugfix: DAT assets, SSH.socket bypass, Uninstall added)
+# Version : 3.0.2 (Bugfix: Replaced acme.sh with native Certbot)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="3.0.1"
+readonly SCRIPT_VERSION="3.0.2"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
@@ -21,7 +21,6 @@ readonly XRAY_SERVICE="/etc/systemd/system/xray.service"
 readonly NGINX_CONF_DIR="/etc/nginx/conf.d"
 readonly TLS_DIR="/etc/ssl/autoxray"
 readonly WEBSOCKIFY_PORT=2082
-readonly ACME_HOME="/root/.acme.sh"
 
 readonly PORT_VLESS_WS=10001
 readonly PORT_VMESS_WS=10002
@@ -62,7 +61,6 @@ parse_args() {
         esac
     done
 
-    # INTERACTIVE PROMPT
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
         read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
@@ -127,17 +125,20 @@ provision_tls() {
     server_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
     if [[ -n "$DOMAIN" ]]; then
-        info "Installing Let's Encrypt for ${DOMAIN}"
-        [[ ! -f "${ACME_HOME}/acme.sh" ]] && curl -fsSL https://get.acme.sh | bash -s -- --install-online --email "$EMAIL" >> "$LOG_FILE" 2>&1
+        info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
         systemctl stop nginx 2>/dev/null || true
         
-        if "${ACME_HOME}/acme.sh" --issue --standalone --domain "$DOMAIN" --keylength ec-256 --server letsencrypt --force >> "$LOG_FILE" 2>&1; then
-            "${ACME_HOME}/acme.sh" --install-cert --domain "$DOMAIN" --ecc \
-                --cert-file "${TLS_DIR}/cert.pem" --key-file "${TLS_DIR}/key.pem" --fullchain-file "${TLS_DIR}/fullchain.pem" \
-                --reloadcmd "systemctl reload nginx" >> "$LOG_FILE" 2>&1
-            log "Let's Encrypt installed for ${DOMAIN}."
+        # Using certbot standalone to issue cert and setting a deploy hook for auto-renewals
+        if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa \
+            --deploy-hook "cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TLS_DIR}/fullchain.pem && cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem && systemctl reload nginx" >> "$LOG_FILE" 2>&1; then
+            
+            cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
+            cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
+            cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
+            log "Let's Encrypt installed successfully for ${DOMAIN}."
         else
-            warn "ACME failed — falling back to self-signed."
+            warn "Certbot ACME failed — falling back to self-signed."
+            warn "To see the exact Certbot error, check: /var/log/letsencrypt/letsencrypt.log"
             DOMAIN=""
         fi
     fi
@@ -167,7 +168,6 @@ install_xray() {
     wget -q --show-progress -O "${tmp_dir}/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip"
     unzip -qo "${tmp_dir}/xray.zip" -d "${tmp_dir}/xray"
     
-    # FIX: Install binary AND the .dat routing files
     install -m 755 "${tmp_dir}/xray/xray" "$XRAY_BIN"
     cp "${tmp_dir}/xray/"*.dat "/usr/local/bin/" 2>/dev/null || true
     
@@ -188,7 +188,6 @@ TROJAN_PASS="${trojan_pass}"
 DOMAIN="${DOMAIN}"
 EOF
 
-    # Initialize CSV database
     echo "Username,ServiceType,Secret,ExpiryDate" > "$CSV_DB"
     echo "admin_vless,Xray,${uuid_vless},Never" >> "$CSV_DB"
     echo "admin_vmess,Xray,${uuid_vmess},Never" >> "$CSV_DB"
@@ -235,7 +234,6 @@ XRAY_JSON
 install_services() {
     section "Configuring Services"
     
-    # 1. Xray Systemd
     cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
 Description=Xray Service
@@ -251,7 +249,6 @@ WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable xray
 
-    # 2. SSH-WebSocket Systemd (FIX: Removed strict ssh.service dependency)
     apt-get install -y -qq websockify >/dev/null
     cat > /etc/systemd/system/ssh-websocket.service <<SERVICE
 [Unit]
@@ -267,12 +264,17 @@ WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable ssh-websocket
 
-    # 3. Nginx
     rm -f /etc/nginx/sites-enabled/default
     cat > "${NGINX_CONF_DIR}/autoxray-443.conf" <<NGINX_443
 server {
-    listen 443 ssl http2; server_name _;
+    listen 80; listen [::]:80;
+    listen 443 ssl http2; listen [::]:443 ssl http2;
+    server_name _;
     ssl_certificate ${TLS_DIR}/fullchain.pem; ssl_certificate_key ${TLS_DIR}/key.pem;
+    
+    # Auto-redirect HTTP to HTTPS if accessed on 80
+    if (\$scheme != "https") { return 301 https://\$host\$request_uri; }
+
     location /vless-ws { proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
@@ -290,7 +292,6 @@ harden_system() {
     ufw --force reset; ufw default deny incoming; ufw default allow outgoing
     ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw --force enable
     
-    # Harden SSH
     sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords no/' /etc/ssh/sshd_config
     systemctl restart ssh || systemctl restart sshd
     log "System Hardened."
@@ -342,7 +343,6 @@ create_account() {
         echo -e "${GREEN}SSH User $u_name created!${NC}"
     elif [[ "$s_type" == "2" ]]; then
         u_uuid=$(/usr/local/bin/xray uuid)
-        # Safely inject user into JSON via jq for both VLESS and VMESS
         jq --arg user "$u_name" --arg uuid "$u_uuid" '
           .inbounds |= map(
             if .protocol == "vless" and .settings.clients then
@@ -390,10 +390,7 @@ renew_account() {
     if grep -q "^${ren_user}," "$CSV_DB"; then
         read -rp "New Expiry Date (YYYY-MM-DD): " new_exp
         svc=$(grep "^${ren_user}," "$CSV_DB" | cut -d, -f2)
-        # Update CSV
         sed -i "s/^${ren_user},${svc},.*,.*/${ren_user},${svc},$(grep "^${ren_user}," "$CSV_DB" | cut -d, -f3),${new_exp}/" "$CSV_DB"
-        
-        # System update for SSH
         [[ "$svc" == "SSH" ]] && chage -E "$new_exp" "$ren_user"
         echo -e "${GREEN}User $ren_user renewed to $new_exp.${NC}"
     else
