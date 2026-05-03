@@ -72,6 +72,10 @@ SKIP_HARDENING="false"
 UNINSTALL="false"
 
 parse_args() {
+    # Check if an existing installation is present
+    local is_installed="false"
+    [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]] && is_installed="true"
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain)         DOMAIN="${2:-}";  shift 2 ;;
@@ -85,6 +89,13 @@ parse_args() {
             *) die "Unknown option: $1" ;;
         esac
     done
+
+    # Bypass interactive prompts if updating an existing system
+    if [[ "$is_installed" == "true" && "$UNINSTALL" == "false" ]]; then
+        info "Existing installation detected. Bypassing domain/email setup to prevent data loss."
+        [[ -f "${XRAY_DIR}/credentials.env" ]] && source "${XRAY_DIR}/credentials.env"
+        return
+    fi
 
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
@@ -118,7 +129,7 @@ prepare_system() {
     apt-get update -qq
     apt-get install -y -qq curl wget unzip jq socat coreutils nginx certbot \
         python3-certbot-nginx ufw fail2ban ca-certificates openssl \
-        net-tools iproute2 lsof logrotate cron 2>&1 | tee -a "$LOG_FILE"
+        net-tools iproute2 lsof logrotate cron iptables-persistent 2>&1 | tee -a "$LOG_FILE"
     log "Base packages installed."
 }
 
@@ -143,6 +154,13 @@ SYSCTL
 
 provision_tls() {
     section "TLS Certificate Provisioning"
+    
+    # Skip TLS provisioning to prevent Let's Encrypt rate limits and overwrites on update
+    if [[ -f "${TLS_DIR}/fullchain.pem" && -f "$CSV_DB" ]]; then
+        log "TLS certificates already exist. Skipping provisioning."
+        return
+    fi
+
     mkdir -p "$TLS_DIR"
     local server_ip
     server_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
@@ -207,6 +225,13 @@ install_xray() {
 
 configure_xray() {
     section "Configuring Xray-core"
+
+    # Prevent config and user wipe on script updates
+    if [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]]; then
+        log "Existing Xray configuration and database detected. Skipping regeneration."
+        return
+    fi
+
     local uuid_vless
     uuid_vless=$("$XRAY_BIN" uuid)
     local uuid_vmess
@@ -229,6 +254,16 @@ EOF
     cat > "${XRAY_DIR}/config.json" <<XRAY_JSON
 {
   "log": { "loglevel": "warning" },
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "protocol": ["bittorrent"],
+        "outboundTag": "blocked"
+      }
+    ]
+  },
   "inbounds": [
     {
       "tag": "vless-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS},
@@ -237,7 +272,8 @@ EOF
         "clients": [{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }],
         "decryption": "none"
       },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
     {
       "tag": "vmess-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS},
@@ -245,7 +281,8 @@ EOF
       "settings": {
         "clients": [{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }]
       },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
     {
       "tag": "trojan-ws-tls", "listen": "127.0.0.1", "port": ${PORT_TROJAN_WS},
@@ -253,7 +290,8 @@ EOF
       "settings": {
         "clients": [{ "password": "${trojan_pass}", "email": "admin_trojan" }]
       },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan-ws" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan-ws" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
     {
       "tag": "vless-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS_NOTLS},
@@ -262,7 +300,8 @@ EOF
         "clients": [{ "id": "${uuid_vless}", "flow": "" }],
         "decryption": "none"
       },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws-nt" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws-nt" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
     {
       "tag": "vmess-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS_NOTLS},
@@ -270,7 +309,8 @@ EOF
       "settings": {
         "clients": [{ "id": "${uuid_vmess}", "alterId": 0 }]
       },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws-nt" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws-nt" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
   "outbounds": [
@@ -409,7 +449,25 @@ harden_system() {
     ufw allow 22/tcp
     ufw allow 80/tcp
     ufw allow 443/tcp
+
+    # Anti-Torrent: Block common BitTorrent ports
+    ufw deny out 6881:6889/tcp
+    ufw deny out 6881:6889/udp
+    
     ufw --force enable
+
+    # Anti-Torrent: Advanced deep packet inspection for BitTorrent strings
+    iptables -A FORWARD -m string --algo bm --string "BitTorrent" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "BitTorrent protocol" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "peer_id=" -j DROP
+    iptables -A FORWARD -m string --algo bm --string ".torrent" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "announce.php?passkey=" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "torrent" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "announce" -j DROP
+    iptables -A FORWARD -m string --algo bm --string "info_hash" -j DROP
+    
+    # Silently attempt to save iptables rules (will persist if iptables-persistent is installed)
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
     # ── SSH hardening ─────────────────────────────────────────────────────────
     rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf         2>/dev/null || true
@@ -441,7 +499,7 @@ harden_system() {
 BANNER
 
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-    log "System hardened. SSH banner written to /etc/issue.net."
+    log "System hardened. SSH banner written and Anti-Torrent protections applied."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
