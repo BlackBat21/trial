@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 3.1.2 (Bugfix: Force-kill active SSH sessions on user delete)
+# Version : 3.1.3 (Feature: Display full account details & URIs on creation)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="3.1.2"
+readonly SCRIPT_VERSION="3.1.3"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
@@ -230,7 +230,6 @@ XRAY_JSON
 install_services() {
     section "Configuring Services"
     
-    # Xray Systemd
     cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
 Description=Xray Service
@@ -246,7 +245,6 @@ WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable xray
 
-    # Nginx Configuration
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
     cat > "${NGINX_CONF_DIR}/autoxray-443.conf" <<NGINX_CONF
 server {
@@ -271,7 +269,6 @@ server {
 }
 NGINX_CONF
 
-    # AutoScriptX Python Proxy
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
 import socket, threading
@@ -404,7 +401,17 @@ create_account() {
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
         echo "${u_name},SSH,${u_pass},${u_exp}" >> "$CSV_DB"
-        echo -e "${GREEN}SSH User $u_name created! Expires: $u_exp${NC}"
+        
+        echo ""
+        echo -e "${BOLD}${GREEN}✔ SSH Account Created Successfully!${NC}"
+        echo -e "────────────────────────────────────────"
+        echo -e " ${BOLD}Username${NC}       : $u_name"
+        echo -e " ${BOLD}Pass${NC}           : $u_pass"
+        echo -e " ${BOLD}Expiration${NC}     : $u_exp"
+        echo -e " ${BOLD}Available port${NC} : 80 (WS), 443 (WSS), 22 (SSH)"
+        echo -e "────────────────────────────────────────"
+        echo ""
+        
     elif [[ "$s_type" == "2" ]]; then
         u_uuid=$(/usr/local/bin/xray uuid)
         jq --arg user "$u_name" --arg uuid "$u_uuid" '
@@ -418,7 +425,23 @@ create_account() {
         
         systemctl restart xray
         echo "${u_name},Xray,${u_uuid},${u_exp}" >> "$CSV_DB"
-        echo -e "${GREEN}Xray User $u_name created! Expires: $u_exp${NC}"
+        
+        v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
+        v_b64=$(echo -n "$v_json" | base64 -w0)
+
+        echo ""
+        echo -e "${BOLD}${GREEN}✔ Xray Account Created Successfully!${NC}"
+        echo -e "────────────────────────────────────────"
+        echo -e " ${BOLD}Username${NC}       : $u_name"
+        echo -e " ${BOLD}Expiration${NC}     : $u_exp"
+        echo -e "────────────────────────────────────────"
+        echo -e "${CYAN}VLESS URI:${NC}"
+        echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&headerType=none&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS"
+        echo ""
+        echo -e "${CYAN}VMESS URI:${NC}"
+        echo "vmess://${v_b64}"
+        echo -e "────────────────────────────────────────"
+        echo ""
     fi
     read -rp "Press Enter to return..."
 }
@@ -431,7 +454,6 @@ delete_account() {
     if grep -q "^${del_user}," "$CSV_DB"; then
         svc=$(grep "^${del_user}," "$CSV_DB" | cut -d, -f2)
         if [[ "$svc" == "SSH" ]]; then
-            # FIX: Forcefully sever the SSH connection before deleting the user
             pkill -9 -u "$del_user" 2>/dev/null || true
             userdel -f -r "$del_user" 2>/dev/null || true
         elif [[ "$svc" == "Xray" ]]; then
