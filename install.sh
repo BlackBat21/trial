@@ -429,22 +429,14 @@ harden_system() {
 
     grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
 
-    # ── Futuristic SSH Banner (/etc/issue.net) ────────────────────────────────
+    # ── SSH Login Banner (/etc/issue.net) ────────────────────────
     cat > /etc/issue.net <<'BANNER'
 
-  ╔══════════════════════════════════════════════════════════════════════╗
-  ║                                                                      ║
-  ║    ░█████╗░██╗░░░██╗████████╗░█████╗░██╗░░██╗██████╗░░█████╗░██╗░░ ║
-  ║    ██╔══██╗██║░░░██║╚══██╔══╝██╔══██╗╚██╗██╔╝██╔══██╗██╔══██╗╚██╗░ ║
-  ║    ███████║██║░░░██║░░░██║░░░██║░░██║░╚███╔╝░██████╔╝███████║░╚██╗ ║
-  ║    ██╔══██║██║░░░██║░░░██║░░░██║░░██║░██╔██╗░██╔══██╗██╔══██║░██╔╝ ║
-  ║    ██║░░██║╚██████╔╝░░░██║░░░╚█████╔╝██╔╝╚██╗██║░░██║██║░░██║██╔╝░ ║
-  ║    ╚═╝░░╚═╝░╚═════╝░░░╚═╝░░░░╚════╝░╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░ ║
-  ║                                                                      ║
-  ║   [ AUTHORIZED ACCESS ONLY ]          [ CONNECTIONS ARE MONITORED ] ║
-  ║   [ ALL ACTIVITY IS LOGGED  ]          [ VIOLATORS WILL BE TRACED ] ║
-  ║                                                                      ║
-  ╚══════════════════════════════════════════════════════════════════════╝
+  ┌─────────────────────────────────────────────┐
+  │         PHC-Lanz ScriptX                    │
+  │         Authorized Access Only              │
+  │         All activity is monitored & logged  │
+  └─────────────────────────────────────────────┘
 
 BANNER
 
@@ -506,20 +498,15 @@ draw_header() {
     up=$(uptime -p 2>/dev/null || echo "N/A")
     ram=$(free -m 2>/dev/null | awk 'NR==2{printf "%s/%s MB (%.1f%%)", $3,$2,$3*100/$2}')
 
-    # ── ASCII art (cyan + magenta accent) ────────────────────────
-    echo -e "${BCYAN}"
-    echo '  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
-    echo ''
-    echo '  ██████╗  █████╗  ██╗   ██╗████████╗ ██████╗ ██╗  ██╗██████╗  █████╗ ██╗   ██╗'
-    echo '  ██╔══██╗██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗╚██╗██╔╝██╔══██╗██╔══██╗╚██╗ ██╔╝'
-    echo '  ███████║██║  ██║██║   ██║   ██║   ██║   ██║ ╚███╔╝ ██████╔╝███████║ ╚████╔╝ '
-    echo '  ██╔══██║██║  ██║██║   ██║   ██║   ██║   ██║ ██╔██╗ ██╔══██╗██╔══██║  ╚██╔╝  '
-    echo '  ██║  ██║╚█████╔╝╚██████╔╝   ██║   ╚██████╔╝██╔╝╚██╗██║  ██║██║  ██║   ██║   '
-    echo '  ╚═╝  ╚═╝ ╚════╝  ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝  '
-    echo ''
-    echo -e "  ${BMAGENTA}E L I T E   V P N   M A N A G E M E N T   S Y S T E M${BCYAN}"
-    echo '  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
-    echo -e "${NC}"
+    # ── Clean title banner ────────────────────────────────────────
+    echo ""
+    echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.0${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 
     # ── System stats bar ─────────────────────────────────────────
     echo -e "  ${BBLUE}┌──────────────────────────────────────────────────────────────────────┐${NC}"
@@ -1060,19 +1047,13 @@ start_services() {
 
 print_summary() {
     echo ""
-    echo -e "${BCYAN}"
-    echo '  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
-    echo ''
-    echo '  ██████╗  ██████╗ ███╗   ██╗███████╗██╗'
-    echo '  ██╔══██╗██╔═══██╗████╗  ██║██╔════╝██║'
-    echo '  ██║  ██║██║   ██║██╔██╗ ██║█████╗  ██║'
-    echo '  ██║  ██║██║   ██║██║╚██╗██║██╔══╝  ╚═╝'
-    echo '  ██████╔╝╚██████╔╝██║ ╚████║███████╗██╗'
-    echo '  ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝'
-    echo ''
-    echo -e "  ${BMAGENTA}Installation Complete — AutoXray Cyberpunk Elite v${SCRIPT_VERSION}${BCYAN}"
-    echo '  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
-    echo -e "${NC}"
+    echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}PHC-Lanz ScriptX${NC}  —  Installation Complete ${GCHECK}          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}v${SCRIPT_VERSION}${NC}                                                  ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
     echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}autoxray${NC} to launch the management console."
     echo -e "  ${GCHECK}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
     echo -e "  ${GCHECK}  Logs: ${BOLD}${LOG_FILE}${NC}"
