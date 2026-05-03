@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 3.1.0 (AutoScriptX Python Proxy + Day-based Expiry TUI)
+# Version : 3.1.1 (Restored Interactive Domain Prompt + Day-based Expiry TUI)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
@@ -25,7 +25,6 @@ readonly ACME_HOME="/root/.acme.sh"
 readonly PORT_VLESS_WS=10001
 readonly PORT_VMESS_WS=10002
 readonly PORT_TROJAN_WS=10003
-readonly PORT_VLESS_GRPC=10004
 readonly PORT_VLESS_WS_NOTLS=10011
 readonly PORT_VMESS_WS_NOTLS=10012
 
@@ -63,6 +62,16 @@ parse_args() {
             *) die "Unknown option: $1" ;;
         esac
     done
+
+    # RESTORED INTERACTIVE PROMPT
+    if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
+        echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
+        read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
+        if [[ "$configure_tls" =~ ^[Yy]$ ]]; then
+            read -rp "Enter Domain (e.g., vpn.example.com): " DOMAIN </dev/tty
+            read -rp "Enter Email for Let's Encrypt (e.g., admin@example.com): " EMAIL </dev/tty
+        fi
+    fi
 
     if [[ -n "$DOMAIN" && -z "$EMAIL" ]]; then
         die "--email is required when --domain is specified."
@@ -114,6 +123,23 @@ provision_tls() {
     section "TLS certificate provisioning"
     mkdir -p "$TLS_DIR"
     local server_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+
+    if [[ -n "$DOMAIN" ]]; then
+        info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
+        systemctl stop nginx 2>/dev/null || true
+        
+        if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa \
+            --deploy-hook "cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TLS_DIR}/fullchain.pem && cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem && systemctl reload nginx" >> "$LOG_FILE" 2>&1; then
+            
+            cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
+            cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
+            cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
+            log "Let's Encrypt installed successfully for ${DOMAIN}."
+        else
+            warn "Certbot ACME failed — falling back to self-signed."
+            DOMAIN=""
+        fi
+    fi
 
     if [[ -z "$DOMAIN" ]] || [[ ! -f "${TLS_DIR}/fullchain.pem" ]]; then
         info "Generating self-signed certificate..."
