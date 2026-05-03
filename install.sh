@@ -503,13 +503,13 @@ BANNER
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ELITE TUI MANAGER  (/usr/local/bin/autoxray)
+#  ELITE TUI MANAGER  (/usr/local/bin/menu)
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_manage_script() {
     section "Installing Elite Cyberpunk TUI Manager"
 
-    cat > /usr/local/bin/autoxray <<'MANAGE'
+    cat > /usr/local/bin/menu <<'MANAGE'
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
 # AutoXray Cyberpunk TUI Manager  v4.0.0
@@ -1004,7 +1004,7 @@ update_script_and_core() {
         echo ""
         echo -e "   ${GINFO}  Applying new AutoXray manager..."
         chmod +x "${tmp_dir}/autoxray_new"
-        cp "${tmp_dir}/autoxray_new" /usr/local/bin/autoxray
+        cp "${tmp_dir}/autoxray_new" /usr/local/bin/menu
         echo -e "   ${GCHECK} Manager updated."
     fi
 
@@ -1013,7 +1013,7 @@ update_script_and_core() {
     echo ""
     echo -e "   ${GCHECK}  ${BOLD}${GREEN}Update complete! Re-launching manager...${NC}"
     sleep 2
-    exec /usr/local/bin/autoxray
+    exec /usr/local/bin/menu
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -1035,7 +1035,7 @@ uninstall_autoxray() {
               /etc/systemd/system/ssh-websocket.service
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
         rm -f /usr/local/bin/xray \
-              /usr/local/bin/autoxray \
+              /usr/local/bin/menu \
               /usr/local/bin/ws-proxy.py \
               /etc/nginx/conf.d/autoxray-*.conf
         systemctl daemon-reload
@@ -1066,8 +1066,8 @@ while true; do
 done
 MANAGE
 
-    chmod +x /usr/local/bin/autoxray
-    log "Cyberpunk TUI manager installed → run: autoxray"
+    chmod +x /usr/local/bin/menu
+    log "Cyberpunk TUI manager installed → run: menu"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1083,7 +1083,7 @@ do_uninstall() {
           /etc/systemd/system/ssh-websocket.service
     rm -rf /usr/local/etc/xray /etc/ssl/autoxray
     rm -f /usr/local/bin/xray \
-          /usr/local/bin/autoxray \
+          /usr/local/bin/menu \
           /usr/local/bin/ws-proxy.py \
           /etc/nginx/conf.d/autoxray-*.conf
     systemctl daemon-reload
@@ -1112,7 +1112,7 @@ print_summary() {
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}autoxray${NC} to launch the management console."
+    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}menu${NC} to launch the management console."
     echo -e "  ${GCHECK}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
     echo -e "  ${GCHECK}  Logs: ${BOLD}${LOG_FILE}${NC}"
     echo ""
