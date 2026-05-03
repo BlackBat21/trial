@@ -165,35 +165,56 @@ provision_tls() {
     local server_ip
     server_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
+    local cert_issued="false"
+
     if [[ -n "$DOMAIN" ]]; then
         info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
-        systemctl stop nginx 2>/dev/null || true
+        
+        # Aggressively kill anything listening on port 80 to ensure Certbot standalone works
+        systemctl stop nginx apache2 ws-proxy 2>/dev/null || true
+        fuser -k 80/tcp 2>/dev/null || true
 
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" \
-            --non-interactive --agree-tos --key-type ecdsa \
-            --deploy-hook "cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TLS_DIR}/fullchain.pem \
-                        && cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem \
-                        && systemctl reload nginx" >> "$LOG_FILE" 2>&1; then
+            --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
 
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"  "${TLS_DIR}/key.pem"
+            
+            # Create a reliable renewal hook
+            mkdir -p /etc/letsencrypt/renewal-hooks/deploy/
+            cat > /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh <<EOF
+#!/bin/bash
+cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TLS_DIR}/fullchain.pem
+cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem
+systemctl reload nginx
+EOF
+            chmod +x /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh
+
             log "Let's Encrypt installed successfully for ${DOMAIN}."
+            cert_issued="true"
         else
-            warn "Certbot ACME failed — falling back to self-signed."
-            DOMAIN=""
+            warn "Certbot ACME failed — falling back to a self-signed certificate."
         fi
     fi
 
-    if [[ -z "$DOMAIN" ]] || [[ ! -f "${TLS_DIR}/fullchain.pem" ]]; then
+    if [[ "$cert_issued" == "false" ]]; then
         info "Generating self-signed certificate..."
+        local cert_cn="${DOMAIN:-$server_ip}"
+
         openssl req -x509 -newkey rsa:4096 \
             -keyout "${TLS_DIR}/key.pem" -out "${TLS_DIR}/fullchain.pem" \
             -days 3650 -nodes \
-            -subj "/CN=autoxray/O=AutoXray/C=US" \
+            -subj "/CN=${cert_cn}/O=AutoXray/C=US" \
             -addext "subjectAltName=IP:${server_ip}" >> "$LOG_FILE" 2>&1
+        
         cp "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/cert.pem"
-        DOMAIN="${server_ip}"
+        
+        # Only fall back to IP if the user completely skipped the domain prompt
+        if [[ -z "$DOMAIN" ]]; then
+            DOMAIN="${server_ip}"
+        fi
+        
         log "Self-signed certificate generated."
     fi
 }
