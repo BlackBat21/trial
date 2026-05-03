@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Ubuntu 24 VPS Edition
-# Version : 3.0.0 (Elite TUI & Standardized URI Edition)
+# Version : 3.0.1 (Bugfix: DAT assets, SSH.socket bypass, Uninstall added)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
@@ -26,9 +26,6 @@ readonly ACME_HOME="/root/.acme.sh"
 readonly PORT_VLESS_WS=10001
 readonly PORT_VMESS_WS=10002
 readonly PORT_TROJAN_WS=10003
-readonly PORT_VLESS_GRPC=10004
-readonly PORT_VLESS_WS_NOTLS=10011
-readonly PORT_VMESS_WS_NOTLS=10012
 
 RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'; CYAN='\033[0;36m'
@@ -65,7 +62,7 @@ parse_args() {
         esac
     done
 
-    # INTERACTIVE PROMPT (bypassing curl|bash pipe using /dev/tty)
+    # INTERACTIVE PROMPT
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
         read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
@@ -169,10 +166,14 @@ install_xray() {
     
     wget -q --show-progress -O "${tmp_dir}/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip"
     unzip -qo "${tmp_dir}/xray.zip" -d "${tmp_dir}/xray"
+    
+    # FIX: Install binary AND the .dat routing files
     install -m 755 "${tmp_dir}/xray/xray" "$XRAY_BIN"
+    cp "${tmp_dir}/xray/"*.dat "/usr/local/bin/" 2>/dev/null || true
+    
     rm -rf "$tmp_dir"
     mkdir -p "${XRAY_DIR}/conf"
-    log "Xray-core ${latest_tag} installed."
+    log "Xray-core ${latest_tag} installed with routing assets."
 }
 
 configure_xray() {
@@ -250,13 +251,12 @@ WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable xray
 
-    # 2. SSH-WebSocket Systemd (Fixing dependency to ssh.service)
+    # 2. SSH-WebSocket Systemd (FIX: Removed strict ssh.service dependency)
     apt-get install -y -qq websockify >/dev/null
     cat > /etc/systemd/system/ssh-websocket.service <<SERVICE
 [Unit]
 Description=SSH over WebSocket
-After=network.target ssh.service
-Requires=ssh.service
+After=network.target
 [Service]
 Type=simple
 User=nobody
@@ -265,7 +265,7 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 SERVICE
-    systemctl enable ssh-websocket
+    systemctl daemon-reload; systemctl enable ssh-websocket
 
     # 3. Nginx
     rm -f /etc/nginx/sites-enabled/default
@@ -290,7 +290,7 @@ harden_system() {
     ufw --force reset; ufw default deny incoming; ufw default allow outgoing
     ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw --force enable
     
-    # Harden SSH (Replacing sshd with ssh.service restart)
+    # Harden SSH
     sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords no/' /etc/ssh/sshd_config
     systemctl restart ssh || systemctl restart sshd
     log "System Hardened."
@@ -421,6 +421,22 @@ manage_services() {
     if [[ "$rst" =~ ^[Yy]$ ]]; then systemctl restart xray nginx ssh-websocket fail2ban; fi
 }
 
+uninstall_autoxray() {
+    read -rp "WARNING: This will completely remove AutoXray. Proceed? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Uninstalling components..."
+        systemctl stop xray ssh-websocket 2>/dev/null || true
+        systemctl disable xray ssh-websocket 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service /etc/systemd/system/ssh-websocket.service
+        rm -rf /usr/local/etc/xray /etc/ssl/autoxray
+        rm -f /usr/local/bin/xray /usr/local/bin/autoxray /etc/nginx/conf.d/autoxray-*.conf
+        systemctl daemon-reload
+        systemctl reload nginx 2>/dev/null || true
+        echo -e "${GREEN}Uninstallation complete. Manager will now exit.${NC}"
+        exit 0
+    fi
+}
+
 while true; do
     draw_header
     echo "  1) Create Account"
@@ -429,6 +445,7 @@ while true; do
     echo "  4) List Users Database"
     echo "  5) Show Admin Standard URIs"
     echo "  6) Manage Services"
+    echo "  7) Uninstall AutoXray Script"
     echo "  x) Exit Manager"
     echo ""
     read -rp "Select an option: " opt
@@ -439,6 +456,7 @@ while true; do
         4) column -s, -t < "$CSV_DB" | nl; read -rp "Press Enter to return..." ;;
         5) show_links ;;
         6) manage_services ;;
+        7) uninstall_autoxray ;;
         x) clear; exit 0 ;;
         *) echo "Invalid option." ; sleep 1 ;;
     esac
@@ -454,8 +472,9 @@ MANAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
 do_uninstall() {
-    section "Uninstalling AutoXray"
-    for svc in xray ssh-websocket; do systemctl stop "$svc" 2>/dev/null; systemctl disable "$svc" 2>/dev/null; done
+    section "Uninstalling AutoXray via Argument"
+    systemctl stop xray ssh-websocket 2>/dev/null || true
+    systemctl disable xray ssh-websocket 2>/dev/null || true
     rm -f /etc/systemd/system/xray.service /etc/systemd/system/ssh-websocket.service
     rm -rf /usr/local/etc/xray /etc/ssl/autoxray
     rm -f /usr/local/bin/xray /usr/local/bin/autoxray /etc/nginx/conf.d/autoxray-*.conf
