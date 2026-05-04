@@ -47,7 +47,6 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Neon glyph shortcuts
 GCHECK="${GREEN}✔${NC}"
 GCROSS="${RED}✖${NC}"
 GWARN="${YELLOW}⚡${NC}"
@@ -72,7 +71,6 @@ SKIP_HARDENING="false"
 UNINSTALL="false"
 
 parse_args() {
-    # Check if an existing installation is present
     local is_installed="false"
     [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]] && is_installed="true"
 
@@ -90,9 +88,11 @@ parse_args() {
         esac
     done
 
-    # Bypass interactive prompts if updating an existing system
+    # Bypass interactive prompts and trigger backups if updating
     if [[ "$is_installed" == "true" && "$UNINSTALL" == "false" ]]; then
-        info "Existing installation detected. Bypassing domain/email setup to prevent data loss."
+        info "Existing installation detected. Bypassing setup and backing up data..."
+        cp "$CSV_DB" "${BACKUP_DIR}/users_$(date +%F_%H%M%S).csv" 2>/dev/null || true
+        cp "${XRAY_DIR}/config.json" "${BACKUP_DIR}/config_$(date +%F_%H%M%S).json" 2>/dev/null || true
         [[ -f "${XRAY_DIR}/credentials.env" ]] && source "${XRAY_DIR}/credentials.env"
         return
     fi
@@ -155,7 +155,6 @@ SYSCTL
 provision_tls() {
     section "TLS Certificate Provisioning"
     
-    # Skip TLS provisioning to prevent Let's Encrypt rate limits and overwrites on update
     if [[ -f "${TLS_DIR}/fullchain.pem" && -f "$CSV_DB" ]]; then
         log "TLS certificates already exist. Skipping provisioning."
         return
@@ -169,8 +168,6 @@ provision_tls() {
 
     if [[ -n "$DOMAIN" ]]; then
         info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
-        
-        # Aggressively kill anything listening on port 80 to ensure Certbot standalone works
         systemctl stop nginx apache2 ws-proxy 2>/dev/null || true
         fuser -k 80/tcp 2>/dev/null || true
 
@@ -181,7 +178,6 @@ provision_tls() {
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"  "${TLS_DIR}/key.pem"
             
-            # Create a reliable renewal hook
             mkdir -p /etc/letsencrypt/renewal-hooks/deploy/
             cat > /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh <<EOF
 #!/bin/bash
@@ -210,7 +206,6 @@ EOF
         
         cp "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/cert.pem"
         
-        # Only fall back to IP if the user completely skipped the domain prompt
         if [[ -z "$DOMAIN" ]]; then
             DOMAIN="${server_ip}"
         fi
@@ -247,7 +242,6 @@ install_xray() {
 configure_xray() {
     section "Configuring Xray-core"
 
-    # Prevent config and user wipe on script updates
     if [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]]; then
         log "Existing Xray configuration and database detected. Skipping regeneration."
         return
@@ -456,14 +450,13 @@ SERVICE
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SECURITY HARDENING  (incl. SSH Banner — Requirement 4)
+#  SECURITY HARDENING
 # ─────────────────────────────────────────────────────────────────────────────
 
 harden_system() {
     section "Security Hardening"
     [[ "$SKIP_HARDENING" == "true" ]] && return
 
-    # ── Firewall ──────────────────────────────────────────────────────────────
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
@@ -471,33 +464,24 @@ harden_system() {
     ufw allow 80/tcp
     ufw allow 443/tcp
 
-    # Anti-Torrent: Block common BitTorrent ports
     ufw deny out 6881:6889/tcp
     ufw deny out 6881:6889/udp
-    
     ufw --force enable
 
-    # Anti-Torrent: Advanced deep packet inspection for BitTorrent strings
-    iptables -A FORWARD -m string --algo bm --string "BitTorrent" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "BitTorrent protocol" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "peer_id=" -j DROP
-    iptables -A FORWARD -m string --algo bm --string ".torrent" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "announce.php?passkey=" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "torrent" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "announce" -j DROP
-    iptables -A FORWARD -m string --algo bm --string "info_hash" -j DROP
+    # Anti-Torrent Rules: Checking first prevents duplicate appends on updates
+    for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
+        iptables -C FORWARD -m string --algo bm --string "$str" -j DROP 2>/dev/null || \
+        iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
+    done
     
-    # Silently attempt to save iptables rules (will persist if iptables-persistent is installed)
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
-    # ── SSH hardening ─────────────────────────────────────────────────────────
     rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf         2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf  2>/dev/null || true
 
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g'             /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
 
-    # Remove any stale Banner line so we can insert a clean one
     sed -i '/^Banner/d' /etc/ssh/sshd_config
 
     printf '%s\n' \
@@ -508,7 +492,6 @@ harden_system() {
 
     grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
 
-    # ── SSH Login Banner (/etc/issue.net) ────────────────────────
     cat > /etc/issue.net <<'BANNER'
 
   ┌─────────────────────────────────────────────┐
@@ -541,7 +524,6 @@ CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 
-# ── Colour palette ────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -556,7 +538,6 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ── Neon glyphs ───────────────────────────────────────────────────
 GCHECK="${GREEN}✔${NC}"
 GCROSS="${RED}✖${NC}"
 GWARN="${YELLOW}⚡${NC}"
@@ -568,16 +549,12 @@ source "$CRED_FILE" 2>/dev/null || { echo "Missing credentials. Was AutoXray ins
 IP=$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 OS=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
 
-# ─────────────────────────────────────────────────────────────────
-# CYBERPUNK HEADER
-# ─────────────────────────────────────────────────────────────────
 draw_header() {
     clear
     local up ram
     up=$(uptime -p 2>/dev/null || echo "N/A")
     ram=$(free -m 2>/dev/null | awk 'NR==2{printf "%s/%s MB (%.1f%%)", $3,$2,$3*100/$2}')
 
-    # ── Clean title banner ────────────────────────────────────────
     echo ""
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
@@ -586,8 +563,6 @@ draw_header() {
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-
-    # ── System stats bar ─────────────────────────────────────────
     echo -e "  ${BBLUE}┌──────────────────────────────────────────────────────────────────────┐${NC}"
     printf "  ${BBLUE}│${NC}  ${BOLD}${CYAN}OS   ${NC}${DIM}%-28s${NC}  ${BOLD}${CYAN}UPTIME  ${NC}${DIM}%-18s${NC}${BBLUE}│${NC}\n" "$OS" "$up"
     printf "  ${BBLUE}│${NC}  ${BOLD}${MAGENTA}IP   ${NC}${DIM}%-28s${NC}  ${BOLD}${MAGENTA}DOMAIN  ${NC}${DIM}%-18s${NC}${BBLUE}│${NC}\n" "$IP" "$DOMAIN"
@@ -596,16 +571,10 @@ draw_header() {
     echo ""
 }
 
-# ─────────────────────────────────────────────────────────────────
-# NEON DIVIDER
-# ─────────────────────────────────────────────────────────────────
 divider() {
     echo -e "  ${BMAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# ─────────────────────────────────────────────────────────────────
-# MAIN MENU RENDERER
-# ─────────────────────────────────────────────────────────────────
 draw_menu() {
     draw_header
     divider
@@ -621,9 +590,6 @@ draw_menu() {
     echo ""
 }
 
-# ─────────────────────────────────────────────────────────────────
-# CREATE ACCOUNT
-# ─────────────────────────────────────────────────────────────────
 create_account() {
     draw_header
     divider
@@ -652,7 +618,6 @@ create_account() {
     local u_exp
     u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
 
-    # ── SSH Account ───────────────────────────────────────────────
     if [[ "$s_type" == "1" ]]; then
         read -rp "   Password : " u_pass
         if [[ -z "$u_pass" ]]; then
@@ -674,7 +639,6 @@ create_account() {
         divider
         echo ""
 
-    # ── Xray Account ─────────────────────────────────────────────
     elif [[ "$s_type" == "2" ]]; then
         local u_uuid
         u_uuid=$(/usr/local/bin/xray uuid)
@@ -719,9 +683,6 @@ create_account() {
     read -rp "   Press Enter to return..." </dev/tty
 }
 
-# ─────────────────────────────────────────────────────────────────
-# SHOW ACCOUNT DETAILS  (called from nested manage menu)
-# ─────────────────────────────────────────────────────────────────
 show_account_details() {
     local username="$1"
     local line
@@ -768,9 +729,6 @@ show_account_details() {
     read -rp "   Press Enter to return..." </dev/tty
 }
 
-# ─────────────────────────────────────────────────────────────────
-# DELETE ACCOUNT  (called from nested manage menu)
-# ─────────────────────────────────────────────────────────────────
 _delete_account() {
     local username="$1"
     local svc
@@ -800,9 +758,6 @@ _delete_account() {
     sleep 2
 }
 
-# ─────────────────────────────────────────────────────────────────
-# EXTEND ACCOUNT  (called from nested manage menu)
-# ─────────────────────────────────────────────────────────────────
 _extend_account() {
     local username="$1"
     local current_exp svc secret days new_exp
@@ -819,14 +774,12 @@ _extend_account() {
         echo -e "   ${GCROSS} Invalid input — enter a whole number."; sleep 2; return
     fi
 
-    # If expiry is "Never" or a past date, extend from today
     if [[ "$current_exp" == "Never" ]] || ! date -d "$current_exp" &>/dev/null; then
         new_exp=$(date -d "+${days} days" +"%Y-%m-%d")
     else
         new_exp=$(date -d "${current_exp} +${days} days" +"%Y-%m-%d")
     fi
 
-    # Escape for sed
     local escaped_secret
     escaped_secret=$(printf '%s' "$secret" | sed 's/[\/&]/\\&/g')
     sed -i "s|^${username},${svc},.*,.*|${username},${svc},${escaped_secret},${new_exp}|" "$CSV_DB"
@@ -836,9 +789,6 @@ _extend_account() {
     sleep 2
 }
 
-# ─────────────────────────────────────────────────────────────────
-# MANAGE ACCOUNTS  (nested menu — Requirement 2)
-# ─────────────────────────────────────────────────────────────────
 manage_accounts() {
     while true; do
         draw_header
@@ -846,7 +796,6 @@ manage_accounts() {
         echo -e "   ${BOLD}${BCYAN}MANAGE ACCOUNTS${NC}"
         divider
 
-        # ── Read CSV into indexed arrays (skip header row) ────────
         local -a usernames protocols
         usernames=()
         protocols=()
@@ -865,7 +814,6 @@ manage_accounts() {
             return
         fi
 
-        # ── Print compact account list ────────────────────────────
         printf "   ${DIM}%-6s  %-24s  %-12s${NC}\n" "IDX" "USERNAME" "PROTOCOL"
         divider
         for (( i=0; i<${#usernames[@]}; i++ )); do
@@ -879,24 +827,20 @@ manage_accounts() {
         echo -e "   ${GARROW}  ${BOLD}0${NC})  Back to Main Menu"
         echo ""
 
-        # ── Prompt for index ──────────────────────────────────────
         read -rp "   Pick account (number): " pick </dev/tty
 
-        # Validate: must be integer
         if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
             echo -e "\n   ${GCROSS} Invalid input — enter a number."; sleep 2; continue
         fi
 
         [[ "$pick" -eq 0 ]] && return
 
-        # Validate: in range
         if (( pick < 1 || pick > ${#usernames[@]} )); then
             echo -e "\n   ${GCROSS} No account at index ${pick}."; sleep 2; continue
         fi
 
         local selected_user="${usernames[$((pick-1))]}"
 
-        # ── Nested per-account menu ───────────────────────────────
         while true; do
             draw_header
             divider
@@ -913,7 +857,7 @@ manage_accounts() {
             case "$sub_opt" in
                 1) show_account_details  "$selected_user" ;;
                 2) _delete_account       "$selected_user"
-                   break   # user no longer exists, return to list
+                   break 
                    ;;
                 3) _extend_account       "$selected_user" ;;
                 4) break ;;
@@ -923,9 +867,6 @@ manage_accounts() {
     done
 }
 
-# ─────────────────────────────────────────────────────────────────
-# MANAGE SERVICES
-# ─────────────────────────────────────────────────────────────────
 manage_services() {
     draw_header
     divider
@@ -951,95 +892,31 @@ manage_services() {
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────
-# UPDATE SCRIPT & CORE  (Requirement 3)
-# ─────────────────────────────────────────────────────────────────
 update_script_and_core() {
     draw_header
     divider
     echo -e "   ${BOLD}${BCYAN}UPDATE SCRIPT & CORE${NC}"
     divider
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    local arch latest_tag
-
-    case "$(uname -m)" in
-        x86_64)  arch="64"        ;;
-        aarch64) arch="arm64-v8a" ;;
-        *)
-            echo -e "   ${GCROSS} Unsupported architecture."
-            rm -rf "$tmp_dir"; sleep 2; return
-            ;;
-    esac
-
-    # ── 1) Download latest autoxray script ───────────────────────
+    echo -e "   ${GINFO}  Downloading latest installer from GitHub..."
     echo ""
-    echo -e "   ${GINFO}  Fetching latest AutoXray script..."
-    echo ""
-    if curl -# -fL "$SCRIPT_URL" -o "${tmp_dir}/autoxray_new" 2>&1 | \
-        sed 's/^/   /'; then
-        echo ""
-        echo -e "   ${GCHECK} Script download complete."
+
+    local tmp_sh="/tmp/autoxray_update.sh"
+
+    if curl -# -fL "$SCRIPT_URL" -o "$tmp_sh"; then
+        chmod +x "$tmp_sh"
+        echo -e "   ${GCHECK} Download complete. Commencing safe upgrade..."
+        echo -e "   ${GWARN} The menu will automatically close during the update."
+        sleep 3
+        
+        # Replace the current process with the installer to prevent Bash read-corruption
+        exec bash "$tmp_sh"
     else
-        echo ""
-        echo -e "   ${GCROSS} Failed to download script."
-        rm -rf "$tmp_dir"; sleep 2; return
+        echo -e "   ${GCROSS} Failed to download update."
+        rm -f "$tmp_sh"
+        sleep 3
     fi
-
-    # ── 2) Fetch latest Xray-core release tag ────────────────────
-    echo ""
-    echo -e "   ${GINFO}  Resolving latest Xray-core release..."
-    latest_tag=$(curl -fsSL \
-        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
-        | jq -r '.tag_name' 2>/dev/null) || latest_tag=""
-
-    if [[ -z "$latest_tag" ]]; then
-        echo -e "   ${GWARN} Could not resolve latest tag. Using installed version."
-    else
-        echo -e "   ${GCHECK} Latest Xray-core: ${BOLD}${latest_tag}${NC}"
-        echo ""
-        echo -e "   ${GINFO}  Downloading Xray-core ${latest_tag}..."
-        echo ""
-        if curl -# -fL \
-            "https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip" \
-            -o "${tmp_dir}/xray.zip" 2>&1 | sed 's/^/   /'; then
-            echo ""
-            echo -e "   ${GCHECK} Xray-core download complete."
-
-            echo -e "   ${GINFO}  Extracting and installing Xray-core..."
-            unzip -qo "${tmp_dir}/xray.zip" -d "${tmp_dir}/xray_extracted"
-            systemctl stop xray 2>/dev/null || true
-            install -m 755 "${tmp_dir}/xray_extracted/xray" /usr/local/bin/xray
-            cp "${tmp_dir}/xray_extracted/"*.dat /usr/local/bin/ 2>/dev/null || true
-            systemctl start xray 2>/dev/null || true
-            echo -e "   ${GCHECK} Xray-core ${latest_tag} installed."
-        else
-            echo ""
-            echo -e "   ${GCROSS} Failed to download Xray-core."
-        fi
-    fi
-
-    # ── 3) Apply new manager script ───────────────────────────────
-    if [[ -s "${tmp_dir}/autoxray_new" ]]; then
-        echo ""
-        echo -e "   ${GINFO}  Applying new AutoXray manager..."
-        chmod +x "${tmp_dir}/autoxray_new"
-        cp "${tmp_dir}/autoxray_new" /usr/local/bin/menu
-        echo -e "   ${GCHECK} Manager updated."
-    fi
-
-    rm -rf "$tmp_dir"
-    divider
-    echo ""
-    echo -e "   ${GCHECK}  ${BOLD}${GREEN}Update complete! Re-launching manager...${NC}"
-    sleep 2
-    exec /usr/local/bin/menu
 }
 
-# ─────────────────────────────────────────────────────────────────
-# UNINSTALL
-# ─────────────────────────────────────────────────────────────────
 uninstall_autoxray() {
     draw_header
     divider
@@ -1069,9 +946,6 @@ uninstall_autoxray() {
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────────────────────────
 while true; do
     draw_menu
     read -rp "   Select option: " opt </dev/tty
@@ -1154,10 +1028,13 @@ main() {
     install_xray
     configure_xray
     install_services
-    harden_system           # ← writes SSH banner + restarts sshd
+    harden_system
     install_manage_script
     start_services
     print_summary
+    
+    # Cleanup temp script if it was executed via the TUI updater
+    rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
 main "$@"
