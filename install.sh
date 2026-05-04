@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Cyberpunk Elite Edition
-# Version : 4.0.0
+# Version : 4.0.1
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.0"
+readonly SCRIPT_VERSION="4.0.1"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -247,10 +247,11 @@ configure_xray() {
         return
     fi
 
+    # Native Linux UUID generation prevents binary failures
     local uuid_vless
-    uuid_vless=$("$XRAY_BIN" uuid)
+    uuid_vless=$(cat /proc/sys/kernel/random/uuid)
     local uuid_vmess
-    uuid_vmess=$("$XRAY_BIN" uuid)
+    uuid_vmess=$(cat /proc/sys/kernel/random/uuid)
     local trojan_pass
     trojan_pass=$(openssl rand -hex 20)
 
@@ -516,7 +517,7 @@ install_manage_script() {
     cat > /usr/local/bin/menu <<'MANAGE'
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
-# AutoXray Cyberpunk TUI Manager  v4.0.0
+# AutoXray Cyberpunk TUI Manager  v4.0.1
 # ─────────────────────────────────────────────────────────────────
 
 CRED_FILE="/usr/local/etc/xray/credentials.env"
@@ -559,7 +560,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.0${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.1${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -640,8 +641,9 @@ create_account() {
         echo ""
 
     elif [[ "$s_type" == "2" ]]; then
+        # Use native kernel UUID generation to guarantee it never fails
         local u_uuid
-        u_uuid=$(/usr/local/bin/xray uuid)
+        u_uuid=$(cat /proc/sys/kernel/random/uuid)
 
         jq --arg user "$u_name" --arg uuid "$u_uuid" '
           .inbounds |= map(
@@ -908,7 +910,6 @@ update_script_and_core() {
         echo -e "   ${GWARN} The menu will automatically close during the update."
         sleep 3
         
-        # Replace the current process with the installer to prevent Bash read-corruption
         exec bash "$tmp_sh"
     else
         echo -e "   ${GCROSS} Failed to download update."
@@ -1033,7 +1034,6 @@ main() {
     start_services
     print_summary
     
-    # Cleanup temp script if it was executed via the TUI updater
     rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
