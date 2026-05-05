@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.2 (Stable Core + Advanced TUI + Anti-Torrent + Safe Updates)
+# Version : 4.0.3 (Stable Core + Advanced TUI + Anti-Torrent + Bulletproof SSH)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.2"
+readonly SCRIPT_VERSION="4.0.3"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -135,7 +135,6 @@ SYSCTL
 provision_tls() {
     section "TLS certificate provisioning"
     
-    # Skip generation if updating an existing node to prevent ACME rate limits
     if [[ -f "${TLS_DIR}/fullchain.pem" && -f "$CSV_DB" ]]; then
         log "TLS certificates already exist. Skipping provisioning."
         return
@@ -148,7 +147,7 @@ provision_tls() {
     if [[ -n "$DOMAIN" ]]; then
         info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
         systemctl stop nginx apache2 ws-proxy 2>/dev/null || true
-        fuser -k 80/tcp 2>/dev/null || true # Forcefully unbind port 80
+        fuser -k 80/tcp 2>/dev/null || true
         
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
             
@@ -156,7 +155,6 @@ provision_tls() {
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
             
-            # Safe renewal hook
             mkdir -p /etc/letsencrypt/renewal-hooks/deploy/
             cat > /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh <<EOF
 #!/bin/bash
@@ -170,7 +168,6 @@ EOF
             cert_issued="true"
         else
             warn "Certbot ACME failed — falling back to self-signed."
-            # Do NOT wipe DOMAIN here, so CF flexible SSL still works
         fi
     fi
 
@@ -181,7 +178,6 @@ EOF
             -subj "/CN=${cert_cn}/O=AutoXray/C=US" -addext "subjectAltName=IP:${server_ip}" >> "$LOG_FILE" 2>&1
         cp "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/cert.pem"
         
-        # Only fallback to IP if user completely left domain blank
         [[ -z "$DOMAIN" ]] && DOMAIN="${server_ip}"
         log "Self-signed certificate generated."
     fi
@@ -206,13 +202,11 @@ install_xray() {
 configure_xray() {
     section "Configuring Xray-core"
 
-    # Prevent config and user wipe on script updates
     if [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]]; then
         log "Existing Xray configuration and database detected. Skipping regeneration."
         return
     fi
 
-    # Native kernel UUID generation (100% reliable)
     local uuid_vless=$(cat /proc/sys/kernel/random/uuid)
     local uuid_vmess=$(cat /proc/sys/kernel/random/uuid)
     local trojan_pass=$(openssl rand -hex 20)
@@ -353,15 +347,16 @@ def handle_client(client_socket):
             client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             target.connect(('127.0.0.1', 22))
             
-            # Recover and forward pipelined SSH data swallowed by the first read
-            parts = header.split(b'\r\n\r\n', 1)
-            if len(parts) == 2 and parts[1]:
-                target.sendall(parts[1])
+            # Extract only the exact SSH handshake if pipelined, dropping all HTTP garbage
+            idx = header.find(b'SSH-2.0')
+            if idx != -1:
+                target.sendall(header[idx:])
             
-        threading.Thread(target=forward, args=(client_socket, target)).start()
-        threading.Thread(target=forward, args=(target, client_socket)).start()
+        threading.Thread(target=forward, args=(client_socket, target), daemon=True).start()
+        threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
     except Exception:
-        client_socket.close()
+        try: client_socket.close()
+        except: pass
 
 def forward(src, dst):
     try:
@@ -382,8 +377,11 @@ server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(('0.0.0.0', 80))
 server.listen(1000)
 while True:
-    client, _ = server.accept()
-    threading.Thread(target=handle_client, args=(client,)).start()
+    try:
+        client, _ = server.accept()
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+    except Exception:
+        pass
 PYTHON_SCRIPT
 
     chmod +x /usr/local/bin/ws-proxy.py
@@ -431,8 +429,8 @@ harden_system() {
     
     sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    # Apply Tunneling and Keep-alive Directives (including UseDNS no)
-    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "UseDNS no" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
+    # Apply unrestricted Tunneling and Keep-alive Directives
+    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "GatewayPorts yes" "PermitTunnel yes" "UseDNS no" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
 
@@ -444,12 +442,8 @@ harden_system() {
 
 BANNER
     
-    # Create the secure dummy shell for SSH tunnelers
-    cat > /bin/tunnel-shell <<'EOF'
-#!/bin/bash
-trap 'exit 0' HUP INT TERM QUIT
-while true; do sleep 86400 & wait $!; done
-EOF
+    # Create the bulletproof dummy shell for SSH tunnelers
+    echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
 
@@ -491,7 +485,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.2${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.3${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -817,7 +811,6 @@ update_script_and_core() {
         echo -e "   ${GWARN} The menu will automatically close during the update."
         sleep 3
         
-        # Exec replaces the running process to prevent Bash memory read-corruption
         exec bash "$tmp_sh"
     else
         echo -e "   ${GCROSS} Failed to download update."
@@ -871,8 +864,6 @@ done
 MANAGE
 
     chmod +x /usr/local/bin/menu
-    
-    # Remove old binary if it exists
     rm -f /usr/local/bin/autoxray 2>/dev/null
     
     log "Management helper installed. Access via: menu"
@@ -929,7 +920,6 @@ main() {
     start_services
     print_summary
     
-    # Cleanup temp updater
     rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
