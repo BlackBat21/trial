@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.8 (Smart Python Proxy + Threading Fix + Auto-Patcher)
+# Version : 4.0.9 (Patched WebSocket Handshake & Tunnel Fixes)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.8"
+readonly SCRIPT_VERSION="4.0.9"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -78,7 +78,7 @@ parse_args() {
 
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
-        read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
+        read -rp "Do you want to configure a custom domain with Let's Encrypt?[y/N] " configure_tls </dev/tty
         if [[ "$configure_tls" =~ ^[Yy]$ ]]; then
             read -rp "Enter Domain (e.g., vpn.example.com): " DOMAIN </dev/tty
             read -rp "Enter Email for Let's Encrypt (e.g., admin@example.com): " EMAIL </dev/tty
@@ -227,7 +227,7 @@ EOF
   "log": { "loglevel": "warning" },
   "routing": {
     "domainStrategy": "AsIs",
-    "rules": [
+    "rules":[
       {
         "type": "field",
         "protocol": ["bittorrent"],
@@ -235,16 +235,16 @@ EOF
       }
     ]
   },
-  "inbounds": [
+  "inbounds":[
     {
       "tag": "vless-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS}, "protocol": "vless",
-      "settings": { "clients": [{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }], "decryption": "none" },
+      "settings": { "clients":[{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }], "decryption": "none" },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
     {
       "tag": "vmess-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS}, "protocol": "vmess",
-      "settings": { "clients": [{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }] },
+      "settings": { "clients":[{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
@@ -252,22 +252,22 @@ EOF
       "tag": "trojan-ws-tls", "listen": "127.0.0.1", "port": ${PORT_TROJAN_WS}, "protocol": "trojan",
       "settings": { "clients": [{ "password": "${trojan_pass}", "email": "admin_trojan" }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan-ws" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     },
     {
       "tag": "vless-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS_NOTLS}, "protocol": "vless",
-      "settings": { "clients": [{ "id": "${uuid_vless}", "flow": "" }], "decryption": "none" },
+      "settings": { "clients":[{ "id": "${uuid_vless}", "flow": "" }], "decryption": "none" },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws-nt" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     },
     {
       "tag": "vmess-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS_NOTLS}, "protocol": "vmess",
       "settings": { "clients": [{ "id": "${uuid_vmess}", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws-nt" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     }
   ],
-  "outbounds": [
+  "outbounds":[
     { "tag": "direct", "protocol": "freedom" },
     { "tag": "blocked", "protocol": "blackhole" }
   ]
@@ -318,40 +318,44 @@ server {
     location /vless-ws { proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
-    location /ssh-ws { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
+    location /ssh-ws { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
 }
 NGINX_CONF
 
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
-import socket, threading
+import socket, threading, hashlib, base64
 
 def forward_ssh_c2s(src, dst, initial_data):
-    """Client to Server Thread: Smart payload stripper. Drops double-GET garbage."""
+    """Client to Server Thread: Smart payload stripper with robust buffering."""
     try:
+        buffer = initial_data
         ssh_started = False
-        
-        # Check if the pipelined buffer already has the SSH handshake
-        idx = initial_data.find(b'SSH-')
-        if idx != -1:
-            dst.sendall(initial_data[idx:])
-            ssh_started = True
+
+        # Accumulate data until the SSH banner is found
+        while not ssh_started:
+            idx = buffer.find(b'SSH-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+                break
             
+            # Prevent memory leaks from massive garbage payloads
+            if len(buffer) > 4096:
+                buffer = buffer[-10:]
+                
+            data = src.recv(8192)
+            if not data: return
+            buffer += data
+            
+        # Standard pass-through once banner is established
         while True:
             data = src.recv(8192)
             if not data: break
-            
-            if not ssh_started:
-                idx = data.find(b'SSH-')
-                if idx != -1:
-                    dst.sendall(data[idx:])
-                    ssh_started = True
-            else:
-                dst.sendall(data)
+            dst.sendall(data)
     except Exception:
         pass
     finally:
-        # THE FIX: Safely half-close the destination socket instead of killing both
         try: dst.shutdown(socket.SHUT_WR)
         except: pass
 
@@ -389,10 +393,23 @@ def handle_client(client_socket):
             t1 = threading.Thread(target=forward_generic, args=(client_socket, target), daemon=True)
             t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
         else:
-            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            # Parse Sec-WebSocket-Key to satisfy strict WebSocket clients
+            ws_key = None
+            for line in head_str.split('\r\n'):
+                if line.lower().startswith('sec-websocket-key:'):
+                    ws_key = line.split(':', 1)[1].strip()
+                    break
+                    
+            if ws_key:
+                magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                accept = base64.b64encode(hashlib.sha1((ws_key + magic).encode('utf-8')).digest()).decode('utf-8')
+                resp = f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                client_socket.sendall(resp.encode('utf-8'))
+            else:
+                client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                
             target.connect(('127.0.0.1', 22))
             
-            # Isolate any pipelined HTTP garbage sent by the payload app
             _, _, pipelined = req.partition(b"\r\n\r\n")
             t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
             t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
@@ -400,7 +417,6 @@ def handle_client(client_socket):
         t1.start()
         t2.start()
         
-        # THE FIX: Wait for both streams to gracefully finish before closing the main socket
         t1.join()
         t2.join()
         
@@ -430,14 +446,12 @@ PYTHON_SCRIPT
     cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
 [Unit]
 Description=AutoScriptX Python WS Proxy
-After=network.target
-[Service]
+After=network.target[Service]
 Type=simple
 User=root
 ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
 Restart=always
-LimitNOFILE=65535
-[Install]
+LimitNOFILE=65535[Install]
 WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable ws-proxy
@@ -482,8 +496,8 @@ harden_system() {
 
 BANNER
     
-    # THE FIX: Create the infinite tunnel shell to prevent immediate disconnections
-    echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\nwhile true; do sleep 86400; done' > /bin/tunnel-shell
+    # THE FIX: Create the infinite tunnel shell to prevent immediate disconnections & zombie leaks
+    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
     
@@ -534,7 +548,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.8${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.9${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -612,7 +626,7 @@ create_account() {
         jq --arg user "$u_name" --arg uuid "$u_uuid" '
           .inbounds |= map(
             if .protocol == "vless" and .settings.clients then
-              .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
+              .settings.clients +=[{"id": $uuid, "flow": "", "email": $user}]
             elif .protocol == "vmess" and .settings.clients then
               .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
             else . end
@@ -692,7 +706,7 @@ _delete_account() {
     local svc=$(grep "^${username}," "$CSV_DB" | cut -d, -f2)
 
     echo ""
-    read -rp "   ${GWARN}  Confirm deletion of '${username}'? [y/N]: " confirm </dev/tty
+    read -rp "   ${GWARN}  Confirm deletion of '${username}'?[y/N]: " confirm </dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "   ${GINFO} Deletion cancelled."; sleep 1; return
     fi
@@ -834,7 +848,7 @@ manage_services() {
     done
     divider
     echo ""
-    read -rp "   Restart all services? [y/N]: " rst </dev/tty
+    read -rp "   Restart all services?[y/N]: " rst </dev/tty
     if [[ "$rst" =~ ^[Yy]$ ]]; then
         for svc in xray nginx ws-proxy fail2ban; do
             systemctl restart "$svc" 2>/dev/null && \
