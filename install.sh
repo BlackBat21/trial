@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.6 (FreeNetLabs WS-Proxy Integration + Bulletproof Shell)
+# Version : 4.0.7 (Smart Payload Stripper + Tunnel Shell Fix)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.6"
+readonly SCRIPT_VERSION="4.0.7"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -273,11 +273,11 @@ EOF
   ]
 }
 XRAY_JSON
-    log "Xray base configuration written (Anti-Torrent routing enabled)."
+    log "Xray base configuration written."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SERVICES: XRAY, NGINX & AUTOSCRIPTX WS-PROXY
+#  SERVICES: XRAY, NGINX & SMART PYTHON PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_services() {
@@ -333,23 +333,119 @@ server {
 }
 NGINX_CONF
 
-    log "Integrating stable ws-proxy from FreeNetLabs/AutoScriptX..."
-    local FNL_REPO="https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master"
-    
-    # Remove old implementations
-    rm -f /usr/local/bin/ws-proxy.py
-    rm -f /usr/local/bin/ws-proxy
-    
-    # Download the stable Go binary
-    wget -q -O /usr/local/bin/ws-proxy "${FNL_REPO}/bin/ws-proxy"
-    chmod +x /usr/local/bin/ws-proxy
-    
-    # Download the corresponding service file
-    wget -q -O /etc/systemd/system/ws-proxy.service "${FNL_REPO}/service/systemd/ws-proxy.service"
-    chmod 644 /etc/systemd/system/ws-proxy.service
-    
-    systemctl daemon-reload
-    systemctl enable ws-proxy
+    cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
+#!/usr/bin/env python3
+import socket, threading
+
+def forward_ssh(src, dst, initial_data):
+    try:
+        ssh_started = False
+        
+        # Check if the initial pipelined data already contains the SSH handshake
+        idx = initial_data.find(b'SSH-')
+        if idx != -1:
+            dst.sendall(initial_data[idx:])
+            ssh_started = True
+            
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            
+            if not ssh_started:
+                # Strip out Double GET payload HTTP garbage
+                idx = data.find(b'SSH-')
+                if idx != -1:
+                    dst.sendall(data[idx:])
+                    ssh_started = True
+            else:
+                dst.sendall(data)
+    except Exception:
+        pass
+    finally:
+        try: src.shutdown(socket.SHUT_WR)
+        except: pass
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
+
+def forward(src, dst):
+    try:
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
+    except Exception:
+        pass
+    finally:
+        try: src.shutdown(socket.SHUT_WR)
+        except: pass
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
+
+def handle_client(client_socket):
+    target = None
+    try:
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        req = b""
+        while b"\r\n\r\n" not in req:
+            chunk = client_socket.recv(4096)
+            if not chunk: return
+            req += chunk
+            
+        head_str = req.decode('utf-8', 'ignore')
+        
+        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
+            target.connect(('127.0.0.1', 81))
+            target.sendall(req)
+            threading.Thread(target=forward, args=(client_socket, target), daemon=True).start()
+            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
+        else:
+            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            target.connect(('127.0.0.1', 22))
+            
+            _, _, pipelined = req.partition(b"\r\n\r\n")
+            
+            threading.Thread(target=forward_ssh, args=(client_socket, target, pipelined), daemon=True).start()
+            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
+            
+    except Exception:
+        if target:
+            try: target.close()
+            except: pass
+        try: client_socket.close()
+        except: pass
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('0.0.0.0', 80))
+server.listen(1000)
+while True:
+    try:
+        client, _ = server.accept()
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+    except Exception:
+        pass
+PYTHON_SCRIPT
+
+    chmod +x /usr/local/bin/ws-proxy.py
+
+    cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
+[Unit]
+Description=AutoScriptX Python WS Proxy
+After=network.target
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
+Restart=always
+LimitNOFILE=65535
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload; systemctl enable ws-proxy
 }
 
 harden_system() {
@@ -376,10 +472,8 @@ harden_system() {
 
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
-    
     sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    # Apply OpenSSH Tunneling Directives
     printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "GatewayPorts yes" "PermitTunnel yes" "UseDNS no" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
@@ -392,13 +486,13 @@ harden_system() {
 
 BANNER
     
-    # The secure tunnel shell to keep users connected indefinitely
+    # The secure tunnel shell to prevent EOF disconnects
     echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
 
     systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI Active)."
+    log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,7 +529,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.6${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.7${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -491,7 +585,7 @@ create_account() {
         read -rp "   Password : " u_pass
         [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
-        # New users properly assigned the tunnel-shell instead of /bin/false
+        # We ensure tunnel-shell is assigned here so the user never drops
         useradd -m -s /bin/tunnel-shell "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
@@ -788,7 +882,6 @@ uninstall_autoxray() {
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
               /usr/local/bin/ws-proxy.py \
-              /usr/local/bin/ws-proxy \
               /etc/nginx/conf.d/autoxray-*.conf
         systemctl daemon-reload
         systemctl reload nginx 2>/dev/null || true
@@ -816,8 +909,6 @@ done
 MANAGE
 
     chmod +x /usr/local/bin/menu
-    
-    # Remove old binary if it exists
     rm -f /usr/local/bin/autoxray 2>/dev/null
     
     log "Management helper installed. Access via: menu"
@@ -832,7 +923,7 @@ do_uninstall() {
     systemctl disable xray ws-proxy ssh-websocket 2>/dev/null || true
     rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/ssh-websocket.service
     rm -rf /usr/local/etc/xray /etc/ssl/autoxray
-    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /usr/local/bin/ws-proxy /etc/nginx/conf.d/autoxray-*.conf
+    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
     systemctl daemon-reload; systemctl reload nginx 2>/dev/null || true
     log "Uninstall complete."
     exit 0
