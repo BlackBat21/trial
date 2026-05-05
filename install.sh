@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.3 (Stable Core + Advanced TUI + Anti-Torrent + Bulletproof SSH)
+# Version : 4.0.4 (Stable Core + Advanced TUI + Anti-Torrent + WS Codec Fix)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.3"
+readonly SCRIPT_VERSION="4.0.4"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -68,7 +68,6 @@ parse_args() {
         esac
     done
 
-    # Safe Update Bypass: Backup data and skip interactive prompts if updating
     if [[ "$is_installed" == "true" && "$UNINSTALL" == "false" ]]; then
         info "Existing installation detected. Bypassing setup and backing up data..."
         cp "$CSV_DB" "${BACKUP_DIR}/users_$(date +%F_%H%M%S).csv" 2>/dev/null || true
@@ -319,69 +318,209 @@ server {
     location /vless-ws { proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
-    location /ssh-ws { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
+    
+    location /ssh-ws {
+        proxy_pass         http://127.0.0.1:80;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    \$http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       \$host;
+
+        # Without these, Nginx drops idle SSH tunnels after the default 60 s.
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+
+        # Disable buffering so SSH keystrokes are forwarded immediately,
+        # not held until Nginx fills an internal buffer.
+        proxy_buffering     off;
+        tcp_nodelay         on;
+    }
 }
 NGINX_CONF
 
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
-import socket, threading
+"""
+ws-proxy.py — WebSocket-aware SSH/Xray traffic splitter.
+  SSH path  : decodes RFC 6455 WebSocket frames before forwarding to sshd.
+  Xray path : raw HTTP/WebSocket pass-through to the non-TLS Nginx listener.
+"""
+import socket, threading, struct
 
-def handle_client(client_socket):
-    try:
-        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        
-        header = client_socket.recv(8192)
-        if not header:
-            client_socket.close()
-            return
-        header_str = header.decode('utf-8', 'ignore')
-        
-        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+# ── WebSocket frame codec (RFC 6455) ─────────────────────────────────────────
 
-        if '/vless' in header_str or '/vmess' in header_str or '/trojan' in header_str:
-            target.connect(('127.0.0.1', 81))
-            target.sendall(header)
-        else:
-            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-            target.connect(('127.0.0.1', 22))
-            
-            # Extract only the exact SSH handshake if pipelined, dropping all HTTP garbage
-            idx = header.find(b'SSH-2.0')
-            if idx != -1:
-                target.sendall(header[idx:])
-            
-        threading.Thread(target=forward, args=(client_socket, target), daemon=True).start()
-        threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
-    except Exception:
-        try: client_socket.close()
-        except: pass
+def _recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed mid-read")
+        buf.extend(chunk)
+    return bytes(buf)
 
-def forward(src, dst):
+def ws_read_frame(sock):
+    """Read one complete WebSocket frame; return (opcode, unmasked_payload)."""
+    b0, b1 = _recv_exact(sock, 2)
+    opcode  = b0 & 0x0F
+    masked  = bool(b1 & 0x80)
+    plen    = b1 & 0x7F
+    if plen == 126:
+        plen = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif plen == 127:
+        plen = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    mask_key = _recv_exact(sock, 4) if masked else b""
+    payload  = bytearray(_recv_exact(sock, plen))
+    if masked:
+        for i in range(plen):
+            payload[i] ^= mask_key[i & 3]
+    return opcode, bytes(payload)
+
+def ws_write_frame(sock, payload):
+    """Send a server-side (unmasked) binary WebSocket frame to sock."""
+    n = len(payload)
+    if   n < 126:     hdr = struct.pack("!BB",  0x82, n)
+    elif n < 0x10000: hdr = struct.pack("!BBH", 0x82, 126, n)
+    else:             hdr = struct.pack("!BBQ", 0x82, 127, n)
+    sock.sendall(hdr + payload)
+
+# ── Buffered-socket wrapper ───────────────────────────────────────────────────
+
+class _BufSock:
+    """Wraps a raw socket, prepending an already-read byte buffer to recv()."""
+    __slots__ = ("_s", "_b")
+    def __init__(self, sock, buf=b""):
+        self._s, self._b = sock, buf
+    def recv(self, n):
+        if self._b:
+            out, self._b = self._b[:n], self._b[n:]
+            return out
+        return self._s.recv(n)
+    def sendall(self, d): return self._s.sendall(d)
+    def shutdown(self, h): return self._s.shutdown(h)
+    def close(self):       return self._s.close()
+
+# ── Forwarding workers ────────────────────────────────────────────────────────
+# Each worker owns exactly ONE direction.
+# On exit it half-closes its write-end on dst to signal EOF to the peer;
+# it does NOT close dst outright (that is the cleanup thread's responsibility).
+
+def _fwd_raw(src, dst):
+    """Plain TCP relay — used for the Xray pass-through path."""
     try:
         while True:
             data = src.recv(8192)
-            if not data: break
+            if not data:
+                break
             dst.sendall(data)
     except Exception:
         pass
     finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
+        try: dst.shutdown(socket.SHUT_WR)
         except: pass
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', 80))
-server.listen(1000)
-while True:
+def _fwd_ws_to_tcp(ws, tcp):
+    """Decode WebSocket frames from ws and write raw payloads to tcp (client → sshd)."""
     try:
-        client, _ = server.accept()
-        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+        while True:
+            opcode, payload = ws_read_frame(ws)
+            if opcode == 0x08:          # Close frame — initiate clean shutdown
+                break
+            if payload:
+                tcp.sendall(payload)
     except Exception:
         pass
+    finally:
+        # Signal to sshd that the client is done writing
+        try: tcp.shutdown(socket.SHUT_WR)
+        except: pass
+
+def _fwd_tcp_to_ws(tcp, ws):
+    """Read raw bytes from tcp (sshd) and send as WebSocket frames to ws (client)."""
+    try:
+        while True:
+            data = tcp.recv(8192)
+            if not data:
+                break
+            ws_write_frame(ws, data)
+    except Exception:
+        pass
+    finally:
+        # Send a clean WebSocket Close frame so the client closes gracefully
+        try: ws.sendall(b"\x88\x00")
+        except: pass
+        try: tcp.shutdown(socket.SHUT_RD)
+        except: pass
+
+# ── Client handler ────────────────────────────────────────────────────────────
+
+def handle_client(client_sock):
+    target = None
+    try:
+        client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        # Read until we have the complete HTTP request headers
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = client_sock.recv(4096)
+            if not chunk:
+                return
+            raw += chunk
+
+        head, _, pipelined = raw.partition(b"\r\n\r\n")
+        head_str = head.decode("utf-8", "ignore")
+
+        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        if "/vless" in head_str or "/vmess" in head_str or "/trojan" in head_str:
+            # ── Xray path: raw HTTP/WS pass-through to non-TLS Nginx on :81 ──
+            target.connect(("127.0.0.1", 81))
+            target.sendall(raw)         # forward the full request including pipelined body
+            t1 = threading.Thread(target=_fwd_raw, args=(client_sock, target), daemon=True)
+            t2 = threading.Thread(target=_fwd_raw, args=(target, client_sock), daemon=True)
+        else:
+            # ── SSH path: WebSocket ↔ raw-TCP bridge ──────────────────────────
+            # IMPORTANT: connect to sshd BEFORE sending 101 so we can fail safely
+            target.connect(("127.0.0.1", 22))
+            client_sock.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n\r\n"
+            )
+            # _BufSock replays bytes already read past the HTTP headers so the
+            # frame reader does not miss the start of the first WebSocket frame.
+            ws = _BufSock(client_sock, pipelined)
+            t1 = threading.Thread(target=_fwd_ws_to_tcp, args=(ws, target), daemon=True)
+            t2 = threading.Thread(target=_fwd_tcp_to_ws, args=(target, ws), daemon=True)
+
+        t1.start()
+        t2.start()
+
+        # Cleanup thread: waits for BOTH workers to finish before closing sockets.
+        # This prevents closing a socket while its partner's finally-block is still
+        # sending a close-frame or half-close signal.
+        def _cleanup():
+            t1.join()
+            t2.join()
+            for s in (client_sock, target):
+                try: s.close()
+                except: pass
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    except Exception:
+        for s in (s for s in (client_sock, target) if s):
+            try: s.close()
+            except: pass
+
+# ── Server ────────────────────────────────────────────────────────────────────
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 80))
+srv.listen(1000)
+while True:
+    cl, _ = srv.accept()
+    threading.Thread(target=handle_client, args=(cl,), daemon=True).start()
 PYTHON_SCRIPT
 
     chmod +x /usr/local/bin/ws-proxy.py
@@ -485,7 +624,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.3${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.4${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
