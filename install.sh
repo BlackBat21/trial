@@ -335,7 +335,6 @@ import socket, threading
 
 def handle_client(client_socket):
     try:
-        # Enable keep-alive on the incoming client socket
         client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         
         header = client_socket.recv(8192)
@@ -345,15 +344,19 @@ def handle_client(client_socket):
         header_str = header.decode('utf-8', 'ignore')
         
         target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Enable keep-alive on the outgoing target socket
         target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
         if '/vless' in header_str or '/vmess' in header_str or '/trojan' in header_str:
             target.connect(('127.0.0.1', 81))
             target.sendall(header)
         else:
-            client_socket.sendall(b"HTTP/1.1 101 Lanzvps\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             target.connect(('127.0.0.1', 22))
+            
+            # Recover and forward pipelined SSH data swallowed by the first read
+            parts = header.split(b'\r\n\r\n', 1)
+            if len(parts) == 2 and parts[1]:
+                target.sendall(parts[1])
             
         threading.Thread(target=forward, args=(client_socket, target)).start()
         threading.Thread(target=forward, args=(target, client_socket)).start()
@@ -369,8 +372,10 @@ def forward(src, dst):
     except Exception:
         pass
     finally:
-        src.close()
-        dst.close()
+        try: src.close()
+        except: pass
+        try: dst.close()
+        except: pass
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -411,7 +416,7 @@ harden_system() {
     ufw deny out 6881:6889/udp
     ufw --force enable
     
-    # Anti-Torrent DPI (Duplicate check prevents iptables bloat)
+    # Anti-Torrent DPI 
     for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
         iptables -C FORWARD -m string --algo bm --string "$str" -j DROP 2>/dev/null || \
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
@@ -426,8 +431,8 @@ harden_system() {
     
     sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    # Apply Tunneling and Keep-alive Directives
-    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
+    # Apply Tunneling and Keep-alive Directives (including UseDNS no)
+    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "UseDNS no" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
 
@@ -441,9 +446,9 @@ BANNER
     
     # Create the secure dummy shell for SSH tunnelers
     cat > /bin/tunnel-shell <<'EOF'
-#!/bin/sh
-trap 'exit 0' TERM INT
-while true; do sleep 3600; done
+#!/bin/bash
+trap 'exit 0' HUP INT TERM QUIT
+while true; do sleep 86400 & wait $!; done
 EOF
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
