@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.7 (Smart Payload Stripper + Tunnel Shell Fix)
+# Version : 4.0.8 (Smart Python Proxy + Threading Fix + Auto-Patcher)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.7"
+readonly SCRIPT_VERSION="4.0.8"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -273,7 +273,7 @@ EOF
   ]
 }
 XRAY_JSON
-    log "Xray base configuration written."
+    log "Xray base configuration written (Anti-Torrent routing enabled)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,18 +318,7 @@ server {
     location /vless-ws { proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
-    
-    location /ssh-ws { 
-        proxy_pass http://127.0.0.1:80; 
-        proxy_http_version 1.1; 
-        proxy_set_header Upgrade \$http_upgrade; 
-        proxy_set_header Connection "upgrade"; 
-        proxy_set_header Host \$host; 
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffering off;
-        tcp_nodelay on;
-    }
+    location /ssh-ws { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
 }
 NGINX_CONF
 
@@ -337,11 +326,12 @@ NGINX_CONF
 #!/usr/bin/env python3
 import socket, threading
 
-def forward_ssh(src, dst, initial_data):
+def forward_ssh_c2s(src, dst, initial_data):
+    """Client to Server Thread: Smart payload stripper. Drops double-GET garbage."""
     try:
         ssh_started = False
         
-        # Check if the initial pipelined data already contains the SSH handshake
+        # Check if the pipelined buffer already has the SSH handshake
         idx = initial_data.find(b'SSH-')
         if idx != -1:
             dst.sendall(initial_data[idx:])
@@ -352,7 +342,6 @@ def forward_ssh(src, dst, initial_data):
             if not data: break
             
             if not ssh_started:
-                # Strip out Double GET payload HTTP garbage
                 idx = data.find(b'SSH-')
                 if idx != -1:
                     dst.sendall(data[idx:])
@@ -362,12 +351,12 @@ def forward_ssh(src, dst, initial_data):
     except Exception:
         pass
     finally:
-        try: src.shutdown(socket.SHUT_WR)
-        except: pass
+        # THE FIX: Safely half-close the destination socket instead of killing both
         try: dst.shutdown(socket.SHUT_WR)
         except: pass
 
-def forward(src, dst):
+def forward_generic(src, dst):
+    """Server to Client Thread: Standard pass-through."""
     try:
         while True:
             data = src.recv(8192)
@@ -376,8 +365,6 @@ def forward(src, dst):
     except Exception:
         pass
     finally:
-        try: src.shutdown(socket.SHUT_WR)
-        except: pass
         try: dst.shutdown(socket.SHUT_WR)
         except: pass
 
@@ -393,25 +380,33 @@ def handle_client(client_socket):
             req += chunk
             
         head_str = req.decode('utf-8', 'ignore')
-        
         target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
         if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
             target.connect(('127.0.0.1', 81))
             target.sendall(req)
-            threading.Thread(target=forward, args=(client_socket, target), daemon=True).start()
-            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
+            t1 = threading.Thread(target=forward_generic, args=(client_socket, target), daemon=True)
+            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
         else:
             client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             target.connect(('127.0.0.1', 22))
             
+            # Isolate any pipelined HTTP garbage sent by the payload app
             _, _, pipelined = req.partition(b"\r\n\r\n")
+            t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
+            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
             
-            threading.Thread(target=forward_ssh, args=(client_socket, target, pipelined), daemon=True).start()
-            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
-            
+        t1.start()
+        t2.start()
+        
+        # THE FIX: Wait for both streams to gracefully finish before closing the main socket
+        t1.join()
+        t2.join()
+        
     except Exception:
+        pass
+    finally:
         if target:
             try: target.close()
             except: pass
@@ -460,7 +455,7 @@ harden_system() {
     ufw deny out 6881:6889/udp
     ufw --force enable
     
-    # Anti-Torrent DPI 
+    # Anti-Torrent DPI (Duplicate check prevents iptables bloat)
     for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
         iptables -C FORWARD -m string --algo bm --string "$str" -j DROP 2>/dev/null || \
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
@@ -474,7 +469,8 @@ harden_system() {
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
     sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "GatewayPorts yes" "PermitTunnel yes" "UseDNS no" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
+    # Add tunneling permissions to OpenSSH
+    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "PermitTunnel yes" "GatewayPorts yes" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
 
@@ -486,10 +482,19 @@ harden_system() {
 
 BANNER
     
-    # The secure tunnel shell to prevent EOF disconnects
-    echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
+    # THE FIX: Create the infinite tunnel shell to prevent immediate disconnections
+    echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\nwhile true; do sleep 86400; done' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
+    
+    # THE FIX: Auto-patch all existing SSH users created by the previous script
+    if [[ -f "$CSV_DB" ]]; then
+        while IFS=',' read -r uname svc _rest; do
+            if [[ "$svc" == "SSH" ]]; then
+                usermod -s /bin/tunnel-shell "$uname" 2>/dev/null || true
+            fi
+        done < <(tail -n +2 "$CSV_DB")
+    fi
 
     systemctl restart ssh || systemctl restart sshd
     log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
@@ -529,7 +534,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.7${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.8${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -585,7 +590,7 @@ create_account() {
         read -rp "   Password : " u_pass
         [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
-        # We ensure tunnel-shell is assigned here so the user never drops
+        # New users are correctly provisioned with the tunnel shell
         useradd -m -s /bin/tunnel-shell "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
@@ -965,7 +970,6 @@ main() {
     start_services
     print_summary
     
-    # Cleanup temp updater
     rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
