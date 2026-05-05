@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.1.0 (Stable Base + Anti-Torrent + Safe Updater + SSH Dummy Shell)
+# Version : 4.0.2 (Stable Core + Advanced TUI + Anti-Torrent + Safe Updates)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.0.2"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -31,6 +31,7 @@ readonly PORT_VMESS_WS_NOTLS=10012
 
 RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
+BMAGENTA='\033[1;35m'; BCYAN='\033[1;36m'
 
 log()     { echo -e "${GREEN}[✔]${NC} $*" | tee -a "$LOG_FILE"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $*" | tee -a "$LOG_FILE"; }
@@ -67,7 +68,7 @@ parse_args() {
         esac
     done
 
-    # Safe Update Bypass: Backup data and skip prompts if updating
+    # Safe Update Bypass: Backup data and skip interactive prompts if updating
     if [[ "$is_installed" == "true" && "$UNINSTALL" == "false" ]]; then
         info "Existing installation detected. Bypassing setup and backing up data..."
         cp "$CSV_DB" "${BACKUP_DIR}/users_$(date +%F_%H%M%S).csv" 2>/dev/null || true
@@ -133,7 +134,7 @@ SYSCTL
 
 provision_tls() {
     section "TLS certificate provisioning"
-
+    
     # Skip generation if updating an existing node to prevent ACME rate limits
     if [[ -f "${TLS_DIR}/fullchain.pem" && -f "$CSV_DB" ]]; then
         log "TLS certificates already exist. Skipping provisioning."
@@ -150,6 +151,7 @@ provision_tls() {
         fuser -k 80/tcp 2>/dev/null || true # Forcefully unbind port 80
         
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
+            
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
@@ -163,6 +165,7 @@ cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem
 systemctl reload nginx
 EOF
             chmod +x /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh
+            
             log "Let's Encrypt installed successfully for ${DOMAIN}."
             cert_issued="true"
         else
@@ -177,6 +180,8 @@ EOF
         openssl req -x509 -newkey rsa:4096 -keyout "${TLS_DIR}/key.pem" -out "${TLS_DIR}/fullchain.pem" -days 3650 -nodes \
             -subj "/CN=${cert_cn}/O=AutoXray/C=US" -addext "subjectAltName=IP:${server_ip}" >> "$LOG_FILE" 2>&1
         cp "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/cert.pem"
+        
+        # Only fallback to IP if user completely left domain blank
         [[ -z "$DOMAIN" ]] && DOMAIN="${server_ip}"
         log "Self-signed certificate generated."
     fi
@@ -201,12 +206,13 @@ install_xray() {
 configure_xray() {
     section "Configuring Xray-core"
 
+    # Prevent config and user wipe on script updates
     if [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]]; then
         log "Existing Xray configuration and database detected. Skipping regeneration."
         return
     fi
 
-    # Native Kernel UUID Generation prevents core failures
+    # Native kernel UUID generation (100% reliable)
     local uuid_vless=$(cat /proc/sys/kernel/random/uuid)
     local uuid_vmess=$(cat /proc/sys/kernel/random/uuid)
     local trojan_pass=$(openssl rand -hex 20)
@@ -329,18 +335,24 @@ import socket, threading
 
 def handle_client(client_socket):
     try:
+        # Enable keep-alive on the incoming client socket
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
         header = client_socket.recv(8192)
         if not header:
             client_socket.close()
             return
         header_str = header.decode('utf-8', 'ignore')
+        
+        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Enable keep-alive on the outgoing target socket
+        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
         if '/vless' in header_str or '/vmess' in header_str or '/trojan' in header_str:
-            target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             target.connect(('127.0.0.1', 81))
             target.sendall(header)
         else:
             client_socket.sendall(b"HTTP/1.1 101 Lanzvps\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-            target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             target.connect(('127.0.0.1', 22))
             
         threading.Thread(target=forward, args=(client_socket, target)).start()
@@ -405,22 +417,17 @@ harden_system() {
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
     done
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-
-    # CRITICAL: Create Dummy Shell to prevent HTTP Injector dropouts
-    cat << 'EOF' > /bin/sshdummy
-#!/bin/bash
-echo "VPN Tunnel Active."
-tail -f /dev/null
-EOF
-    chmod +x /bin/sshdummy
-    grep -q "/bin/sshdummy" /etc/shells || echo "/bin/sshdummy" >> /etc/shells
     
     rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
 
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
-    echo -e "PasswordAuthentication yes\nKbdInteractiveAuthentication yes\nBanner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
+    
+    sed -i '/^Banner/d' /etc/ssh/sshd_config
+    
+    # Apply Tunneling and Keep-alive Directives
+    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "ClientAliveInterval 120" "ClientAliveCountMax 3" "Banner /etc/issue.net" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
 
@@ -432,14 +439,21 @@ EOF
 
 BANNER
     
-    grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
+    # Create the secure dummy shell for SSH tunnelers
+    cat > /bin/tunnel-shell <<'EOF'
+#!/bin/sh
+trap 'exit 0' TERM INT
+while true; do sleep 3600; done
+EOF
+    chmod +x /bin/tunnel-shell
+    grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
 
     systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI & Dummy Shell Active)."
+    log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ADVANCED TUI MANAGER
+#  ADVANCED TUI MANAGER (menu)
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_manage_script() {
@@ -451,53 +465,97 @@ CRED_FILE="/usr/local/etc/xray/credentials.env"
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-source "$CRED_FILE" 2>/dev/null || exit 1
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
+BCYAN='\033[1;36m'; MAGENTA='\033[0;35m'; BMAGENTA='\033[1;35m'; BLUE='\033[0;34m'
+BBLUE='\033[1;34m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
+
+GCHECK="${GREEN}✔${NC}"; GCROSS="${RED}✖${NC}"; GWARN="${YELLOW}⚡${NC}"
+GINFO="${BCYAN}◈${NC}"; GARROW="${BMAGENTA}▶${NC}"
+
+source "$CRED_FILE" 2>/dev/null || { echo "Missing credentials."; exit 1; }
 IP=$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 OS=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
 
 draw_header() {
     clear
-    local up; up=$(uptime -p)
-    local ram; ram=$(free -m | awk 'NR==2{printf "%s/%sMB (%.1f%%)", $3,$2,$3*100/$2 }')
-    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║                AutoXray Elite Manager TUI                ║${NC}"
-    echo -e "${CYAN}${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
-    echo -e "  ${BOLD}OS:${NC} $OS   |  ${BOLD}Uptime:${NC} $up"
-    echo -e "  ${BOLD}IP:${NC} $IP |  ${BOLD}Domain:${NC} $DOMAIN"
-    echo -e "  ${BOLD}RAM Usage:${NC} $ram"
-    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}\n"
+    local up; up=$(uptime -p 2>/dev/null || echo "N/A")
+    local ram; ram=$(free -m 2>/dev/null | awk 'NR==2{printf "%s/%s MB (%.1f%%)", $3,$2,$3*100/$2}')
+
+    echo ""
+    echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.2${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BBLUE}┌──────────────────────────────────────────────────────────────────────┐${NC}"
+    printf "  ${BBLUE}│${NC}  ${BOLD}${CYAN}OS   ${NC}${DIM}%-28s${NC}  ${BOLD}${CYAN}UPTIME  ${NC}${DIM}%-18s${NC}${BBLUE}│${NC}\n" "$OS" "$up"
+    printf "  ${BBLUE}│${NC}  ${BOLD}${MAGENTA}IP   ${NC}${DIM}%-28s${NC}  ${BOLD}${MAGENTA}DOMAIN  ${NC}${DIM}%-18s${NC}${BBLUE}│${NC}\n" "$IP" "$DOMAIN"
+    printf "  ${BBLUE}│${NC}  ${BOLD}${BMAGENTA}RAM  ${NC}${DIM}%-56s${NC}  ${BBLUE}│${NC}\n" "$ram"
+    echo -e "  ${BBLUE}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+}
+
+divider() {
+    echo -e "  ${BMAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+draw_menu() {
+    draw_header
+    divider
+    echo -e "   ${BOLD}${BCYAN}MAIN MENU${NC}"
+    divider
+    echo -e "   ${GARROW}  ${BOLD}1${NC}${DIM})${NC}  Create Account"
+    echo -e "   ${GARROW}  ${BOLD}2${NC}${DIM})${NC}  Manage Accounts"
+    echo -e "   ${GARROW}  ${BOLD}3${NC}${DIM})${NC}  Manage Services"
+    echo -e "   ${GARROW}  ${BOLD}4${NC}${DIM})${NC}  Update Script & Core"
+    echo -e "   ${GARROW}  ${BOLD}5${NC}${DIM})${NC}  Uninstall AutoXray"
+    echo -e "   ${GARROW}  ${BOLD}x${NC}${DIM})${NC}  Exit"
+    divider
+    echo ""
 }
 
 create_account() {
-    echo -e "${BOLD}Select Service Type:${NC}\n 1) SSH-WS\n 2) Xray (VLESS/VMESS)"
-    read -rp "Choice: " s_type
-    read -rp "Username: " u_name
-    read -rp "Expiration (day): " days
-    
+    draw_header
+    divider
+    echo -e "   ${BOLD}${BCYAN}CREATE ACCOUNT${NC}"
+    divider
+    echo -e "   ${GARROW}  ${BOLD}1${NC}) SSH-WS"
+    echo -e "   ${GARROW}  ${BOLD}2${NC}) Xray (VLESS + VMESS + Trojan)"
+    echo ""
+    read -rp "   Select service type [1/2]: " s_type
+
+    case "$s_type" in 1|2) ;; *) echo -e "\n   ${GCROSS} Invalid selection."; sleep 2; return ;; esac
+
+    read -rp "   Username : " u_name
+    [[ -z "$u_name" ]] && { echo -e "\n   ${GCROSS} Username cannot be empty."; sleep 2; return; }
+
+    read -rp "   Expiry   : " days
     if ! [[ "$days" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid input. Please enter a number.${NC}"; sleep 2; return
+        echo -e "\n   ${GCROSS} Invalid input — enter a whole number of days."; sleep 2; return
     fi
     u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
 
     if [[ "$s_type" == "1" ]]; then
-        read -rp "Password: " u_pass
+        read -rp "   Password : " u_pass
+        [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
-        # Using sshdummy prevents the connection from closing instantly
-        useradd -m -s /bin/sshdummy "$u_name" 2>/dev/null || true
+        useradd -m -s /bin/tunnel-shell "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
         echo "${u_name},SSH,${u_pass},${u_exp}" >> "$CSV_DB"
         
         echo ""
-        echo -e "${BOLD}${GREEN}✔ SSH Account Created Successfully!${NC}"
-        echo -e "────────────────────────────────────────"
-        echo -e " ${BOLD}Username${NC}       : $u_name"
-        echo -e " ${BOLD}Pass${NC}           : $u_pass"
-        echo -e " ${BOLD}Expiration${NC}     : $u_exp"
-        echo -e " ${BOLD}Available port${NC} : 80 (WS), 443 (WSS), 22 (SSH)"
-        echo -e "────────────────────────────────────────"
+        divider
+        echo -e "   ${GCHECK}  ${BOLD}${GREEN}SSH Account Created${NC}"
+        divider
+        echo -e "   ${BOLD}${CYAN}Username   ${NC}: $u_name"
+        echo -e "   ${BOLD}${CYAN}Password   ${NC}: $u_pass"
+        echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $u_exp"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
+        divider
         echo ""
         
     elif [[ "$s_type" == "2" ]]; then
@@ -518,144 +576,300 @@ create_account() {
         v_b64=$(echo -n "$v_json" | base64 -w0)
 
         echo ""
-        echo -e "${BOLD}${GREEN}✔ Xray Account Created Successfully!${NC}"
-        echo -e "────────────────────────────────────────"
-        echo -e " ${BOLD}Username${NC}       : $u_name"
-        echo -e " ${BOLD}Expiration${NC}     : $u_exp"
-        echo -e "────────────────────────────────────────"
-        echo -e "${CYAN}VLESS URI:${NC}"
-        echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&headerType=none&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS"
+        divider
+        echo -e "   ${GCHECK}  ${BOLD}${GREEN}Xray Account Created${NC}"
+        divider
+        echo -e "   ${BOLD}${CYAN}Username   ${NC}: $u_name"
+        echo -e "   ${BOLD}${CYAN}UUID       ${NC}: $u_uuid"
+        echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $u_exp"
         echo ""
-        echo -e "${CYAN}VMESS URI:${NC}"
-        echo "vmess://${v_b64}"
-        echo -e "────────────────────────────────────────"
+        echo -e "   ${BMAGENTA}VLESS URI:${NC}"
+        echo -e "   ${DIM}vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&headerType=none&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS${NC}"
+        echo ""
+        echo -e "   ${BMAGENTA}VMESS URI:${NC}"
+        echo -e "   ${DIM}vmess://${v_b64}${NC}"
+        echo ""
+        echo -e "   ${BMAGENTA}TROJAN URI:${NC}"
+        echo -e "   ${DIM}trojan://${u_uuid}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN${NC}"
+        divider
         echo ""
     fi
-    read -rp "Press Enter to return..."
+    read -rp "   Press Enter to return..." </dev/tty
 }
 
-delete_account() {
-    echo -e "${BOLD}Active Users:${NC}"
-    column -s, -t < "$CSV_DB" | nl
+show_account_details() {
+    local username="$1"
+    local line=$(grep "^${username}," "$CSV_DB" | head -1)
+    local svc=$(echo "$line"    | cut -d, -f2)
+    local secret=$(echo "$line" | cut -d, -f3)
+    local expiry=$(echo "$line" | cut -d, -f4)
+
     echo ""
-    read -rp "Enter Username to delete: " del_user
-    if grep -q "^${del_user}," "$CSV_DB"; then
-        svc=$(grep "^${del_user}," "$CSV_DB" | cut -d, -f2)
-        if [[ "$svc" == "SSH" ]]; then
-            pkill -9 -u "$del_user" 2>/dev/null || true
-            userdel -f -r "$del_user" 2>/dev/null || true
-        elif [[ "$svc" == "Xray" ]]; then
-            jq --arg user "$del_user" '
-              .inbounds |= map(
-                if .settings.clients then
-                  .settings.clients |= map(select(.email != $user))
-                else . end
-              )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-            systemctl restart xray
-        fi
-        sed -i "/^${del_user},/d" "$CSV_DB"
-        echo -e "${GREEN}User $del_user deleted successfully.${NC}"
-    else
-        echo -e "${RED}User not found.${NC}"
+    divider
+    echo -e "   ${GINFO}  ${BOLD}${BCYAN}Account Details — ${username}${NC}"
+    divider
+    echo -e "   ${BOLD}${CYAN}Username   ${NC}: $username"
+    echo -e "   ${BOLD}${CYAN}Service    ${NC}: $svc"
+    echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $expiry"
+    echo ""
+
+    if [[ "$svc" == "SSH" ]]; then
+        echo -e "   ${BOLD}${CYAN}Password   ${NC}: $secret"
+        echo -e "   ${BOLD}${CYAN}Host       ${NC}: $IP"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
+
+    elif [[ "$svc" == "Xray" ]]; then
+        local uuid="$secret"
+        local v_json="{\"v\":\"2\",\"ps\":\"${username}-VMESS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
+        local v_b64=$(echo -n "$v_json" | base64 -w0)
+
+        echo -e "   ${BMAGENTA}VLESS URI:${NC}"
+        echo -e "   ${DIM}vless://${uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&headerType=none&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${username}-VLESS${NC}"
+        echo ""
+        echo -e "   ${BMAGENTA}VMESS URI:${NC}"
+        echo -e "   ${DIM}vmess://${v_b64}${NC}"
+        echo ""
+        echo -e "   ${BMAGENTA}TROJAN URI:${NC}"
+        echo -e "   ${DIM}trojan://${uuid}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${username}-TROJAN${NC}"
     fi
-    read -rp "Press Enter to return..."
+
+    divider
+    echo ""
+    read -rp "   Press Enter to return..." </dev/tty
 }
 
-renew_account() {
-    read -rp "Enter Username to renew: " ren_user
-    if grep -q "^${ren_user}," "$CSV_DB"; then
-        read -rp "Expiration (day): " days
-        if ! [[ "$days" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}Invalid input. Please enter a number.${NC}"; sleep 2; return
-        fi
-        
-        # Extend from existing date if possible, else from today
-        local current_exp=$(grep "^${ren_user}," "$CSV_DB" | cut -d, -f4)
-        if [[ "$current_exp" == "Never" ]] || ! date -d "$current_exp" &>/dev/null; then
-            new_exp=$(date -d "+${days} days" +"%Y-%m-%d")
-        else
-            new_exp=$(date -d "${current_exp} +${days} days" +"%Y-%m-%d")
-        fi
-        
-        svc=$(grep "^${ren_user}," "$CSV_DB" | cut -d, -f2)
-        sed -i "s|^${ren_user},${svc},.*,.*|${ren_user},${svc},$(grep "^${ren_user}," "$CSV_DB" | cut -d, -f3),${new_exp}|" "$CSV_DB"
-        [[ "$svc" == "SSH" ]] && chage -E "$new_exp" "$ren_user" 2>/dev/null || true
-        echo -e "${GREEN}User $ren_user renewed! New Expiration: $new_exp.${NC}"
-    else
-        echo -e "${RED}User not found.${NC}"
+_delete_account() {
+    local username="$1"
+    local svc=$(grep "^${username}," "$CSV_DB" | cut -d, -f2)
+
+    echo ""
+    read -rp "   ${GWARN}  Confirm deletion of '${username}'? [y/N]: " confirm </dev/tty
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "   ${GINFO} Deletion cancelled."; sleep 1; return
     fi
-    read -rp "Press Enter to return..."
+
+    if [[ "$svc" == "SSH" ]]; then
+        pkill -9 -u "$username" 2>/dev/null || true
+        userdel -f -r "$username" 2>/dev/null || true
+    elif [[ "$svc" == "Xray" ]]; then
+        jq --arg user "$username" '
+          .inbounds |= map(
+            if .settings.clients then
+              .settings.clients |= map(select(.email != $user))
+            else . end
+          )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+        systemctl restart xray
+    fi
+
+    sed -i "/^${username},/d" "$CSV_DB"
+    echo -e "   ${GCHECK} ${GREEN}User ${BOLD}${username}${NC}${GREEN} deleted successfully.${NC}"
+    sleep 2
+}
+
+_extend_account() {
+    local username="$1"
+    local current_exp svc secret days new_exp
+
+    svc=$(grep "^${username},"    "$CSV_DB" | cut -d, -f2)
+    secret=$(grep "^${username}," "$CSV_DB" | cut -d, -f3)
+    current_exp=$(grep "^${username}," "$CSV_DB" | cut -d, -f4)
+
+    echo ""
+    echo -e "   ${GINFO}  Current expiry: ${BOLD}${current_exp}${NC}"
+    read -rp "   Days to add: " days </dev/tty
+
+    if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+        echo -e "   ${GCROSS} Invalid input — enter a whole number."; sleep 2; return
+    fi
+
+    if [[ "$current_exp" == "Never" ]] || ! date -d "$current_exp" &>/dev/null; then
+        new_exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    else
+        new_exp=$(date -d "${current_exp} +${days} days" +"%Y-%m-%d")
+    fi
+
+    local escaped_secret=$(printf '%s' "$secret" | sed 's/[\/&]/\\&/g')
+    sed -i "s|^${username},${svc},.*,.*|${username},${svc},${escaped_secret},${new_exp}|" "$CSV_DB"
+
+    [[ "$svc" == "SSH" ]] && chage -E "$new_exp" "$username" 2>/dev/null || true
+    echo -e "   ${GCHECK} ${GREEN}Expiry for ${BOLD}${username}${NC}${GREEN} updated to ${BOLD}${new_exp}${NC}${GREEN}.${NC}"
+    sleep 2
+}
+
+manage_accounts() {
+    while true; do
+        draw_header
+        divider
+        echo -e "   ${BOLD}${BCYAN}MANAGE ACCOUNTS${NC}"
+        divider
+
+        local -a usernames protocols
+        usernames=()
+        protocols=()
+
+        local idx=0
+        while IFS=',' read -r uname svc _rest; do
+            usernames+=("$uname")
+            protocols+=("$svc")
+            (( idx++ ))
+        done < <(tail -n +2 "$CSV_DB")
+
+        if [[ ${#usernames[@]} -eq 0 ]]; then
+            echo -e "   ${GWARN} No accounts found in database."
+            divider
+            read -rp "   Press Enter to return..." </dev/tty
+            return
+        fi
+
+        printf "   ${DIM}%-6s  %-24s  %-12s${NC}\n" "IDX" "USERNAME" "PROTOCOL"
+        divider
+        for (( i=0; i<${#usernames[@]}; i++ )); do
+            local proto_color="$CYAN"
+            [[ "${protocols[$i]}" == "SSH" ]]  && proto_color="$GREEN"
+            [[ "${protocols[$i]}" == "Xray" ]] && proto_color="$BMAGENTA"
+            printf "   ${BOLD}${YELLOW}%-6s${NC}  ${WHITE}%-24s${NC}  ${proto_color}%-12s${NC}\n" \
+                "$((i+1))" "${usernames[$i]}" "${protocols[$i]}"
+        done
+        divider
+        echo -e "   ${GARROW}  ${BOLD}0${NC})  Back to Main Menu"
+        echo ""
+
+        read -rp "   Pick account (number): " pick </dev/tty
+
+        if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
+            echo -e "\n   ${GCROSS} Invalid input."; sleep 2; continue
+        fi
+        [[ "$pick" -eq 0 ]] && return
+
+        if (( pick < 1 || pick > ${#usernames[@]} )); then
+            echo -e "\n   ${GCROSS} No account at index ${pick}."; sleep 2; continue
+        fi
+
+        local selected_user="${usernames[$((pick-1))]}"
+
+        while true; do
+            draw_header
+            divider
+            echo -e "   ${BOLD}${BCYAN}ACCOUNT MENU  ${BMAGENTA}▶  ${WHITE}${selected_user}${NC}"
+            divider
+            echo -e "   ${GARROW}  ${BOLD}1${NC})  Show account details"
+            echo -e "   ${GARROW}  ${BOLD}2${NC})  Delete account"
+            echo -e "   ${GARROW}  ${BOLD}3${NC})  Extend account"
+            echo -e "   ${GARROW}  ${BOLD}4${NC})  Back to account list"
+            divider
+            echo ""
+            read -rp "   Select option: " sub_opt </dev/tty
+
+            case "$sub_opt" in
+                1) show_account_details  "$selected_user" ;;
+                2) _delete_account       "$selected_user"; break ;;
+                3) _extend_account       "$selected_user" ;;
+                4) break ;;
+                *) echo -e "\n   ${GCROSS} Invalid option."; sleep 1 ;;
+            esac
+        done
+    done
 }
 
 manage_services() {
+    draw_header
+    divider
+    echo -e "   ${BOLD}${BCYAN}SERVICE STATUS${NC}"
+    divider
     for svc in xray nginx ws-proxy fail2ban; do
-        if systemctl is-active --quiet "$svc"; then echo -e "  ${GREEN}●${NC} $svc: active"; else echo -e "  ${RED}●${NC} $svc: inactive"; fi
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            printf "   ${GREEN}● ACTIVE  ${NC}${BOLD}%-16s${NC}\n" "$svc"
+        else
+            printf "   ${RED}● INACTIVE${NC}${BOLD}%-16s${NC}\n" "$svc"
+        fi
     done
-    read -rp "Restart all services? [y/N]: " rst
-    if [[ "$rst" =~ ^[Yy]$ ]]; then systemctl restart xray nginx ws-proxy fail2ban; fi
+    divider
+    echo ""
+    read -rp "   Restart all services? [y/N]: " rst </dev/tty
+    if [[ "$rst" =~ ^[Yy]$ ]]; then
+        for svc in xray nginx ws-proxy fail2ban; do
+            systemctl restart "$svc" 2>/dev/null && \
+                echo -e "   ${GCHECK} ${svc} restarted." || \
+                echo -e "   ${GWARN} ${svc} could not be restarted."
+        done
+        sleep 2
+    fi
 }
 
 update_script_and_core() {
-    echo -e "\n  ${CYAN}[i] Downloading latest installer from GitHub...${NC}"
+    draw_header
+    divider
+    echo -e "   ${BOLD}${BCYAN}UPDATE SCRIPT & CORE${NC}"
+    divider
+    echo -e "   ${GINFO}  Downloading latest installer from GitHub..."
+    echo ""
+
     local tmp_sh="/tmp/autoxray_update.sh"
 
     if curl -# -fL "$SCRIPT_URL" -o "$tmp_sh"; then
         chmod +x "$tmp_sh"
-        echo -e "  ${GREEN}[✔] Download complete. Commencing safe upgrade...${NC}"
-        sleep 2
+        echo -e "   ${GCHECK} Download complete. Commencing safe upgrade..."
+        echo -e "   ${GWARN} The menu will automatically close during the update."
+        sleep 3
         
-        # Using exec replaces the Bash process entirely, preventing read-corruption crashes
+        # Exec replaces the running process to prevent Bash memory read-corruption
         exec bash "$tmp_sh"
     else
-        echo -e "  ${RED}[✖] Failed to download update.${NC}"
+        echo -e "   ${GCROSS} Failed to download update."
         rm -f "$tmp_sh"
         sleep 3
     fi
 }
 
 uninstall_autoxray() {
-    read -rp "WARNING: This will completely remove AutoXray. Proceed? [y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        systemctl stop xray ws-proxy 2>/dev/null || true
-        systemctl disable xray ws-proxy 2>/dev/null || true
-        rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service
+    draw_header
+    divider
+    echo -e "   ${BOLD}${RED}UNINSTALL AUTOXRAY${NC}"
+    divider
+    echo -e "   ${GWARN}  This will permanently remove AutoXray and all configuration."
+    echo ""
+    read -rp "   Type 'YES' to confirm: " confirm </dev/tty
+    if [[ "$confirm" == "YES" ]]; then
+        systemctl stop  xray ws-proxy ssh-websocket 2>/dev/null || true
+        systemctl disable xray ws-proxy ssh-websocket 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service \
+              /etc/systemd/system/ws-proxy.service \
+              /etc/systemd/system/ssh-websocket.service
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
-        rm -f /usr/local/bin/xray /usr/local/bin/autoxray /usr/local/bin/menu /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
+        rm -f /usr/local/bin/xray \
+              /usr/local/bin/menu \
+              /usr/local/bin/ws-proxy.py \
+              /etc/nginx/conf.d/autoxray-*.conf
         systemctl daemon-reload
         systemctl reload nginx 2>/dev/null || true
-        echo -e "${GREEN}Uninstallation complete. Manager will now exit.${NC}"
+        echo -e "\n   ${GCHECK}  ${BOLD}${GREEN}Uninstallation complete. Exiting.${NC}"
+        sleep 2
         exit 0
+    else
+        echo -e "   ${GINFO} Uninstall cancelled."; sleep 2
     fi
 }
 
 while true; do
-    draw_header
-    echo "  1) Create Account"
-    echo "  2) Delete Account"
-    echo "  3) Renew Account"
-    echo "  4) List Users Database"
-    echo "  5) Manage Services"
-    echo "  6) Update Script & Core"
-    echo "  7) Uninstall AutoXray Script"
-    echo "  x) Exit Manager"
-    echo ""
-    read -rp "Select an option: " opt
-    case $opt in
-        1) create_account ;;
-        2) delete_account ;;
-        3) renew_account ;;
-        4) column -s, -t < "$CSV_DB" | nl; read -rp "Press Enter to return..." ;;
-        5) manage_services ;;
-        6) update_script_and_core ;;
-        7) uninstall_autoxray ;;
-        x) clear; exit 0 ;;
-        *) echo "Invalid option." ; sleep 1 ;;
+    draw_menu
+    read -rp "   Select option: " opt </dev/tty
+    case "$opt" in
+        1) create_account      ;;
+        2) manage_accounts     ;;
+        3) manage_services     ;;
+        4) update_script_and_core ;;
+        5) uninstall_autoxray  ;;
+        x|X) clear; exit 0    ;;
+        *) echo -e "\n   ${GCROSS} Invalid option — try again."; sleep 1 ;;
     esac
 done
 MANAGE
 
     chmod +x /usr/local/bin/menu
+    
+    # Remove old binary if it exists
     rm -f /usr/local/bin/autoxray 2>/dev/null
+    
     log "Management helper installed. Access via: menu"
 }
 
@@ -675,16 +889,22 @@ do_uninstall() {
 }
 
 start_services() {
-    for svc in nginx xray ws-proxy fail2ban; do systemctl start "$svc" 2>/dev/null || true; done
+    for svc in nginx xray ws-proxy fail2ban; do systemctl start "$svc" 2>/dev/null; done
     log "All services activated."
 }
 
 print_summary() {
     echo ""
-    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${GREEN}║         AutoXray Elite Installation Complete ✔           ║${NC}"
-    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo -e "\n  ${BOLD}Management Console:${NC} Type ${YELLOW}menu${NC} to open the TUI."
+    echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}PHC-Lanz ScriptX${NC}  —  Installation Complete ${GCHECK}          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}v${SCRIPT_VERSION}${NC}                                                  ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}menu${NC} to launch the management console."
+    echo -e "  ${GCHECK}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
+    echo -e "  ${GCHECK}  Logs: ${BOLD}${LOG_FILE}${NC}"
     echo ""
 }
 
@@ -704,6 +924,7 @@ main() {
     start_services
     print_summary
     
+    # Cleanup temp updater
     rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
