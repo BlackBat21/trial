@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.5 (Smart WS Payload Stripper + Tunnel Shell Fix)
+# Version : 4.0.6 (FreeNetLabs WS-Proxy Integration + Bulletproof Shell)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.5"
+readonly SCRIPT_VERSION="4.0.6"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -277,7 +277,7 @@ XRAY_JSON
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SERVICES: XRAY, NGINX & AUTOSCRIPTX PYTHON PROXY
+#  SERVICES: XRAY, NGINX & AUTOSCRIPTX WS-PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_services() {
@@ -327,118 +327,29 @@ server {
         proxy_set_header Host \$host; 
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+        proxy_buffering off;
+        tcp_nodelay on;
     }
 }
 NGINX_CONF
 
-    # The new Smart Python Proxy to handle Double GET payload garbage
-    cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
-#!/usr/bin/env python3
-import socket, threading
-
-def forward_ssh(src, dst, initial_data):
-    """
-    Strips leftover HTTP payload garbage (like Double GET requests) 
-    and only forwards the pure SSH protocol stream to OpenSSH.
-    """
-    try:
-        ssh_started = False
-        # Scan the initial pipelined buffer for the SSH handshake
-        idx = initial_data.find(b'SSH-')
-        if idx != -1:
-            dst.sendall(initial_data[idx:])
-            ssh_started = True
-        
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            
-            if not ssh_started:
-                idx = data.find(b'SSH-')
-                if idx != -1:
-                    dst.sendall(data[idx:])
-                    ssh_started = True
-            else:
-                dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
-        except: pass
-
-def forward(src, dst):
-    try:
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
-        except: pass
-
-def handle_client(client_socket):
-    try:
-        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        header = client_socket.recv(8192)
-        if not header:
-            client_socket.close()
-            return
-        
-        header_str = header.decode('utf-8', 'ignore')
-        
-        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
-        if '/vless' in header_str or '/vmess' in header_str or '/trojan' in header_str:
-            target.connect(('127.0.0.1', 81))
-            target.sendall(header)
-            threading.Thread(target=forward, args=(client_socket, target), daemon=True).start()
-            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
-        else:
-            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-            target.connect(('127.0.0.1', 22))
-            
-            # Pass the raw header buffer to the smart SSH forwarder
-            threading.Thread(target=forward_ssh, args=(client_socket, target, header), daemon=True).start()
-            threading.Thread(target=forward, args=(target, client_socket), daemon=True).start()
-    except Exception:
-        try: client_socket.close()
-        except: pass
-
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', 80))
-server.listen(1000)
-while True:
-    try:
-        client, _ = server.accept()
-        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
-    except Exception:
-        pass
-PYTHON_SCRIPT
-
-    chmod +x /usr/local/bin/ws-proxy.py
-
-    cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
-[Unit]
-Description=AutoScriptX Python WS Proxy
-After=network.target
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
-Restart=always
-LimitNOFILE=65535
-[Install]
-WantedBy=multi-user.target
-SERVICE
-    systemctl daemon-reload; systemctl enable ws-proxy
+    log "Integrating stable ws-proxy from FreeNetLabs/AutoScriptX..."
+    local FNL_REPO="https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master"
+    
+    # Remove old implementations
+    rm -f /usr/local/bin/ws-proxy.py
+    rm -f /usr/local/bin/ws-proxy
+    
+    # Download the stable Go binary
+    wget -q -O /usr/local/bin/ws-proxy "${FNL_REPO}/bin/ws-proxy"
+    chmod +x /usr/local/bin/ws-proxy
+    
+    # Download the corresponding service file
+    wget -q -O /etc/systemd/system/ws-proxy.service "${FNL_REPO}/service/systemd/ws-proxy.service"
+    chmod 644 /etc/systemd/system/ws-proxy.service
+    
+    systemctl daemon-reload
+    systemctl enable ws-proxy
 }
 
 harden_system() {
@@ -453,7 +364,7 @@ harden_system() {
     ufw deny out 6881:6889/udp
     ufw --force enable
     
-    # Anti-Torrent DPI (Duplicate check prevents iptables bloat)
+    # Anti-Torrent DPI 
     for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
         iptables -C FORWARD -m string --algo bm --string "$str" -j DROP 2>/dev/null || \
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
@@ -482,11 +393,7 @@ harden_system() {
 BANNER
     
     # The secure tunnel shell to keep users connected indefinitely
-    cat > /bin/tunnel-shell <<'EOF'
-#!/bin/sh
-trap '' HUP INT TERM QUIT
-while true; do sleep 86400; done
-EOF
+    echo -e '#!/bin/sh\ntrap "" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
 
@@ -528,7 +435,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.5${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.6${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -855,7 +762,6 @@ update_script_and_core() {
         echo -e "   ${GWARN} The menu will automatically close during the update."
         sleep 3
         
-        # Exec replaces the running process to prevent Bash memory read-corruption
         exec bash "$tmp_sh"
     else
         echo -e "   ${GCROSS} Failed to download update."
@@ -882,6 +788,7 @@ uninstall_autoxray() {
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
               /usr/local/bin/ws-proxy.py \
+              /usr/local/bin/ws-proxy \
               /etc/nginx/conf.d/autoxray-*.conf
         systemctl daemon-reload
         systemctl reload nginx 2>/dev/null || true
@@ -925,7 +832,7 @@ do_uninstall() {
     systemctl disable xray ws-proxy ssh-websocket 2>/dev/null || true
     rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/ssh-websocket.service
     rm -rf /usr/local/etc/xray /etc/ssl/autoxray
-    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
+    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /usr/local/bin/ws-proxy /etc/nginx/conf.d/autoxray-*.conf
     systemctl daemon-reload; systemctl reload nginx 2>/dev/null || true
     log "Uninstall complete."
     exit 0
