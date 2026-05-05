@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.2 (Stable Core + Advanced TUI + Anti-Torrent + Safe Updates)
+# Version : 4.0.3 (Stable Core + TUI + Anti-Torrent + Dummy Shell Fix)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.2"
+readonly SCRIPT_VERSION="4.0.3"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -411,6 +411,15 @@ harden_system() {
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
     done
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+
+    # Create dummy shell to hold SSH connections open indefinitely
+    cat << 'EOF' > /bin/sshdummy
+#!/bin/bash
+echo "VPN Tunnel Active."
+tail -f /dev/null
+EOF
+    chmod +x /bin/sshdummy
+    grep -q "/bin/sshdummy" /etc/shells || echo "/bin/sshdummy" >> /etc/shells
     
     rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
@@ -434,7 +443,7 @@ BANNER
     grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
 
     systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI Active)."
+    log "System Hardened (Anti-Torrent DPI & Dummy Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,7 +480,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.2${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.3${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -527,7 +536,7 @@ create_account() {
         read -rp "   Password : " u_pass
         [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
-        useradd -m -s /bin/false "$u_name" 2>/dev/null || true
+        useradd -m -s /bin/sshdummy "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
         echo "${u_name},SSH,${u_pass},${u_exp}" >> "$CSV_DB"
