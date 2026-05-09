@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.1.0 (Definitive EOF / Tunnel-Drop Fix)
+# Version : 4.0.9 (Patched WebSocket Handshake & Tunnel Fixes)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.0.9"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -277,8 +277,7 @@ XRAY_JSON
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SERVICES: XRAY, NGINX & PYTHON PROXY
-#  *** FIXED: ws-proxy.py rewritten with correct passthrough logic ***
+#  SERVICES: XRAY, NGINX & SMART PYTHON PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_services() {
@@ -287,9 +286,7 @@ install_services() {
     cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
 Description=Xray Service
-After=network.target
-
-[Service]
+After=network.target[Service]
 Type=simple
 User=nobody
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
@@ -325,195 +322,132 @@ server {
 }
 NGINX_CONF
 
-    # =========================================================================
-    # FIX 1 — ws-proxy.py: Replace the broken SSH-banner scanner with a clean
-    #          direct passthrough.
-    #
-    # ROOT CAUSE (old code): forward_ssh_c2s() searched for b'SSH-' in incoming
-    # data before forwarding anything to the SSH daemon. Two failure modes:
-    #
-    #   a) Buffer-truncation race: when the accumulated buffer exceeded 4 096
-    #      bytes the tail was trimmed to 10 bytes. If the SSH banner arrived
-    #      split across that boundary it was silently discarded, leaving the SSH
-    #      daemon waiting for a client banner that never came → server-side EOF.
-    #
-    #   b) Unnecessary stall: even when no truncation occurred, no data reached
-    #      sshd until the proxy had "seen" the banner string. Any TCP segment
-    #      that arrived before the banner caused a blocking loop that widened the
-    #      race window, giving sshd enough time to time-out and close the socket.
-    #
-    # THE FIX: After the HTTP upgrade handshake the proxy forwards bytes from
-    # the client to sshd immediately and unconditionally — no pattern search,
-    # no buffer accumulation, no trimming. Any pipelined bytes that arrived
-    # with the original HTTP request are flushed first, then the loop takes over.
-    # TCP_NODELAY is set on every socket so the Nagle algorithm cannot introduce
-    # additional 200 ms delays during the SSH key-exchange phase.
-    # =========================================================================
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
-"""
-AutoXray WebSocket-to-TCP proxy.
-Listens on :80, speaks a bare HTTP-upgrade handshake, then does full-duplex
-raw TCP passthrough to either the SSH daemon (:22) or Nginx (:81) depending
-on the request path.
-"""
-import socket
-import threading
-import hashlib
-import base64
+import socket, threading, hashlib, base64
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _set_socket_opts(sock: socket.socket) -> None:
-    """Apply keep-alive and disable Nagle on *sock*."""
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    # Linux-specific keep-alive tuning (ignored silently on other kernels)
+def forward_ssh_c2s(src, dst, initial_data):
+    """Client to Server Thread: Smart payload stripper with fallback."""
     try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  60)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    6)
-    except AttributeError:
-        pass
+        buffer = initial_data
+        ssh_started = False
 
+        if buffer:
+            idx = buffer.find(b'SSH-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+            elif len(buffer) > 8192:
+                # Prevent getting stuck if payload is obfuscated/masked
+                dst.sendall(buffer)
+                ssh_started = True
 
-def _pipe(src: socket.socket, dst: socket.socket,
-          initial: bytes = b"") -> None:
-    """
-    Forward bytes from *src* to *dst* until EOF, then half-close *dst*.
-
-    If *initial* is non-empty it is sent to *dst* first (pipelined bytes
-    that were over-read from the HTTP request buffer).
-    """
-    try:
-        if initial:
-            dst.sendall(initial)
+        # Accumulate data until the SSH banner is found or fallback is met
+        while not ssh_started:
+            data = src.recv(8192)
+            if not data: return
+            buffer += data
+            
+            idx = buffer.find(b'SSH-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+                break
+                
+            if len(buffer) > 8192:
+                dst.sendall(buffer)
+                ssh_started = True
+                break
+            
+        # Standard pass-through once banner is established
         while True:
             data = src.recv(8192)
-            if not data:
-                break
+            if not data: break
             dst.sendall(data)
     except Exception:
         pass
     finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except Exception:
-            pass
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
 
-
-# ---------------------------------------------------------------------------
-# Connection handler
-# ---------------------------------------------------------------------------
-
-def handle_client(client: socket.socket) -> None:
-    target: socket.socket | None = None
+def forward_generic(src, dst):
+    """Server to Client Thread: Standard pass-through."""
     try:
-        _set_socket_opts(client)
-
-        # ── 1. Read the full HTTP request head ──────────────────────────────
-        req = b""
-        while b"\r\n\r\n" not in req:
-            chunk = client.recv(4096)
-            if not chunk:
-                return
-            req += chunk
-
-        head_bytes, _, pipelined = req.partition(b"\r\n\r\n")
-        head_str = head_bytes.decode("utf-8", "ignore")
-
-        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _set_socket_opts(target)
-
-        # ── 2. Route: Xray paths → Nginx:81, everything else → sshd:22 ──────
-        is_xray = any(p in head_str for p in ("/vless", "/vmess", "/trojan"))
-
-        if is_xray:
-            # Plain TCP relay — forward the entire original request so Nginx
-            # can process the WebSocket upgrade headers itself.
-            target.connect(("127.0.0.1", 81))
-            target.sendall(req)
-            # Symmetric passthrough; no pipelined data to pre-send.
-            t1 = threading.Thread(target=_pipe, args=(client, target),
-                                  daemon=True)
-            t2 = threading.Thread(target=_pipe, args=(target, client),
-                                  daemon=True)
-        else:
-            # ── SSH-WS path ─────────────────────────────────────────────────
-            # Parse Sec-WebSocket-Key so strict WS clients (e.g. HTTP Injector)
-            # accept the upgrade response.
-            ws_key: str | None = None
-            for line in head_str.split("\r\n"):
-                if line.lower().startswith("sec-websocket-key:"):
-                    ws_key = line.split(":", 1)[1].strip()
-                    break
-
-            if ws_key:
-                magic  = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-                accept = base64.b64encode(
-                    hashlib.sha1((ws_key + magic).encode()).digest()
-                ).decode()
-                response = (
-                    "HTTP/1.1 101 Switching Protocols\r\n"
-                    "Upgrade: websocket\r\n"
-                    "Connection: Upgrade\r\n"
-                    f"Sec-WebSocket-Accept: {accept}\r\n"
-                    "\r\n"
-                )
-                client.sendall(response.encode())
-            else:
-                client.sendall(
-                    b"HTTP/1.1 101 Switching Protocols\r\n"
-                    b"Upgrade: websocket\r\n"
-                    b"Connection: Upgrade\r\n"
-                    b"\r\n"
-                )
-
-            # Connect to sshd AFTER sending the 101 so the client does not
-            # time-out waiting for the upgrade acknowledgement.
-            target.connect(("127.0.0.1", 22))
-
-            # FIX: pass `pipelined` as initial data to _pipe so any bytes that
-            # arrived together with the HTTP headers are sent to sshd at once,
-            # without any pattern-matching delay or buffer-trimming risk.
-            t1 = threading.Thread(target=_pipe,
-                                  args=(client, target, pipelined),
-                                  daemon=True)
-            t2 = threading.Thread(target=_pipe, args=(target, client),
-                                  daemon=True)
-
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
     except Exception:
         pass
     finally:
-        for sock in (target, client):
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
 
+def handle_client(client_socket):
+    target = None
+    try:
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        req = b""
+        while b"\r\n\r\n" not in req:
+            chunk = client_socket.recv(4096)
+            if not chunk: return
+            req += chunk
+            
+        head_str = req.decode('utf-8', 'ignore')
+        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-# ---------------------------------------------------------------------------
-# Server loop
-# ---------------------------------------------------------------------------
+        if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
+            target.connect(('127.0.0.1', 81))
+            target.sendall(req)
+            t1 = threading.Thread(target=forward_generic, args=(client_socket, target), daemon=True)
+            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
+        else:
+            # Parse Sec-WebSocket-Key to satisfy strict WebSocket clients
+            ws_key = None
+            for line in head_str.split('\r\n'):
+                if line.lower().startswith('sec-websocket-key:'):
+                    ws_key = line.split(':', 1)[1].strip()
+                    break
+                    
+            if ws_key:
+                magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                accept = base64.b64encode(hashlib.sha1((ws_key + magic).encode('utf-8')).digest()).decode('utf-8')
+                resp = f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                client_socket.sendall(resp.encode('utf-8'))
+            else:
+                client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                
+            target.connect(('127.0.0.1', 22))
+            
+            _, _, pipelined = req.partition(b"\r\n\r\n")
+            t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
+            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
+            
+        t1.start()
+        t2.start()
+        
+        t1.join()
+        t2.join()
+        
+    except Exception:
+        pass
+    finally:
+        if target:
+            try: target.close()
+            except: pass
+        try: client_socket.close()
+        except: pass
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(("0.0.0.0", 80))
-server.listen(1024)
-
+server.bind(('0.0.0.0', 80))
+server.listen(1000)
 while True:
     try:
-        conn, _ = server.accept()
-        threading.Thread(target=handle_client, args=(conn,),
-                         daemon=True).start()
+        client, _ = server.accept()
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
     except Exception:
         pass
 PYTHON_SCRIPT
@@ -530,7 +464,6 @@ Type=simple
 User=root
 ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
 Restart=always
-RestartSec=3
 LimitNOFILE=65535
 
 [Install]
@@ -564,26 +497,12 @@ harden_system() {
 
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
+    
+    # Crucial HTTP Injector Fix: Strip out all banners globally to prevent JSch EOF issues
     sed -i '/^Banner/d' /etc/ssh/sshd_config
-
-    # =========================================================================
-    # FIX 2 — sshd_config: add TCP keep-alive so the kernel detects dead
-    # connections instead of leaving half-open sockets that block new logins.
-    # ClientAliveInterval/CountMax provides application-layer liveness checks
-    # from the sshd side, complementing the socket-level SO_KEEPALIVE set by
-    # the proxy.
-    # =========================================================================
-    cat > /etc/ssh/sshd_config.d/99-force-pass.conf <<'SSHD_CONF'
-PasswordAuthentication yes
-KbdInteractiveAuthentication yes
-AllowTcpForwarding yes
-PermitTunnel yes
-GatewayPorts yes
-TCPKeepAlive yes
-ClientAliveInterval 30
-ClientAliveCountMax 6
-Banner /etc/issue.net
-SSHD_CONF
+    
+    # Add tunneling permissions to OpenSSH and keep-alive directives to prevent idleness
+    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "PermitTunnel yes" "GatewayPorts yes" "TCPKeepAlive yes" "ClientAliveInterval 120" "ClientAliveCountMax 2" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
 
@@ -594,36 +513,14 @@ SSHD_CONF
   └─────────────────────────────────────────────┘
 
 BANNER
-
-    # =========================================================================
-    # FIX 3 — /bin/tunnel-shell: the previous implementation used
-    #   trap "exit 0" HUP INT TERM QUIT
-    # which caused the shell to *exit* the moment sshd sent SIGHUP during
-    # session setup (typically within 1-2 s of authentication), matching the
-    # exact symptom: "Connection Lost: Cannot fill buffer, EOF reached".
-    #
-    # The fix replaces the exit-trap with an *ignore-trap* (`trap '' ...`) and
-    # uses a sleep-loop pattern instead of `tail -f /dev/null`.  The sleep
-    # runs as a background child so that `wait` is interruptible; because the
-    # parent shell ignores the signals, neither SIGHUP from a closing PTY nor
-    # SIGTERM from sshd teardown will kill the process before the SSH client
-    # voluntarily disconnects.
-    # =========================================================================
-    cat > /bin/tunnel-shell <<'TUNNEL_SHELL'
-#!/bin/bash
-# Tunnel-keep-alive shell for SSH-WS accounts.
-# Signals are IGNORED (not trapped to exit) so sshd housekeeping signals
-# cannot collapse the session prematurely.
-trap '' HUP INT TERM QUIT PIPE
-while true; do
-    sleep 3600 &
-    wait $!
-done
-TUNNEL_SHELL
+    
+    # THE FIX: Create the infinite tunnel shell using 'read' to continually consume stdin,
+    # preventing the SSH Daemon's pipe buffers from filling and immediately disconnecting.
+    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\nwhile true; do read -r line; done' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
     
-    # Auto-patch all existing SSH users to use the corrected shell
+    # THE FIX: Auto-patch all existing SSH users created by the previous script
     if [[ -f "$CSV_DB" ]]; then
         while IFS=',' read -r uname svc _rest; do
             if [[ "$svc" == "SSH" ]]; then
@@ -633,7 +530,7 @@ TUNNEL_SHELL
     fi
 
     systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI, corrected Tunnel Shell & SSH keep-alive active)."
+    log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -670,7 +567,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.1.0${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.9${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -726,6 +623,7 @@ create_account() {
         read -rp "   Password : " u_pass
         [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
+        # New users are correctly provisioned with the tunnel shell
         useradd -m -s /bin/tunnel-shell "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
@@ -1079,14 +977,14 @@ print_summary() {
     echo ""
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}PHC-Lanz ScriptX${NC}  —  Installation Complete ${GREEN}✔${NC}          ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}PHC-Lanz ScriptX${NC}  —  Installation Complete ${GCHECK}          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${DIM}v${SCRIPT_VERSION}${NC}                                                  ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${GREEN}✔${NC}  Type ${BOLD}${YELLOW}menu${NC} to launch the management console."
-    echo -e "  ${GREEN}✔${NC}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
-    echo -e "  ${GREEN}✔${NC}  Logs: ${BOLD}${LOG_FILE}${NC}"
+    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}menu${NC} to launch the management console."
+    echo -e "  ${GCHECK}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
+    echo -e "  ${GCHECK}  Logs: ${BOLD}${LOG_FILE}${NC}"
     echo ""
 }
 
