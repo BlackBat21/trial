@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
-# Version : 4.0.9 (Patched TTY Pipe Bug, Nginx IPv6 Crash & Grep Fix)
+# Version : 4.0.9 (Patched TTY Pipe Consumption & Robust IP Fallbacks)
 # =============================================================================
 
 # Color definitions
@@ -42,7 +42,7 @@ log_warning() { echo -e "${yellow}[ Warning ]${nc} $1"; }
 
 # Check if script is run as root
 check_root() {
-    if[ "$(id -u)" -ne 0 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
         log_error "Run as root."
         exit 1
     fi
@@ -52,33 +52,43 @@ check_root() {
 setup_hosts() {
     log_info "Setting up hostname and hosts file..."
     localip=$(hostname -I | cut -d ' ' -f1)
-    public_ip=$(curl -s ifconfig.me)
+    public_ip=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 ifconfig.me)
     hostname=$(hostname)
-    domain_from_etc=$(grep -w "$hostname" /etc/hosts | awk '{print $2}')[ "$hostname" != "$domain_from_etc" ] && echo "$localip $hostname" >> /etc/hosts
+    domain_from_etc=$(grep -w "$hostname" /etc/hosts | awk '{print $2}')
+    [ "$hostname" != "$domain_from_etc" ] && echo "$localip $hostname" >> /etc/hosts
     log_success "Hostname and hosts file configured."
 }
 
-# Setup domain configuration (Patched TTY Piping & Auto-Fallback)
+# Setup domain configuration (Bulletproof TTY Piping & Auto-Fallback)
 setup_domain() {
     mkdir -p /etc/AutoScriptX
     clear
     echo "---------------------------"
     echo "      VPS DOMAIN SETUP     "
     echo "---------------------------"
-    # Added </dev/tty to prevent crash when piped via curl
-    read -rp "Enter Your Domain (leave blank for IP): " domain </dev/tty
-    clear
     
-    # Auto-fallback to public IP if empty
-    if [[ -z "$domain" ]]; then
-        domain="$public_ip"
-        log_info "No domain entered. Using Public IP: $domain"
+    domain=""
+    # Safely read from terminal even when script is piped via curl
+    if [ -t 0 ]; then
+        read -rp "Enter Your Domain (Leave blank for IP): " domain
+    elif [ -c /dev/tty ]; then
+        read -rp "Enter Your Domain (Leave blank for IP): " domain </dev/tty || true
     fi
-    
-    if echo "$domain" > /etc/AutoScriptX/domain; then
-        log_success "Domain saved."
+
+    # Strip any accidental whitespace
+    domain=$(echo "$domain" | tr -d ' ')
+
+    # Auto-fallback to public IP if nothing was entered
+    if [[ -z "$domain" ]]; then
+        domain=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 ifconfig.me || echo "$localip")
+        log_info "No domain entered. Auto-selected IP: $domain"
+    fi
+
+    if [[ -n "$domain" ]]; then
+        echo "$domain" > /etc/AutoScriptX/domain
+        log_success "Domain saved: $domain"
     else
-        log_error "Failed to save domain."
+        log_error "Failed to grab an IP or Domain. Check your network."
         exit 1
     fi
 }
@@ -114,7 +124,7 @@ install_packages() {
 configure_squid() {
     log_info "Setting up Squid proxy..."
     wget -qO /etc/squid/squid.conf "$BASE_URL/config/squid.conf" || log_error "Failed to download squid.conf."
-    sed -i "s/IP/$public_ip/g" /etc/squid/squid.conf
+    sed -i "s/IP/${public_ip:-$localip}/g" /etc/squid/squid.conf
     chmod 644 /etc/squid/squid.conf
     systemctl daemon-reload > /dev/null 2>&1
     systemctl enable squid > /dev/null 2>&1
@@ -288,7 +298,7 @@ SERVICE
     log_success "SSH-WebSocket service set up locally."
 }
 
-# Setup SSL certificate
+# Setup SSL certificate (Added hard fallback so Nginx won't crash if ACME fails)
 setup_ssl_cert() {
     log_info "Requesting SSL cert..."
     systemctl stop nginx > /dev/null 2>&1
@@ -315,7 +325,10 @@ setup_ssl_cert() {
 # Inject Native Xray-core
 install_xray() {
     log_info "Installing Xray-core..."
-    local latest_tag=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name' 2>/dev/null) || latest_tag="v1.8.13"
+    local latest_tag
+    latest_tag=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null)
+    [[ -z "$latest_tag" || "$latest_tag" == "null" ]] && latest_tag="v1.8.24" # Safe fallback if GH API limits you
+    
     local arch; case "$(uname -m)" in x86_64) arch="64" ;; aarch64) arch="arm64-v8a" ;; *) log_error "Unsupported arch"; exit 1 ;; esac
     
     local tmp_dir=$(mktemp -d)
@@ -400,19 +413,21 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 SERVICE
+
     systemctl daemon-reload > /dev/null 2>&1
     systemctl enable xray > /dev/null 2>&1
     systemctl restart xray > /dev/null 2>&1 || log_warning "Failed to restart Xray."
     log_success "Xray-core configured."
 }
 
-# Configure Nginx
+# Configure Nginx (IPv6 binds removed to prevent Crash)
 configure_nginx() {
     log_info "Setting up Nginx Multiplexing..."
     rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
     mkdir -p /home/vps/public_html
     mkdir -p /etc/systemd/system/nginx.service.d
     
+    # Payload Custom Nginx block. [::] is REMOVED so it doesn't crash if sysctl disabled IPv6
     cat > /etc/nginx/conf.d/autoscriptx.conf <<NGINX_CONF
 server {
     listen 80 default_server;
