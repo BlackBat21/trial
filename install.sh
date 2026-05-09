@@ -1,4 +1,8 @@
 #!/bin/bash
+# =============================================================================
+# AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
+# Version : 4.0.9 (Patched Missing Array Bug & Aggressive TUI Regex)
+# =============================================================================
 
 # Color definitions
 green="\033[0;32m"
@@ -50,7 +54,7 @@ setup_hosts() {
     log_success "Hostname and hosts file configured."
 }
 
-# Setup domain configuration (Patched for curl | bash TTY piping)
+# Setup domain configuration
 setup_domain() {
     mkdir -p /etc/AutoScriptX
     clear
@@ -90,7 +94,7 @@ update_system() {
         log_error "System update failed."
         exit 1
     fi
-    apt-get purge -y ufw firewalld exim4 samba* apache2* bind9* sendmail* unscd > /dev/null 2>&1 || log_warning "Some packages could not be purged (may not be installed)."
+    apt-get purge -y ufw firewalld exim4 samba* apache2* bind9* sendmail* unscd > /dev/null 2>&1 || log_warning "Some packages could not be purged."
     apt autoremove -y > /dev/null 2>&1 && apt autoclean -y > /dev/null 2>&1
     log_success "System updated."
 }
@@ -267,8 +271,7 @@ Type=simple
 User=root
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=always
-LimitNOFILE=65535
-[Install]
+LimitNOFILE=65535[Install]
 WantedBy=multi-user.target
 SERVICE
 
@@ -390,10 +393,14 @@ apply_firewall_rules() {
 # Install scripts (Eradicate 3x-ui, keep FreeNetLabs UI, inject xray-menu)
 install_scripts() {
     log_info "Installing scripts..."
+    
+    # FIXED: Split lines so [ssh] and [system] arrays do not get commented out!
     declare -A script_dirs=(
-      [menu]="menu.sh slowdns-menu.sh" # xui-menu.sh REMOVED ENTIRELY[ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
+      [menu]="menu.sh slowdns-menu.sh"
+      [ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
       [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
+    
     for dir in "${!script_dirs[@]}"; do
       for s in ${script_dirs[$dir]}; do
         base="${s%.sh}"
@@ -468,9 +475,14 @@ EOF
         sed -i 's/xui-menu/xray-menu/g' /usr/bin/menu
         sed -i 's/X-UI Manager/Xray Manager/g' /usr/bin/menu
     fi
+    
+    # Aggressively remove X-UI references in manage-services script
     if [[ -f /usr/bin/manage-services ]]; then
+        sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
         sed -i 's/x-ui/xray/g' /usr/bin/manage-services
         sed -i 's/X-UI/Xray/g' /usr/bin/manage-services
+        sed -i 's/XUI Watcher/Xray Watcher/g' /usr/bin/manage-services
+        sed -i 's/XUI/Xray/g' /usr/bin/manage-services
     fi
     
     wget -qO /etc/AutoScriptX/uninstall.sh "$BASE_URL/uninstall.sh" > /dev/null 2>&1 || log_warning "Failed to download uninstall.sh."
