@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# AutoXray Installer & Manager — Elite Edition
-# Version : 4.1.1 (Patched Split-Payloads & WebSocket 101 Injector Fix)
+# AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
+# Version : 4.0.9 (Patched Nginx Multiplexing & 3x-ui Eradication)
 # =============================================================================
 
 set -uo pipefail
@@ -11,23 +11,17 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.1.1"
-readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
+readonly SCRIPT_VERSION="4.0.9-Hybrid"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
 readonly XRAY_DIR="/usr/local/etc/xray"
 readonly CSV_DB="${XRAY_DIR}/users.csv"
 readonly XRAY_BIN="/usr/local/bin/xray"
-readonly XRAY_SERVICE="/etc/systemd/system/xray.service"
-readonly NGINX_CONF_DIR="/etc/nginx/conf.d"
 readonly TLS_DIR="/etc/ssl/autoxray"
-readonly ACME_HOME="/root/.acme.sh"
 
 readonly PORT_VLESS_WS=10001
 readonly PORT_VMESS_WS=10002
 readonly PORT_TROJAN_WS=10003
-readonly PORT_VLESS_WS_NOTLS=10011
-readonly PORT_VMESS_WS_NOTLS=10012
 
 RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
@@ -41,65 +35,28 @@ section() { echo -e "\n${BOLD}${BLUE}══ $* ══${NC}\n" | tee -a "$LOG_FIL
 die()     { error "$*"; exit 1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ARGUMENT PARSING & PRE-FLIGHT CHECKS
+#  PRE-FLIGHT & INPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 DOMAIN=""
 EMAIL=""
-SKIP_BBR="false"
-SKIP_HARDENING="false"
-UNINSTALL="false"
-
-parse_args() {
-    local is_installed="false"
-    [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]] && is_installed="true"
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --domain)         DOMAIN="${2:-}";  shift 2 ;;
-            --email)          EMAIL="${2:-}";   shift 2 ;;
-            --skip-bbr)       SKIP_BBR="true";  shift   ;;
-            --skip-hardening) SKIP_HARDENING="true"; shift ;;
-            --uninstall)      UNINSTALL="true"; shift   ;;
-            -h|--help)
-                echo "Usage: sudo bash install.sh [--domain DOMAIN --email EMAIL] [--uninstall]"
-                exit 0 ;;
-            *) die "Unknown option: $1" ;;
-        esac
-    done
-
-    if [[ "$is_installed" == "true" && "$UNINSTALL" == "false" ]]; then
-        info "Existing installation detected. Bypassing setup and backing up data..."
-        cp "$CSV_DB" "${BACKUP_DIR}/users_$(date +%F_%H%M%S).csv" 2>/dev/null || true
-        cp "${XRAY_DIR}/config.json" "${BACKUP_DIR}/config_$(date +%F_%H%M%S).json" 2>/dev/null || true
-        [[ -f "${XRAY_DIR}/credentials.env" ]] && source "${XRAY_DIR}/credentials.env"
-        return
-    fi
-
-    if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
-        echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
-        read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
-        if [[ "$configure_tls" =~ ^[Yy]$ ]]; then
-            read -rp "Enter Domain (e.g., vpn.example.com): " DOMAIN </dev/tty
-            read -rp "Enter Email for Let's Encrypt (e.g., admin@example.com): " EMAIL </dev/tty
-        fi
-    fi
-
-    if [[ -n "$DOMAIN" && -z "$EMAIL" ]]; then
-        die "--email is required when --domain is specified."
-    fi
-}
 
 preflight_checks() {
     section "Pre-flight checks"
     [[ $EUID -ne 0 ]] && die "This script must be run as root."
     mkdir -p "$(dirname "$LOG_FILE")" "$BACKUP_DIR"
     touch "$LOG_FILE"
-    log "Pre-flight checks passed."
+
+    echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
+    read -rp "Enter Domain for Let's Encrypt (e.g., vpn.example.com): " DOMAIN </dev/tty
+    read -rp "Enter Email for Let's Encrypt (e.g., admin@example.com): " EMAIL </dev/tty
+
+    [[ -z "$DOMAIN" ]] && DOMAIN=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    log "Pre-flight checks passed. Domain set to $DOMAIN."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SYSTEM PREP & KERNEL TUNING
+#  SYSTEM PREP & FREENETLABS BASE STACK
 # ─────────────────────────────────────────────────────────────────────────────
 
 prepare_system() {
@@ -108,14 +65,13 @@ prepare_system() {
     apt-get update -qq
     apt-get install -y -qq curl wget unzip jq socat coreutils nginx certbot \
         python3-certbot-nginx ufw fail2ban ca-certificates openssl \
-        net-tools iproute2 lsof logrotate cron iptables-persistent 2>&1 | tee -a "$LOG_FILE"
+        net-tools iproute2 lsof logrotate cron iptables-persistent \
+        dropbear stunnel4 2>&1 | tee -a "$LOG_FILE"
     log "Base packages installed."
 }
 
 optimize_kernel() {
     section "Kernel / network optimisation"
-    [[ "$SKIP_BBR" == "true" ]] && return
-    
     cat > /etc/sysctl.d/99-autoxray.conf <<'SYSCTL'
 net.core.default_qdisc          = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -124,32 +80,31 @@ net.ipv4.ip_forward             = 1
 vm.swappiness                   = 10
 SYSCTL
     sysctl -p /etc/sysctl.d/99-autoxray.conf >> "$LOG_FILE" 2>&1 || true
-    log "Kernel parameters applied."
+    log "Kernel BBR parameters applied."
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TLS PROVISIONING & XRAY
-# ─────────────────────────────────────────────────────────────────────────────
+setup_dropbear() {
+    section "Configuring FreeNetLabs Dropbear"
+    sed -i 's/NO_START=1/NO_START=0/g' /etc/default/dropbear 2>/dev/null || true
+    sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=143/g' /etc/default/dropbear 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl enable dropbear
+    systemctl restart dropbear || warn "Failed to restart Dropbear."
+    log "Dropbear configured safely alongside OpenSSH."
+}
 
 provision_tls() {
     section "TLS certificate provisioning"
-    
-    if [[ -f "${TLS_DIR}/fullchain.pem" && -f "$CSV_DB" ]]; then
-        log "TLS certificates already exist. Skipping provisioning."
-        return
-    fi
-
     mkdir -p "$TLS_DIR"
     local server_ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
     local cert_issued="false"
 
-    if [[ -n "$DOMAIN" ]]; then
+    if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
         info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
-        systemctl stop nginx apache2 ws-proxy 2>/dev/null || true
+        systemctl stop nginx apache2 2>/dev/null || true
         fuser -k 80/tcp 2>/dev/null || true
         
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
-            cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
             
@@ -173,12 +128,134 @@ EOF
         local cert_cn="${DOMAIN:-$server_ip}"
         openssl req -x509 -newkey rsa:4096 -keyout "${TLS_DIR}/key.pem" -out "${TLS_DIR}/fullchain.pem" -days 3650 -nodes \
             -subj "/CN=${cert_cn}/O=AutoXray/C=US" -addext "subjectAltName=IP:${server_ip}" >> "$LOG_FILE" 2>&1
-        cp "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/cert.pem"
-        
-        [[ -z "$DOMAIN" ]] && DOMAIN="${server_ip}"
         log "Self-signed certificate generated."
     fi
 }
+
+setup_websocket_service() {
+    section "Setting up FreeNetLabs SSH-WebSocket proxy"
+    systemctl stop ws-proxy.service 2>/dev/null || true
+    rm -f /usr/local/bin/ws-proxy
+    
+    # We use your robust python logic as the native proxy handler, bound to port 80
+    cat > /usr/local/bin/ws-proxy << 'EOF'
+#!/usr/bin/env python3
+import socket, threading, hashlib, base64
+
+def forward_ssh_c2s(src, dst, initial_data):
+    try:
+        buffer = initial_data
+        ssh_started = False
+        while not ssh_started:
+            idx = buffer.find(b'SSH-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+                break
+            if len(buffer) > 4096:
+                buffer = buffer[-10:]
+            data = src.recv(8192)
+            if not data: return
+            buffer += data
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
+    except Exception: pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
+
+def forward_generic(src, dst):
+    try:
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
+    except Exception: pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
+
+def handle_client(client_socket):
+    target = None
+    try:
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        req = b""
+        while b"\r\n\r\n" not in req:
+            chunk = client_socket.recv(4096)
+            if not chunk: return
+            req += chunk
+            
+        head_str = req.decode('utf-8', 'ignore')
+        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        ws_key = None
+        for line in head_str.split('\r\n'):
+            if line.lower().startswith('sec-websocket-key:'):
+                ws_key = line.split(':', 1)[1].strip()
+                break
+                
+        if ws_key:
+            magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            accept = base64.b64encode(hashlib.sha1((ws_key + magic).encode('utf-8')).digest()).decode('utf-8')
+            resp = f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            client_socket.sendall(resp.encode('utf-8'))
+        else:
+            client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            
+        target.connect(('127.0.0.1', 22))
+        _, _, pipelined = req.partition(b"\r\n\r\n")
+        
+        t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
+        t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        
+    except Exception: pass
+    finally:
+        if target:
+            try: target.close()
+            except: pass
+        try: client_socket.close()
+        except: pass
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('0.0.0.0', 80))
+server.listen(1000)
+while True:
+    try:
+        client, _ = server.accept()
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+    except Exception: pass
+EOF
+
+    chmod +x /usr/local/bin/ws-proxy
+    cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
+[Unit]
+Description=AutoScriptX Python WS Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy
+Restart=always
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+    systemctl daemon-reload; systemctl enable ws-proxy
+    log "SSH-WebSocket proxy configured securely."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PAYLOAD INJECTION: NATIVE XRAY-CORE
+# ─────────────────────────────────────────────────────────────────────────────
 
 install_xray() {
     section "Installing Xray-core"
@@ -198,12 +275,6 @@ install_xray() {
 
 configure_xray() {
     section "Configuring Xray-core"
-
-    if [[ -f "$CSV_DB" && -f "${XRAY_DIR}/config.json" ]]; then
-        log "Existing Xray configuration and database detected. Skipping regeneration."
-        return
-    fi
-
     local uuid_vless=$(cat /proc/sys/kernel/random/uuid)
     local uuid_vmess=$(cat /proc/sys/kernel/random/uuid)
     local trojan_pass=$(openssl rand -hex 20)
@@ -251,18 +322,6 @@ EOF
       "settings": { "clients":[{ "password": "${trojan_pass}", "email": "admin_trojan" }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan-ws" } },
       "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
-    },
-    {
-      "tag": "vless-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS_NOTLS}, "protocol": "vless",
-      "settings": { "clients":[{ "id": "${uuid_vless}", "flow": "" }], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws-nt" } },
-      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
-    },
-    {
-      "tag": "vmess-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS_NOTLS}, "protocol": "vmess",
-      "settings": { "clients":[{ "id": "${uuid_vmess}", "alterId": 0 }] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws-nt" } },
-      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     }
   ],
   "outbounds":[
@@ -271,50 +330,15 @@ EOF
   ]
 }
 XRAY_JSON
-    log "Xray base configuration written (Anti-Torrent routing enabled)."
-}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SERVICES: XRAY, UDPGW, NGINX & PYTHON PROXY
-# ─────────────────────────────────────────────────────────────────────────────
-
-install_badvpn() {
-    section "Installing BadVPN UDPGW"
-    wget -q -O /usr/local/bin/badvpn-udpgw "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64"
-    if [[ -s "/usr/local/bin/badvpn-udpgw" ]]; then
-        chmod +x /usr/local/bin/badvpn-udpgw
-        cat > /etc/systemd/system/badvpn-udpgw.service << 'EOF'
-[Unit]
-Description=BadVPN UDPGW
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload; systemctl enable badvpn-udpgw 2>/dev/null
-        log "BadVPN UDPGW active on port 7300."
-    else
-        warn "Failed to download BadVPN UDPGW. Skipping..."
-    fi
-}
-
-install_services() {
-    section "Configuring Services"
-    
-    cat > "$XRAY_SERVICE" <<'SERVICE'
+    cat > /etc/systemd/system/xray.service <<'SERVICE'
 [Unit]
 Description=Xray Service
 After=network.target
 
 [Service]
 Type=simple
-User=nobody
+User=root
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=always
 LimitNOFILE=65535
@@ -323,183 +347,58 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload; systemctl enable xray
+    log "Xray base configuration written (Anti-Torrent routing enabled)."
+}
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFLICT RESOLUTION: NGINX MULTIPLEXING
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup_nginx() {
+    section "Configuring Nginx reverse proxy multiplexing"
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
-    cat > "${NGINX_CONF_DIR}/autoxray-443.conf" <<NGINX_CONF
+    
+    cat > /etc/nginx/conf.d/autoscriptx.conf <<NGINX_CONF
 server {
     listen 81 default_server;
     listen [::]:81 default_server;
     server_name _;
-    
-    location /vless-ws-nt { proxy_pass http://127.0.0.1:${PORT_VLESS_WS_NOTLS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
-    location /vmess-ws-nt { proxy_pass http://127.0.0.1:${PORT_VMESS_WS_NOTLS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
+    return 404;
 }
 
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name _;
-    ssl_certificate ${TLS_DIR}/fullchain.pem; ssl_certificate_key ${TLS_DIR}/key.pem;
+    ssl_certificate ${TLS_DIR}/fullchain.pem; 
+    ssl_certificate_key ${TLS_DIR}/key.pem;
 
     location /vless-ws { proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
+    
+    # Multiplex WS-Proxy to Nginx root and /ssh-ws
     location /ssh-ws { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
+    location / { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
 }
 NGINX_CONF
-
-    cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
-#!/usr/bin/env python3
-import socket, threading
-
-def forward_traffic(src, dst, initial_data=b""):
-    """Standard generic forwarder."""
-    try:
-        if initial_data:
-            dst.sendall(initial_data)
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: dst.shutdown(socket.SHUT_WR)
-        except: pass
-
-def forward_ssh_c2s(src, dst, initial_data):
-    """Eats all custom payload HTTP garbage until the SSH banner is detected."""
-    try:
-        buffer = initial_data
-        ssh_started = False
-
-        if buffer:
-            idx = buffer.find(b'SSH-2.0-')
-            if idx != -1:
-                dst.sendall(buffer[idx:])
-                ssh_started = True
-
-        while not ssh_started:
-            data = src.recv(8192)
-            if not data: return
-            buffer += data
-            idx = buffer.find(b'SSH-2.0-')
-            if idx != -1:
-                dst.sendall(buffer[idx:])
-                ssh_started = True
-                break
-            
-            # Failsafe: drop buffer if it gets ridiculously large (over 64KB)
-            if len(buffer) > 65536:
-                dst.sendall(buffer)
-                ssh_started = True
-                break
-
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: dst.shutdown(socket.SHUT_WR)
-        except: pass
-
-def handle_client(client_socket):
-    target = None
-    try:
-        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        
-        # Non-blocking initial read to avoid timing out HTTP Injector's[split] payloads
-        req = client_socket.recv(8192)
-        if not req: return
-            
-        head_str = req.decode('utf-8', 'ignore')
-        target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
-        # Xray Routing
-        if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
-            target.connect(('127.0.0.1', 81))
-            target.sendall(req)
-            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target, b""), daemon=True)
-            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket, b""), daemon=True)
-            
-        # SSH Routing
-        else:
-            # Unconditionally send 101 Switching Protocols. 
-            # This completely fixes the "Illegal Packet Size" JSch error by explicitly 
-            # satisfying the Injector's "Upgrade: websocket" demand.
-            response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-            client_socket.sendall(response)
-                
-            target.connect(('127.0.0.1', 22))
-            
-            # Start the C2S thread that aggressively strips out subsequent obfuscation payload data
-            t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, req), daemon=True)
-            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket, b""), daemon=True)
-            
-        t1.start()
-        t2.start()
-        
-        t1.join()
-        t2.join()
-        
-    except Exception:
-        pass
-    finally:
-        if target:
-            try: target.close()
-            except: pass
-        try: client_socket.close()
-        except: pass
-
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', 80))
-server.listen(1024)
-while True:
-    try:
-        client, _ = server.accept()
-        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
-    except KeyboardInterrupt:
-        break
-    except Exception:
-        pass
-PYTHON_SCRIPT
-
-    chmod +x /usr/local/bin/ws-proxy.py
-
-    cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
-[Unit]
-Description=AutoScriptX Python WS Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
-Restart=always
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-    systemctl daemon-reload; systemctl enable ws-proxy
+    log "Nginx config applied for multiplexing."
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PAYLOAD INJECTION: HARDENING
+# ─────────────────────────────────────────────────────────────────────────────
 
 harden_system() {
     section "Security Hardening"
-    [[ "$SKIP_HARDENING" == "true" ]] && return
-    
-    ufw --force reset; ufw default deny incoming; ufw default allow outgoing
-    ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming >/dev/null 2>&1; ufw default allow outgoing >/dev/null 2>&1
+    ufw allow 22/tcp >/dev/null 2>&1; ufw allow 80/tcp >/dev/null 2>&1; ufw allow 443/tcp >/dev/null 2>&1
     
     # Anti-Torrent Ports
-    ufw deny out 6881:6889/tcp
-    ufw deny out 6881:6889/udp
-    ufw --force enable
+    ufw deny out 6881:6889/tcp >/dev/null 2>&1
+    ufw deny out 6881:6889/udp >/dev/null 2>&1
+    ufw --force enable >/dev/null 2>&1
     
     # Anti-Torrent DPI
     for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
@@ -508,55 +407,31 @@ harden_system() {
     done
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     
-    rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null || true
-    rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
-
+    # SSH Config overrides
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
-    sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    # Crucial OpenSSH Allowances for HTTP Injector Channels
-    printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "PermitTunnel yes" "GatewayPorts yes" "TCPKeepAlive yes" "ClientAliveInterval 120" "ClientAliveCountMax 2" > /etc/ssh/sshd_config.d/99-force-pass.conf
-    
-    cat > /etc/issue.net <<'BANNER'
-
-  ┌─────────────────────────────────────────────┐
-  │         PHC-Lanz ScriptX                    │
-  │         Authorized Access Only              │
-  │         All activity is monitored & logged  │
-  └─────────────────────────────────────────────┘
-
-BANNER
-    
-    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\ncat > /dev/null' > /bin/tunnel-shell
+    # The Tunnel Fix (Prevents zombie leaks)
+    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\ntail -f /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
-    
-    if [[ -f "$CSV_DB" ]]; then
-        while IFS=',' read -r uname svc _rest; do
-            if [[ "$svc" == "SSH" ]]; then
-                usermod -s /bin/tunnel-shell "$uname" 2>/dev/null || true
-            fi
-        done < <(tail -n +2 "$CSV_DB")
-    fi
 
-    systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI & Safe Tunnel Shell Active)."
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ADVANCED TUI MANAGER (menu)
+#  PAYLOAD INJECTION: FULL ELITE TUI MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_manage_script() {
-    section "Installing Elite TUI Manager"
+    section "Installing Full Elite TUI Manager"
 
     cat > /usr/local/bin/menu <<'MANAGE'
 #!/usr/bin/env bash
 CRED_FILE="/usr/local/etc/xray/credentials.env"
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
-SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
 BCYAN='\033[1;36m'; MAGENTA='\033[0;35m'; BMAGENTA='\033[1;35m'; BLUE='\033[0;34m'
@@ -577,8 +452,8 @@ draw_header() {
     echo ""
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.1.1${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}A u t o S c r i p t X   E l i t e${NC}                    ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}Hybrid Core Console  ·  v4.0.9${NC}                       ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -590,9 +465,7 @@ draw_header() {
     echo ""
 }
 
-divider() {
-    echo -e "  ${BMAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
+divider() { echo -e "  ${BMAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
 draw_menu() {
     draw_header
@@ -602,8 +475,7 @@ draw_menu() {
     echo -e "   ${GARROW}  ${BOLD}1${NC}${DIM})${NC}  Create Account"
     echo -e "   ${GARROW}  ${BOLD}2${NC}${DIM})${NC}  Manage Accounts"
     echo -e "   ${GARROW}  ${BOLD}3${NC}${DIM})${NC}  Manage Services"
-    echo -e "   ${GARROW}  ${BOLD}4${NC}${DIM})${NC}  Update Script & Core"
-    echo -e "   ${GARROW}  ${BOLD}5${NC}${DIM})${NC}  Uninstall AutoXray"
+    echo -e "   ${GARROW}  ${BOLD}4${NC}${DIM})${NC}  Uninstall AutoScriptX"
     echo -e "   ${GARROW}  ${BOLD}x${NC}${DIM})${NC}  Exit"
     divider
     echo ""
@@ -614,7 +486,7 @@ create_account() {
     divider
     echo -e "   ${BOLD}${BCYAN}CREATE ACCOUNT${NC}"
     divider
-    echo -e "   ${GARROW}  ${BOLD}1${NC}) SSH-WS"
+    echo -e "   ${GARROW}  ${BOLD}1${NC}) SSH-WS (FreeNetLabs Routing)"
     echo -e "   ${GARROW}  ${BOLD}2${NC}) Xray (VLESS + VMESS + Trojan)"
     echo ""
     read -rp "   Select service type [1/2]: " s_type
@@ -646,7 +518,7 @@ create_account() {
         echo -e "   ${BOLD}${CYAN}Username   ${NC}: $u_name"
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $u_pass"
         echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $u_exp"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS) · 7300 (UDPGW)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS via Nginx)"
         divider
         echo ""
         
@@ -708,7 +580,7 @@ show_account_details() {
     if [[ "$svc" == "SSH" ]]; then
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $secret"
         echo -e "   ${BOLD}${CYAN}Host       ${NC}: $IP"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS) · 7300 (UDPGW)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
 
     elif [[ "$svc" == "Xray" ]]; then
         local uuid="$secret"
@@ -735,7 +607,7 @@ _delete_account() {
     local svc=$(grep "^${username}," "$CSV_DB" | cut -d, -f2)
 
     echo ""
-    read -rp "   ${GWARN}  Confirm deletion of '${username}'? [y/N]: " confirm </dev/tty
+    read -rp "   ${GWARN}  Confirm deletion of '${username}'?[y/N]: " confirm </dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "   ${GINFO} Deletion cancelled."; sleep 1; return
     fi
@@ -868,7 +740,7 @@ manage_services() {
     divider
     echo -e "   ${BOLD}${BCYAN}SERVICE STATUS${NC}"
     divider
-    for svc in xray nginx ws-proxy badvpn-udpgw fail2ban; do
+    for svc in xray nginx ws-proxy dropbear stunnel4 fail2ban; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             printf "   ${GREEN}● ACTIVE  ${NC}${BOLD}%-16s${NC}\n" "$svc"
         else
@@ -877,9 +749,9 @@ manage_services() {
     done
     divider
     echo ""
-    read -rp "   Restart all services? [y/N]: " rst </dev/tty
+    read -rp "   Restart all services?[y/N]: " rst </dev/tty
     if [[ "$rst" =~ ^[Yy]$ ]]; then
-        for svc in xray nginx ws-proxy badvpn-udpgw fail2ban; do
+        for svc in xray nginx ws-proxy dropbear stunnel4 fail2ban; do
             systemctl restart "$svc" 2>/dev/null && \
                 echo -e "   ${GCHECK} ${svc} restarted." || \
                 echo -e "   ${GWARN} ${svc} could not be restarted."
@@ -888,52 +760,24 @@ manage_services() {
     fi
 }
 
-update_script_and_core() {
-    draw_header
-    divider
-    echo -e "   ${BOLD}${BCYAN}UPDATE SCRIPT & CORE${NC}"
-    divider
-    echo -e "   ${GINFO}  Downloading latest installer from GitHub..."
-    echo ""
-
-    local tmp_sh="/tmp/autoxray_update.sh"
-
-    if curl -# -fL "$SCRIPT_URL" -o "$tmp_sh"; then
-        chmod +x "$tmp_sh"
-        echo -e "   ${GCHECK} Download complete. Commencing safe upgrade..."
-        echo -e "   ${GWARN} The menu will automatically close during the update."
-        sleep 3
-        
-        exec bash "$tmp_sh"
-    else
-        echo -e "   ${GCROSS} Failed to download update."
-        rm -f "$tmp_sh"
-        sleep 3
-    fi
-}
-
 uninstall_autoxray() {
     draw_header
     divider
-    echo -e "   ${BOLD}${RED}UNINSTALL AUTOXRAY${NC}"
+    echo -e "   ${BOLD}${RED}UNINSTALL HYBRID STACK${NC}"
     divider
-    echo -e "   ${GWARN}  This will permanently remove AutoXray and all configuration."
+    echo -e "   ${GWARN}  This will permanently remove Xray, WS-Proxy, Dropbear, and Configuration."
     echo ""
     read -rp "   Type 'YES' to confirm: " confirm </dev/tty
     if [[ "$confirm" == "YES" ]]; then
-        systemctl stop  xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
-        systemctl disable xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
+        systemctl stop xray ws-proxy dropbear stunnel4 2>/dev/null || true
+        systemctl disable xray ws-proxy dropbear stunnel4 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service \
-              /etc/systemd/system/ws-proxy.service \
-              /etc/systemd/system/badvpn-udpgw.service \
-              /etc/systemd/system/ssh-websocket.service
+              /etc/systemd/system/ws-proxy.service
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
-              /usr/local/bin/badvpn-udpgw \
-              /usr/local/bin/autoxray \
-              /usr/local/bin/ws-proxy.py \
-              /etc/nginx/conf.d/autoxray-*.conf
+              /usr/local/bin/ws-proxy \
+              /etc/nginx/conf.d/autoscriptx.conf
         systemctl daemon-reload
         systemctl reload nginx 2>/dev/null || true
         echo -e "\n   ${GCHECK}  ${BOLD}${GREEN}Uninstallation complete. Exiting.${NC}"
@@ -951,8 +795,7 @@ while true; do
         1) create_account      ;;
         2) manage_accounts     ;;
         3) manage_services     ;;
-        4) update_script_and_core ;;
-        5) uninstall_autoxray  ;;
+        4) uninstall_autoxray  ;;
         x|X) clear; exit 0    ;;
         *) echo -e "\n   ${GCROSS} Invalid option — try again."; sleep 1 ;;
     esac
@@ -960,28 +803,17 @@ done
 MANAGE
 
     chmod +x /usr/local/bin/menu
-    rm -f /usr/local/bin/autoxray 2>/dev/null
-    
-    log "Management helper installed. Access via: menu"
+    log "Full Management helper installed. Access via: menu"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  UNINSTALL & SUMMARY
+#  SERVICE ACTIVATION & SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
-
-do_uninstall() {
-    systemctl stop xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
-    systemctl disable xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
-    rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/badvpn-udpgw.service /etc/systemd/system/ssh-websocket.service
-    rm -rf /usr/local/etc/xray /etc/ssl/autoxray
-    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/badvpn-udpgw /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
-    systemctl daemon-reload; systemctl reload nginx 2>/dev/null || true
-    log "Uninstall complete."
-    exit 0
-}
 
 start_services() {
-    for svc in nginx xray ws-proxy badvpn-udpgw fail2ban; do systemctl start "$svc" 2>/dev/null; done
+    for svc in nginx xray ws-proxy dropbear fail2ban; do 
+        systemctl start "$svc" 2>/dev/null
+    done
     log "All services activated."
 }
 
@@ -989,35 +821,36 @@ print_summary() {
     echo ""
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}PHC-Lanz ScriptX${NC}  —  Installation Complete ${GCHECK}          ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}v${SCRIPT_VERSION}${NC}                                                  ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}AutoScriptX Hybrid Stack${NC} — Installation Complete ${GCHECK}  ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}v${SCRIPT_VERSION}${NC}                                           ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}menu${NC} to launch the management console."
-    echo -e "  ${GCHECK}  SSH banner configured in ${BOLD}/etc/issue.net${NC}."
+    echo -e "  ${GCHECK}  Type ${BOLD}${YELLOW}menu${NC} to launch the full management console."
+    echo -e "  ${GCHECK}  Nginx safely multiplexing Xray & FreeNetLabs WS-Proxy."
+    echo -e "  ${GCHECK}  Anti-Torrent DPI & Zombie Leak Prevention active."
     echo -e "  ${GCHECK}  Logs: ${BOLD}${LOG_FILE}${NC}"
     echo ""
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  EXECUTION PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
 main() {
-    parse_args "$@"
-    [[ "$UNINSTALL" == "true" ]] && do_uninstall
-    
     preflight_checks
     prepare_system
     optimize_kernel
+    setup_dropbear
     provision_tls
+    setup_websocket_service
     install_xray
     configure_xray
-    install_badvpn
-    install_services
+    setup_nginx
     harden_system
     install_manage_script
     start_services
     print_summary
-    
-    rm -f /tmp/autoxray_update.sh 2>/dev/null
 }
 
 main "$@"
