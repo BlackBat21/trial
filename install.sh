@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.1.0 (Patched Proxy Deadlocks, UDPGW & Shell Fixes)
+# Version : 4.1.1 (Patched Split-Payloads & WebSocket 101 Injector Fix)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.1.1"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -62,7 +62,7 @@ parse_args() {
             --skip-hardening) SKIP_HARDENING="true"; shift ;;
             --uninstall)      UNINSTALL="true"; shift   ;;
             -h|--help)
-                echo "Usage: sudo bash install.sh[--domain DOMAIN --email EMAIL] [--uninstall]"
+                echo "Usage: sudo bash install.sh [--domain DOMAIN --email EMAIL] [--uninstall]"
                 exit 0 ;;
             *) die "Unknown option: $1" ;;
         esac
@@ -279,7 +279,7 @@ XRAY_JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_badvpn() {
-    section "Installing BadVPN UDPGW (Fixes Port 7300 Forwarding)"
+    section "Installing BadVPN UDPGW"
     wget -q -O /usr/local/bin/badvpn-udpgw "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64"
     if [[ -s "/usr/local/bin/badvpn-udpgw" ]]; then
         chmod +x /usr/local/bin/badvpn-udpgw
@@ -350,13 +350,51 @@ NGINX_CONF
 
     cat > /usr/local/bin/ws-proxy.py << 'PYTHON_SCRIPT'
 #!/usr/bin/env python3
-import socket, threading, hashlib, base64
+import socket, threading
 
 def forward_traffic(src, dst, initial_data=b""):
-    """Dumb pipe forwarder. Robust and immune to payload deadlocks."""
+    """Standard generic forwarder."""
     try:
         if initial_data:
             dst.sendall(initial_data)
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
+    except Exception:
+        pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except: pass
+
+def forward_ssh_c2s(src, dst, initial_data):
+    """Eats all custom payload HTTP garbage until the SSH banner is detected."""
+    try:
+        buffer = initial_data
+        ssh_started = False
+
+        if buffer:
+            idx = buffer.find(b'SSH-2.0-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+
+        while not ssh_started:
+            data = src.recv(8192)
+            if not data: return
+            buffer += data
+            idx = buffer.find(b'SSH-2.0-')
+            if idx != -1:
+                dst.sendall(buffer[idx:])
+                ssh_started = True
+                break
+            
+            # Failsafe: drop buffer if it gets ridiculously large (over 64KB)
+            if len(buffer) > 65536:
+                dst.sendall(buffer)
+                ssh_started = True
+                break
+
         while True:
             data = src.recv(8192)
             if not data: break
@@ -372,12 +410,9 @@ def handle_client(client_socket):
     try:
         client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         
-        req = b""
-        while b"\r\n\r\n" not in req:
-            chunk = client_socket.recv(4096)
-            if not chunk: return
-            req += chunk
-            if len(req) > 16384: return # Prevent buffer exhaustion
+        # Non-blocking initial read to avoid timing out HTTP Injector's[split] payloads
+        req = client_socket.recv(8192)
+        if not req: return
             
         head_str = req.decode('utf-8', 'ignore')
         target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -387,32 +422,22 @@ def handle_client(client_socket):
         if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
             target.connect(('127.0.0.1', 81))
             target.sendall(req)
-            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target), daemon=True)
-            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket), daemon=True)
+            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target, b""), daemon=True)
+            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket, b""), daemon=True)
             
         # SSH Routing
         else:
-            ws_key = None
-            for line in head_str.split('\r\n'):
-                if line.lower().startswith('sec-websocket-key:'):
-                    ws_key = line.split(':', 1)[1].strip()
-                    break
-                    
-            if ws_key:
-                # Proper WS Handshake
-                magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-                accept = base64.b64encode(hashlib.sha1((ws_key + magic).encode('utf-8')).digest()).decode('utf-8')
-                resp = f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-                client_socket.sendall(resp.encode('utf-8'))
-            else:
-                # Proper HTTP 200 Proxy Fallback (Fixes "EOF Reached" in standard payloads)
-                client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            # Unconditionally send 101 Switching Protocols. 
+            # This completely fixes the "Illegal Packet Size" JSch error by explicitly 
+            # satisfying the Injector's "Upgrade: websocket" demand.
+            response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            client_socket.sendall(response)
                 
             target.connect(('127.0.0.1', 22))
-            _, _, pipelined = req.partition(b"\r\n\r\n")
             
-            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target, pipelined), daemon=True)
-            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket), daemon=True)
+            # Start the C2S thread that aggressively strips out subsequent obfuscation payload data
+            t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, req), daemon=True)
+            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket, b""), daemon=True)
             
         t1.start()
         t2.start()
@@ -503,8 +528,6 @@ harden_system() {
 
 BANNER
     
-    # THE FIX: Create the infinite tunnel shell correctly using 'cat > /dev/null'. 
-    # This natively consumes standard input and sleeps, preventing 100% CPU lockups.
     echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\ncat > /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
@@ -555,7 +578,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.1.0${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.1.1${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
