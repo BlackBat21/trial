@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
-# Version : 4.0.9 (Patched Nginx IPv6 Crash & Grep Bug Fix)
+# Version : 4.0.9 (Patched TTY Pipe Bug, Nginx IPv6 Crash & Grep Fix)
 # =============================================================================
 
 # Color definitions
@@ -42,7 +42,7 @@ log_warning() { echo -e "${yellow}[ Warning ]${nc} $1"; }
 
 # Check if script is run as root
 check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
+    if[ "$(id -u)" -ne 0 ]; then
         log_error "Run as root."
         exit 1
     fi
@@ -58,19 +58,23 @@ setup_hosts() {
     log_success "Hostname and hosts file configured."
 }
 
-# Setup domain configuration
+# Setup domain configuration (Patched TTY Piping & Auto-Fallback)
 setup_domain() {
     mkdir -p /etc/AutoScriptX
     clear
     echo "---------------------------"
     echo "      VPS DOMAIN SETUP     "
     echo "---------------------------"
-    read -rp "Enter Your Domain: " domain
+    # Added </dev/tty to prevent crash when piped via curl
+    read -rp "Enter Your Domain (leave blank for IP): " domain </dev/tty
     clear
+    
+    # Auto-fallback to public IP if empty
     if [[ -z "$domain" ]]; then
-        log_error "Domain cannot be empty."
-        exit 1
+        domain="$public_ip"
+        log_info "No domain entered. Using Public IP: $domain"
     fi
+    
     if echo "$domain" > /etc/AutoScriptX/domain; then
         log_success "Domain saved."
     else
@@ -284,7 +288,7 @@ SERVICE
     log_success "SSH-WebSocket service set up locally."
 }
 
-# Setup SSL certificate (Added hard fallback so Nginx won't crash if ACME fails)
+# Setup SSL certificate
 setup_ssl_cert() {
     log_info "Requesting SSL cert..."
     systemctl stop nginx > /dev/null 2>&1
@@ -386,14 +390,14 @@ XRAY_JSON
     cat > /etc/systemd/system/xray.service <<'SERVICE'
 [Unit]
 Description=Xray Service
-After=network.target
-
-[Service]
+After=network.target[Service]
 Type=simple
 User=root
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=always
-LimitNOFILE=65535[Install]
+LimitNOFILE=65535
+
+[Install]
 WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload > /dev/null 2>&1
@@ -402,14 +406,13 @@ SERVICE
     log_success "Xray-core configured."
 }
 
-# Configure Nginx (IPv6 binds removed to prevent Crash)
+# Configure Nginx
 configure_nginx() {
     log_info "Setting up Nginx Multiplexing..."
     rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
     mkdir -p /home/vps/public_html
     mkdir -p /etc/systemd/system/nginx.service.d
     
-    # Payload Custom Nginx block. [::] is REMOVED so it doesn't crash if sysctl disabled IPv6
     cat > /etc/nginx/conf.d/autoscriptx.conf <<NGINX_CONF
 server {
     listen 80 default_server;
@@ -478,7 +481,7 @@ configure_sshguard() {
     log_success "SSHGuard configured."
 }
 
-# Apply firewall rules (Grep Bug Fixed by removing hyphens)
+# Apply firewall rules
 apply_firewall_rules() {
     log_info "Applying firewall rules..."
     iptables_rules=(
@@ -495,7 +498,6 @@ apply_firewall_rules() {
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
-    # FIX: Using "dport 22" strictly as a literal string. Grep won't throw the flag error.
     if grep -q "dport 22" /etc/iptables/rules.v4 2>/dev/null; then
       sed -i "/--dport 22 -j ACCEPT/a \\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 8080 -j ACCEPT" /etc/iptables/rules.v4
     else
@@ -513,7 +515,7 @@ apply_firewall_rules() {
 install_scripts() {
     log_info "Installing background scripts..."
     declare -A script_dirs=(
-      [menu]="slowdns-menu.sh" # xui-menu.sh and menu.sh ANNIHILATED
+      [menu]="slowdns-menu.sh"
       [ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
       [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
@@ -525,7 +527,6 @@ install_scripts() {
       done
     done
     
-    # Write the Elite Payload TUI to natively manage Xray & SSH
     cat > /usr/bin/menu <<'MANAGE'
 #!/usr/bin/env bash
 CRED_FILE="/usr/local/etc/xray/credentials.env"
@@ -757,7 +758,7 @@ main() {
     setup_badvpn
     configure_stunnel
     configure_sshguard
-    apply_firewall_rules # Patched Grep Dash Bug
+    apply_firewall_rules
     install_scripts
     setup_cron_jobs
     final_cleanup
