@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
-# Version : 4.0.9 (Patched Nginx Multiplexing & 3x-ui Eradication)
+# Version : 4.0.9 (Patched Nginx IPv6 Crash & Grep Bug Fix)
 # =============================================================================
 
 # Color definitions
@@ -54,8 +54,7 @@ setup_hosts() {
     localip=$(hostname -I | cut -d ' ' -f1)
     public_ip=$(curl -s ifconfig.me)
     hostname=$(hostname)
-    domain_from_etc=$(grep -w "$hostname" /etc/hosts | awk '{print $2}')
-    [ "$hostname" != "$domain_from_etc" ] && echo "$localip $hostname" >> /etc/hosts
+    domain_from_etc=$(grep -w "$hostname" /etc/hosts | awk '{print $2}')[ "$hostname" != "$domain_from_etc" ] && echo "$localip $hostname" >> /etc/hosts
     log_success "Hostname and hosts file configured."
 }
 
@@ -88,7 +87,7 @@ update_system() {
         log_error "System update failed."
         exit 1
     fi
-    apt-get purge -y ufw firewalld exim4 samba* apache2* bind9* sendmail* unscd > /dev/null 2>&1 || log_warning "Some packages could not be purged."
+    apt-get purge -y ufw firewalld exim4 samba* apache2* bind9* sendmail* unscd > /dev/null 2>&1 || true
     apt autoremove -y > /dev/null 2>&1 && apt autoclean -y > /dev/null 2>&1
     log_success "System updated."
 }
@@ -147,7 +146,7 @@ configure_dropbear() {
     log_info "Configuring Dropbear..."
     wget -qO /etc/default/dropbear "$BASE_URL/config/dropbear.conf" || log_error "Failed to download dropbear.conf."
     chmod 644 /etc/default/dropbear
-    wget -qO /etc/AutoScriptX/banner "$BASE_URL/config/banner.conf" || log_warning "Failed to download Dropbear banner."
+    wget -qO /etc/AutoScriptX/banner "$BASE_URL/config/banner.conf" || echo "Elite Server" > /etc/AutoScriptX/banner
     chmod 644 /etc/AutoScriptX/banner
     
     # Payload Tunnel Shell (Prevents zombie leaks)
@@ -285,7 +284,7 @@ SERVICE
     log_success "SSH-WebSocket service set up locally."
 }
 
-# Setup SSL certificate
+# Setup SSL certificate (Added hard fallback so Nginx won't crash if ACME fails)
 setup_ssl_cert() {
     log_info "Requesting SSL cert..."
     systemctl stop nginx > /dev/null 2>&1
@@ -296,14 +295,15 @@ setup_ssl_cert() {
     chmod +x /root/.acme.sh/acme.sh
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt > /dev/null 2>&1
-    /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 > /dev/null 2>&1 || log_warning "acme.sh certificate issue failed. Using self-signed fallback."
+    /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 > /dev/null 2>&1 || log_warning "acme.sh issue failed."
     
-    if [[ ! -f /root/.acme.sh/${domain}_ecc/${domain}.cer ]]; then
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/AutoScriptX/cert.key -out /etc/AutoScriptX/cert.crt -subj "/CN=${domain}" > /dev/null 2>&1
-    else
-        /root/.acme.sh/acme.sh --installcert -d "$domain" \
-          --fullchainpath /etc/AutoScriptX/cert.crt \
-          --keypath /etc/AutoScriptX/cert.key --ecc > /dev/null 2>&1
+    /root/.acme.sh/acme.sh --installcert -d "$domain" \
+      --fullchainpath /etc/AutoScriptX/cert.crt \
+      --keypath /etc/AutoScriptX/cert.key --ecc > /dev/null 2>&1
+      
+    # GUARANTEE CERTS EXIST SO NGINX CANNOT CRASH
+    if [[ ! -s /etc/AutoScriptX/cert.crt || ! -s /etc/AutoScriptX/cert.key ]]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout /etc/AutoScriptX/cert.key -out /etc/AutoScriptX/cert.crt -subj "/CN=${domain}" > /dev/null 2>&1
     fi
     log_success "SSL cert ready."
 }
@@ -393,9 +393,7 @@ Type=simple
 User=root
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=always
-LimitNOFILE=65535
-
-[Install]
+LimitNOFILE=65535[Install]
 WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload > /dev/null 2>&1
@@ -404,27 +402,24 @@ SERVICE
     log_success "Xray-core configured."
 }
 
-# Configure Nginx (Payload Multiplexing applied to prevent crash)
+# Configure Nginx (IPv6 binds removed to prevent Crash)
 configure_nginx() {
     log_info "Setting up Nginx Multiplexing..."
     rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
     mkdir -p /home/vps/public_html
     mkdir -p /etc/systemd/system/nginx.service.d
     
-    # Payload Custom Nginx block to handle SSH WS, VLESS, VMESS, and Trojan cleanly
+    # Payload Custom Nginx block. [::] is REMOVED so it doesn't crash if sysctl disabled IPv6
     cat > /etc/nginx/conf.d/autoscriptx.conf <<NGINX_CONF
 server {
     listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name $domain;
-    # Route port 80 SSH-WS correctly to the python script
+    server_name _;
     location / { proxy_pass http://127.0.0.1:${PORT_WS_PROXY}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name $domain;
+    listen 443 ssl;
+    server_name _;
     ssl_certificate /etc/AutoScriptX/cert.crt;
     ssl_certificate_key /etc/AutoScriptX/cert.key;
 
@@ -432,7 +427,6 @@ server {
     location /vmess-ws { proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     location /trojan-ws { proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; }
     
-    # Multiplex WS-Proxy to Nginx root and /ssh-ws
     location /ssh-ws { proxy_pass http://127.0.0.1:${PORT_WS_PROXY}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
     location / { proxy_pass http://127.0.0.1:${PORT_WS_PROXY}; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
 }
@@ -461,11 +455,10 @@ setup_badvpn() {
     log_success "BadVPN set up."
 }
 
-# Configure Stunnel (Port clash fixed)
+# Configure Stunnel
 configure_stunnel() {
     log_info "Configuring Stunnel..."
     wget -qO /etc/stunnel/stunnel.conf "$BASE_URL/config/stunnel.conf" || log_error "Failed to download stunnel.conf."
-    # Prevent stunnel from colliding with Nginx on port 443
     sed -i 's/accept = 443/accept = 444/g' /etc/stunnel/stunnel.conf
     openssl req -x509 -nodes -days 1095 -newkey rsa:2048 \
       -keyout /etc/stunnel/key.pem -out /etc/stunnel/cert.pem \
@@ -485,7 +478,7 @@ configure_sshguard() {
     log_success "SSHGuard configured."
 }
 
-# Apply firewall rules (Grep bug fixed)
+# Apply firewall rules (Grep Bug Fixed by removing hyphens)
 apply_firewall_rules() {
     log_info "Applying firewall rules..."
     iptables_rules=(
@@ -502,8 +495,8 @@ apply_firewall_rules() {
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
-    # FIX: Using -e so grep interprets '--dport' correctly as string, not flag.
-    if grep -q -e "--dport 22" /etc/iptables/rules.v4 2>/dev/null; then
+    # FIX: Using "dport 22" strictly as a literal string. Grep won't throw the flag error.
+    if grep -q "dport 22" /etc/iptables/rules.v4 2>/dev/null; then
       sed -i "/--dport 22 -j ACCEPT/a \\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT\n-A INPUT -p tcp -m state --state NEW -m tcp --dport 8080 -j ACCEPT" /etc/iptables/rules.v4
     else
       echo "-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT" >> /etc/iptables/rules.v4
@@ -513,7 +506,7 @@ apply_firewall_rules() {
     fi
 
     netfilter-persistent save > /dev/null 2>&1 || log_warning "Failed to save iptables rules."
-    log_success "Firewall rules applied successfully."
+    log_success "Firewall rules applied."
 }
 
 # Install Scripts & Payload Elite Menu
@@ -578,7 +571,7 @@ create_account() {
     echo -e "   ${GARROW}  ${BOLD}1${NC}) SSH-WS (FreeNetLabs Routing)"
     echo -e "   ${GARROW}  ${BOLD}2${NC}) Xray (VLESS + VMESS + Trojan)"
     echo ""
-    read -rp "   Select service type [1/2]: " s_type
+    read -rp "   Select service type[1/2]: " s_type
     case "$s_type" in 1|2) ;; *) echo -e "\n   ${GCROSS} Invalid selection."; sleep 2; return ;; esac
 
     read -rp "   Username : " u_name
@@ -760,12 +753,12 @@ main() {
     install_xray      # PAYLOAD INJECTION
     configure_xray    # PAYLOAD INJECTION
     
-    configure_nginx   # Modified to safely Multiplex Xray + Python WS-Proxy
+    configure_nginx   # Patched IPv6 bind crash
     setup_badvpn
-    configure_stunnel # Patched port 443 collision
+    configure_stunnel
     configure_sshguard
-    apply_firewall_rules # Patched Grep Bug
-    install_scripts   # 3x-ui wiped, Payload TUI Injected
+    apply_firewall_rules # Patched Grep Dash Bug
+    install_scripts
     setup_cron_jobs
     final_cleanup
     
