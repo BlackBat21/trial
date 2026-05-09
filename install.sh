@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoXray Installer & Manager — Elite Edition
-# Version : 4.0.9 (Patched WebSocket Handshake & Tunnel Fixes)
+# Version : 4.1.0 (Patched Proxy Deadlocks, UDPGW & Shell Fixes)
 # =============================================================================
 
 set -uo pipefail
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 #  GLOBAL CONSTANTS & COLOUR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="4.0.9"
+readonly SCRIPT_VERSION="4.1.0"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 readonly LOG_FILE="/var/log/autoxray-install.log"
 readonly BACKUP_DIR="/var/backups/autoxray"
@@ -78,7 +78,7 @@ parse_args() {
 
     if [[ -z "$DOMAIN" && "$UNINSTALL" == "false" ]]; then
         echo -e "\n${BOLD}No domain specified. Launching interactive setup...${NC}"
-        read -rp "Do you want to configure a custom domain with Let's Encrypt?[y/N] " configure_tls </dev/tty
+        read -rp "Do you want to configure a custom domain with Let's Encrypt? [y/N] " configure_tls </dev/tty
         if [[ "$configure_tls" =~ ^[Yy]$ ]]; then
             read -rp "Enter Domain (e.g., vpn.example.com): " DOMAIN </dev/tty
             read -rp "Enter Email for Let's Encrypt (e.g., admin@example.com): " EMAIL </dev/tty
@@ -149,7 +149,6 @@ provision_tls() {
         fuser -k 80/tcp 2>/dev/null || true
         
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
-            
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/cert.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
@@ -162,7 +161,6 @@ cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem
 systemctl reload nginx
 EOF
             chmod +x /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh
-            
             log "Let's Encrypt installed successfully for ${DOMAIN}."
             cert_issued="true"
         else
@@ -277,8 +275,34 @@ XRAY_JSON
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SERVICES: XRAY, NGINX & SMART PYTHON PROXY
+#  SERVICES: XRAY, UDPGW, NGINX & PYTHON PROXY
 # ─────────────────────────────────────────────────────────────────────────────
+
+install_badvpn() {
+    section "Installing BadVPN UDPGW (Fixes Port 7300 Forwarding)"
+    wget -q -O /usr/local/bin/badvpn-udpgw "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64"
+    if [[ -s "/usr/local/bin/badvpn-udpgw" ]]; then
+        chmod +x /usr/local/bin/badvpn-udpgw
+        cat > /etc/systemd/system/badvpn-udpgw.service << 'EOF'
+[Unit]
+Description=BadVPN UDPGW
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload; systemctl enable badvpn-udpgw 2>/dev/null
+        log "BadVPN UDPGW active on port 7300."
+    else
+        warn "Failed to download BadVPN UDPGW. Skipping..."
+    fi
+}
 
 install_services() {
     section "Configuring Services"
@@ -286,7 +310,9 @@ install_services() {
     cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
 Description=Xray Service
-After=network.target[Service]
+After=network.target
+
+[Service]
 Type=simple
 User=nobody
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
@@ -326,53 +352,11 @@ NGINX_CONF
 #!/usr/bin/env python3
 import socket, threading, hashlib, base64
 
-def forward_ssh_c2s(src, dst, initial_data):
-    """Client to Server Thread: Smart payload stripper with fallback."""
+def forward_traffic(src, dst, initial_data=b""):
+    """Dumb pipe forwarder. Robust and immune to payload deadlocks."""
     try:
-        buffer = initial_data
-        ssh_started = False
-
-        if buffer:
-            idx = buffer.find(b'SSH-')
-            if idx != -1:
-                dst.sendall(buffer[idx:])
-                ssh_started = True
-            elif len(buffer) > 8192:
-                # Prevent getting stuck if payload is obfuscated/masked
-                dst.sendall(buffer)
-                ssh_started = True
-
-        # Accumulate data until the SSH banner is found or fallback is met
-        while not ssh_started:
-            data = src.recv(8192)
-            if not data: return
-            buffer += data
-            
-            idx = buffer.find(b'SSH-')
-            if idx != -1:
-                dst.sendall(buffer[idx:])
-                ssh_started = True
-                break
-                
-            if len(buffer) > 8192:
-                dst.sendall(buffer)
-                ssh_started = True
-                break
-            
-        # Standard pass-through once banner is established
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: dst.shutdown(socket.SHUT_WR)
-        except: pass
-
-def forward_generic(src, dst):
-    """Server to Client Thread: Standard pass-through."""
-    try:
+        if initial_data:
+            dst.sendall(initial_data)
         while True:
             data = src.recv(8192)
             if not data: break
@@ -393,18 +377,21 @@ def handle_client(client_socket):
             chunk = client_socket.recv(4096)
             if not chunk: return
             req += chunk
+            if len(req) > 16384: return # Prevent buffer exhaustion
             
         head_str = req.decode('utf-8', 'ignore')
         target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
+        # Xray Routing
         if '/vless' in head_str or '/vmess' in head_str or '/trojan' in head_str:
             target.connect(('127.0.0.1', 81))
             target.sendall(req)
-            t1 = threading.Thread(target=forward_generic, args=(client_socket, target), daemon=True)
-            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
+            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target), daemon=True)
+            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket), daemon=True)
+            
+        # SSH Routing
         else:
-            # Parse Sec-WebSocket-Key to satisfy strict WebSocket clients
             ws_key = None
             for line in head_str.split('\r\n'):
                 if line.lower().startswith('sec-websocket-key:'):
@@ -412,18 +399,20 @@ def handle_client(client_socket):
                     break
                     
             if ws_key:
+                # Proper WS Handshake
                 magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
                 accept = base64.b64encode(hashlib.sha1((ws_key + magic).encode('utf-8')).digest()).decode('utf-8')
                 resp = f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
                 client_socket.sendall(resp.encode('utf-8'))
             else:
-                client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                # Proper HTTP 200 Proxy Fallback (Fixes "EOF Reached" in standard payloads)
+                client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 
             target.connect(('127.0.0.1', 22))
-            
             _, _, pipelined = req.partition(b"\r\n\r\n")
-            t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
-            t2 = threading.Thread(target=forward_generic, args=(target, client_socket), daemon=True)
+            
+            t1 = threading.Thread(target=forward_traffic, args=(client_socket, target, pipelined), daemon=True)
+            t2 = threading.Thread(target=forward_traffic, args=(target, client_socket), daemon=True)
             
         t1.start()
         t2.start()
@@ -443,11 +432,13 @@ def handle_client(client_socket):
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(('0.0.0.0', 80))
-server.listen(1000)
+server.listen(1024)
 while True:
     try:
         client, _ = server.accept()
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+    except KeyboardInterrupt:
+        break
     except Exception:
         pass
 PYTHON_SCRIPT
@@ -485,7 +476,7 @@ harden_system() {
     ufw deny out 6881:6889/udp
     ufw --force enable
     
-    # Anti-Torrent DPI (Duplicate check prevents iptables bloat)
+    # Anti-Torrent DPI
     for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey=" "torrent" "announce" "info_hash"; do
         iptables -C FORWARD -m string --algo bm --string "$str" -j DROP 2>/dev/null || \
         iptables -A FORWARD -m string --algo bm --string "$str" -j DROP
@@ -497,11 +488,9 @@ harden_system() {
 
     sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
     sed -i 's/.*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' /etc/ssh/sshd_config
-    
-    # Crucial HTTP Injector Fix: Strip out all banners globally to prevent JSch EOF issues
     sed -i '/^Banner/d' /etc/ssh/sshd_config
     
-    # Add tunneling permissions to OpenSSH and keep-alive directives to prevent idleness
+    # Crucial OpenSSH Allowances for HTTP Injector Channels
     printf '%s\n' "PasswordAuthentication yes" "KbdInteractiveAuthentication yes" "AllowTcpForwarding yes" "PermitTunnel yes" "GatewayPorts yes" "TCPKeepAlive yes" "ClientAliveInterval 120" "ClientAliveCountMax 2" > /etc/ssh/sshd_config.d/99-force-pass.conf
     
     cat > /etc/issue.net <<'BANNER'
@@ -514,13 +503,12 @@ harden_system() {
 
 BANNER
     
-    # THE FIX: Create the infinite tunnel shell using 'read' to continually consume stdin,
-    # preventing the SSH Daemon's pipe buffers from filling and immediately disconnecting.
-    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\nwhile true; do read -r line; done' > /bin/tunnel-shell
+    # THE FIX: Create the infinite tunnel shell correctly using 'cat > /dev/null'. 
+    # This natively consumes standard input and sleeps, preventing 100% CPU lockups.
+    echo -e '#!/bin/sh\ntrap "exit 0" HUP INT TERM QUIT\ncat > /dev/null' > /bin/tunnel-shell
     chmod +x /bin/tunnel-shell
     grep -q "/bin/tunnel-shell" /etc/shells || echo "/bin/tunnel-shell" >> /etc/shells
     
-    # THE FIX: Auto-patch all existing SSH users created by the previous script
     if [[ -f "$CSV_DB" ]]; then
         while IFS=',' read -r uname svc _rest; do
             if [[ "$svc" == "SSH" ]]; then
@@ -530,7 +518,7 @@ BANNER
     fi
 
     systemctl restart ssh || systemctl restart sshd
-    log "System Hardened (Anti-Torrent DPI & Tunnel Shell Active)."
+    log "System Hardened (Anti-Torrent DPI & Safe Tunnel Shell Active)."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,7 +555,7 @@ draw_header() {
     echo -e "  ${BMAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}   ${BCYAN}${BOLD}P H C - L a n z   S c r i p t X${NC}                      ${BMAGENTA}║${NC}"
-    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.0.9${NC}              ${BMAGENTA}║${NC}"
+    echo -e "  ${BMAGENTA}║${NC}   ${DIM}VPN & SSH Management Console  ·  v4.1.0${NC}              ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}║${NC}                                                          ${BMAGENTA}║${NC}"
     echo -e "  ${BMAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -623,7 +611,6 @@ create_account() {
         read -rp "   Password : " u_pass
         [[ -z "$u_pass" ]] && { echo -e "\n   ${GCROSS} Password cannot be empty."; sleep 2; return; }
         
-        # New users are correctly provisioned with the tunnel shell
         useradd -m -s /bin/tunnel-shell "$u_name" 2>/dev/null || true
         echo "${u_name}:${u_pass}" | chpasswd
         chage -E "$u_exp" "$u_name"
@@ -636,7 +623,7 @@ create_account() {
         echo -e "   ${BOLD}${CYAN}Username   ${NC}: $u_name"
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $u_pass"
         echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $u_exp"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS) · 7300 (UDPGW)"
         divider
         echo ""
         
@@ -698,7 +685,7 @@ show_account_details() {
     if [[ "$svc" == "SSH" ]]; then
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $secret"
         echo -e "   ${BOLD}${CYAN}Host       ${NC}: $IP"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS) · 7300 (UDPGW)"
 
     elif [[ "$svc" == "Xray" ]]; then
         local uuid="$secret"
@@ -725,7 +712,7 @@ _delete_account() {
     local svc=$(grep "^${username}," "$CSV_DB" | cut -d, -f2)
 
     echo ""
-    read -rp "   ${GWARN}  Confirm deletion of '${username}'?[y/N]: " confirm </dev/tty
+    read -rp "   ${GWARN}  Confirm deletion of '${username}'? [y/N]: " confirm </dev/tty
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "   ${GINFO} Deletion cancelled."; sleep 1; return
     fi
@@ -858,7 +845,7 @@ manage_services() {
     divider
     echo -e "   ${BOLD}${BCYAN}SERVICE STATUS${NC}"
     divider
-    for svc in xray nginx ws-proxy fail2ban; do
+    for svc in xray nginx ws-proxy badvpn-udpgw fail2ban; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             printf "   ${GREEN}● ACTIVE  ${NC}${BOLD}%-16s${NC}\n" "$svc"
         else
@@ -867,9 +854,9 @@ manage_services() {
     done
     divider
     echo ""
-    read -rp "   Restart all services?[y/N]: " rst </dev/tty
+    read -rp "   Restart all services? [y/N]: " rst </dev/tty
     if [[ "$rst" =~ ^[Yy]$ ]]; then
-        for svc in xray nginx ws-proxy fail2ban; do
+        for svc in xray nginx ws-proxy badvpn-udpgw fail2ban; do
             systemctl restart "$svc" 2>/dev/null && \
                 echo -e "   ${GCHECK} ${svc} restarted." || \
                 echo -e "   ${GWARN} ${svc} could not be restarted."
@@ -911,14 +898,16 @@ uninstall_autoxray() {
     echo ""
     read -rp "   Type 'YES' to confirm: " confirm </dev/tty
     if [[ "$confirm" == "YES" ]]; then
-        systemctl stop  xray ws-proxy ssh-websocket 2>/dev/null || true
-        systemctl disable xray ws-proxy ssh-websocket 2>/dev/null || true
+        systemctl stop  xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
+        systemctl disable xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service \
               /etc/systemd/system/ws-proxy.service \
+              /etc/systemd/system/badvpn-udpgw.service \
               /etc/systemd/system/ssh-websocket.service
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
+              /usr/local/bin/badvpn-udpgw \
               /usr/local/bin/autoxray \
               /usr/local/bin/ws-proxy.py \
               /etc/nginx/conf.d/autoxray-*.conf
@@ -958,18 +947,18 @@ MANAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
 do_uninstall() {
-    systemctl stop xray ws-proxy ssh-websocket 2>/dev/null || true
-    systemctl disable xray ws-proxy ssh-websocket 2>/dev/null || true
-    rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/ssh-websocket.service
+    systemctl stop xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
+    systemctl disable xray ws-proxy ssh-websocket badvpn-udpgw 2>/dev/null || true
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/badvpn-udpgw.service /etc/systemd/system/ssh-websocket.service
     rm -rf /usr/local/etc/xray /etc/ssl/autoxray
-    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
+    rm -f /usr/local/bin/xray /usr/local/bin/menu /usr/local/bin/badvpn-udpgw /usr/local/bin/autoxray /usr/local/bin/ws-proxy.py /etc/nginx/conf.d/autoxray-*.conf
     systemctl daemon-reload; systemctl reload nginx 2>/dev/null || true
     log "Uninstall complete."
     exit 0
 }
 
 start_services() {
-    for svc in nginx xray ws-proxy fail2ban; do systemctl start "$svc" 2>/dev/null; done
+    for svc in nginx xray ws-proxy badvpn-udpgw fail2ban; do systemctl start "$svc" 2>/dev/null; done
     log "All services activated."
 }
 
@@ -998,6 +987,7 @@ main() {
     provision_tls
     install_xray
     configure_xray
+    install_badvpn
     install_services
     harden_system
     install_manage_script
