@@ -66,7 +66,7 @@ prepare_system() {
     apt-get install -y -qq curl wget unzip jq socat coreutils nginx certbot \
         python3-certbot-nginx ufw fail2ban ca-certificates openssl \
         net-tools iproute2 lsof logrotate cron iptables-persistent \
-        dropbear stunnel4 2>&1 | tee -a "$LOG_FILE"
+        dropbear stunnel4 screen vnstat 2>&1 | tee -a "$LOG_FILE"
     log "Base packages installed."
 }
 
@@ -90,7 +90,7 @@ setup_dropbear() {
     systemctl daemon-reload
     systemctl enable dropbear
     systemctl restart dropbear || warn "Failed to restart Dropbear."
-    log "Dropbear configured safely alongside OpenSSH."
+    log "Dropbear configured safely on port 143 alongside OpenSSH."
 }
 
 provision_tls() {
@@ -101,21 +101,37 @@ provision_tls() {
 
     if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
         info "Installing Let's Encrypt for ${DOMAIN} using Certbot"
-        systemctl stop nginx apache2 2>/dev/null || true
+        systemctl stop nginx ws-proxy apache2 2>/dev/null || true
         fuser -k 80/tcp 2>/dev/null || true
         
         if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --non-interactive --agree-tos --key-type ecdsa >> "$LOG_FILE" 2>&1; then
             cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${TLS_DIR}/fullchain.pem"
             cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${TLS_DIR}/key.pem"
             
-            mkdir -p /etc/letsencrypt/renewal-hooks/deploy/
-            cat > /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh <<EOF
+            # Setup dynamic hooks to prevent ACME conflicts with Python WS-Proxy on port 80
+            mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post /etc/letsencrypt/renewal-hooks/deploy
+            
+            cat > /etc/letsencrypt/renewal-hooks/pre/autoxray-pre.sh <<'EOF'
+#!/bin/bash
+systemctl stop ws-proxy nginx
+fuser -k 80/tcp 2>/dev/null || true
+EOF
+            chmod +x /etc/letsencrypt/renewal-hooks/pre/autoxray-pre.sh
+
+            cat > /etc/letsencrypt/renewal-hooks/post/autoxray-post.sh <<'EOF'
+#!/bin/bash
+systemctl start ws-proxy nginx
+EOF
+            chmod +x /etc/letsencrypt/renewal-hooks/post/autoxray-post.sh
+
+            cat > /etc/letsencrypt/renewal-hooks/deploy/autoxray-deploy.sh <<EOF
 #!/bin/bash
 cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TLS_DIR}/fullchain.pem
 cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TLS_DIR}/key.pem
 systemctl reload nginx
 EOF
-            chmod +x /etc/letsencrypt/renewal-hooks/deploy/autoxray-hook.sh
+            chmod +x /etc/letsencrypt/renewal-hooks/deploy/autoxray-deploy.sh
+
             log "Let's Encrypt installed successfully for ${DOMAIN}."
             cert_issued="true"
         else
@@ -137,7 +153,6 @@ setup_websocket_service() {
     systemctl stop ws-proxy.service 2>/dev/null || true
     rm -f /usr/local/bin/ws-proxy
     
-    # We use your robust python logic as the native proxy handler, bound to port 80
     cat > /usr/local/bin/ws-proxy << 'EOF'
 #!/usr/bin/env python3
 import socket, threading, hashlib, base64
@@ -205,7 +220,8 @@ def handle_client(client_socket):
         else:
             client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             
-        target.connect(('127.0.0.1', 22))
+        # Target modified from OpenSSH (22) to FreeNetLabs Dropbear (143) to reduce overhead
+        target.connect(('127.0.0.1', 143))
         _, _, pipelined = req.partition(b"\r\n\r\n")
         
         t1 = threading.Thread(target=forward_ssh_c2s, args=(client_socket, target, pipelined), daemon=True)
@@ -250,7 +266,7 @@ WantedBy=multi-user.target
 SERVICE
 
     systemctl daemon-reload; systemctl enable ws-proxy
-    log "SSH-WebSocket proxy configured securely."
+    log "SSH-WebSocket proxy configured natively to hit Dropbear."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,7 +275,10 @@ SERVICE
 
 install_xray() {
     section "Installing Xray-core"
-    local latest_tag=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name' 2>/dev/null) || latest_tag="v1.8.13"
+    local latest_tag
+    latest_tag=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null)
+    [[ -z "$latest_tag" || "$latest_tag" == "null" ]] && latest_tag="v1.8.24"
+
     local arch; case "$(uname -m)" in x86_64) arch="64" ;; aarch64) arch="arm64-v8a" ;; *) die "Unsupported arch" ;; esac
     
     local tmp_dir=$(mktemp -d)
@@ -299,7 +318,7 @@ EOF
     "rules":[
       {
         "type": "field",
-        "protocol": ["bittorrent"],
+        "protocol":["bittorrent"],
         "outboundTag": "blocked"
       }
     ]
@@ -382,7 +401,7 @@ server {
     location / { proxy_pass http://127.0.0.1:80; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host; proxy_read_timeout 86400; proxy_send_timeout 86400; }
 }
 NGINX_CONF
-    log "Nginx config applied for multiplexing."
+    log "Nginx config applied for seamless Xray/SSH-WS multiplexing."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,7 +412,7 @@ harden_system() {
     section "Security Hardening"
     ufw --force reset >/dev/null 2>&1
     ufw default deny incoming >/dev/null 2>&1; ufw default allow outgoing >/dev/null 2>&1
-    ufw allow 22/tcp >/dev/null 2>&1; ufw allow 80/tcp >/dev/null 2>&1; ufw allow 443/tcp >/dev/null 2>&1
+    ufw allow 22/tcp >/dev/null 2>&1; ufw allow 80/tcp >/dev/null 2>&1; ufw allow 443/tcp >/dev/null 2>&1; ufw allow 143/tcp >/dev/null 2>&1
     
     # Anti-Torrent Ports
     ufw deny out 6881:6889/tcp >/dev/null 2>&1
@@ -425,7 +444,40 @@ harden_system() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_manage_script() {
-    section "Installing Full Elite TUI Manager"
+    section "Installing Full Elite TUI Manager & Cleanup Cron"
+
+    # Elite Auto-Cleanup Cron Job for 3x-ui style expiration management
+    cat > /usr/local/bin/clean-expired <<'CLEANER'
+#!/usr/bin/env bash
+CSV_DB="/usr/local/etc/xray/users.csv"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+TODAY=$(date +"%Y-%m-%d")
+CHANGED=0
+
+while IFS=',' read -r uname svc secret exp; do
+    if [[ "$exp" != "Never" ]] && [[ "$exp" < "$TODAY" ]]; then
+        if [[ "$svc" == "SSH" ]]; then
+            pkill -9 -u "$uname" 2>/dev/null || true
+            userdel -f -r "$uname" 2>/dev/null || true
+        elif [[ "$svc" == "Xray" ]]; then
+            jq --arg user "$uname" '
+              .inbounds |= map(
+                if .settings.clients then
+                  .settings.clients |= map(select(.email != $user))
+                else . end
+              )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+            CHANGED=1
+        fi
+        sed -i "/^${uname},/d" "$CSV_DB"
+    fi
+done < <(tail -n +2 "$CSV_DB" 2>/dev/null || true)
+
+if [[ $CHANGED -eq 1 ]]; then
+    systemctl restart xray
+fi
+CLEANER
+    chmod +x /usr/local/bin/clean-expired
+    (crontab -l 2>/dev/null | grep -v clean-expired; echo "0 0 * * * /usr/local/bin/clean-expired") | crontab -
 
     cat > /usr/local/bin/menu <<'MANAGE'
 #!/usr/bin/env bash
@@ -489,7 +541,7 @@ create_account() {
     echo -e "   ${GARROW}  ${BOLD}1${NC}) SSH-WS (FreeNetLabs Routing)"
     echo -e "   ${GARROW}  ${BOLD}2${NC}) Xray (VLESS + VMESS + Trojan)"
     echo ""
-    read -rp "   Select service type [1/2]: " s_type
+    read -rp "   Select service type[1/2]: " s_type
 
     case "$s_type" in 1|2) ;; *) echo -e "\n   ${GCROSS} Invalid selection."; sleep 2; return ;; esac
 
@@ -518,7 +570,7 @@ create_account() {
         echo -e "   ${BOLD}${CYAN}Username   ${NC}: $u_name"
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $u_pass"
         echo -e "   ${BOLD}${CYAN}Expiry     ${NC}: $u_exp"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS via Nginx)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (OpenSSH) · 143 (Dropbear) · 80 (WS) · 443 (WSS via Nginx)"
         divider
         echo ""
         
@@ -530,6 +582,8 @@ create_account() {
               .settings.clients +=[{"id": $uuid, "flow": "", "email": $user}]
             elif .protocol == "vmess" and .settings.clients then
               .settings.clients +=[{"id": $uuid, "alterId": 0, "email": $user}]
+            elif .protocol == "trojan" and .settings.clients then
+              .settings.clients += [{"password": $uuid, "email": $user}]
             else . end
           )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
         
@@ -580,7 +634,7 @@ show_account_details() {
     if [[ "$svc" == "SSH" ]]; then
         echo -e "   ${BOLD}${CYAN}Password   ${NC}: $secret"
         echo -e "   ${BOLD}${CYAN}Host       ${NC}: $IP"
-        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (SSH) · 80 (WS) · 443 (WSS)"
+        echo -e "   ${BOLD}${CYAN}Ports      ${NC}: 22 (OpenSSH) · 143 (Dropbear) · 80 (WS) · 443 (WSS)"
 
     elif [[ "$svc" == "Xray" ]]; then
         local uuid="$secret"
@@ -676,7 +730,7 @@ manage_accounts() {
             usernames+=("$uname")
             protocols+=("$svc")
             (( idx++ ))
-        done < <(tail -n +2 "$CSV_DB")
+        done < <(tail -n +2 "$CSV_DB" 2>/dev/null || true)
 
         if [[ ${#usernames[@]} -eq 0 ]]; then
             echo -e "   ${GWARN} No accounts found in database."
@@ -776,8 +830,10 @@ uninstall_autoxray() {
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
+              /usr/local/bin/clean-expired \
               /usr/local/bin/ws-proxy \
               /etc/nginx/conf.d/autoscriptx.conf
+        crontab -l | grep -v "clean-expired" | crontab -
         systemctl daemon-reload
         systemctl reload nginx 2>/dev/null || true
         echo -e "\n   ${GCHECK}  ${BOLD}${GREEN}Uninstallation complete. Exiting.${NC}"
