@@ -62,7 +62,7 @@ parse_args() {
             --skip-hardening) SKIP_HARDENING="true"; shift ;;
             --uninstall)      UNINSTALL="true"; shift   ;;
             -h|--help)
-                echo "Usage: sudo bash install.sh [--domain DOMAIN --email EMAIL] [--uninstall]"
+                echo "Usage: sudo bash install.sh[--domain DOMAIN --email EMAIL] [--uninstall]"
                 exit 0 ;;
             *) die "Unknown option: $1" ;;
         esac
@@ -240,17 +240,17 @@ EOF
       "tag": "vless-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VLESS_WS}, "protocol": "vless",
       "settings": { "clients":[{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }], "decryption": "none" },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless-ws" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     },
     {
       "tag": "vmess-ws-tls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS}, "protocol": "vmess",
       "settings": { "clients":[{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     },
     {
       "tag": "trojan-ws-tls", "listen": "127.0.0.1", "port": ${PORT_TROJAN_WS}, "protocol": "trojan",
-      "settings": { "clients": [{ "password": "${trojan_pass}", "email": "admin_trojan" }] },
+      "settings": { "clients":[{ "password": "${trojan_pass}", "email": "admin_trojan" }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan-ws" } },
       "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     },
@@ -262,7 +262,7 @@ EOF
     },
     {
       "tag": "vmess-ws-notls", "listen": "127.0.0.1", "port": ${PORT_VMESS_WS_NOTLS}, "protocol": "vmess",
-      "settings": { "clients": [{ "id": "${uuid_vmess}", "alterId": 0 }] },
+      "settings": { "clients":[{ "id": "${uuid_vmess}", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-ws-nt" } },
       "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"] }
     }
@@ -287,12 +287,14 @@ install_services() {
 [Unit]
 Description=Xray Service
 After=network.target
+
 [Service]
 Type=simple
 User=nobody
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=always
 LimitNOFILE=65535
+
 [Install]
 WantedBy=multi-user.target
 SERVICE
@@ -446,14 +448,19 @@ PYTHON_SCRIPT
     cat > /etc/systemd/system/ws-proxy.service << 'SERVICE'
 [Unit]
 Description=AutoScriptX Python WS Proxy
-After=network.target[Service]
+After=network.target
+
+[Service]
 Type=simple
 User=root
 ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
 Restart=always
-LimitNOFILE=65535[Install]
+LimitNOFILE=65535
+
+[Install]
 WantedBy=multi-user.target
 SERVICE
+
     systemctl daemon-reload; systemctl enable ws-proxy
 }
 
@@ -628,7 +635,7 @@ create_account() {
             if .protocol == "vless" and .settings.clients then
               .settings.clients +=[{"id": $uuid, "flow": "", "email": $user}]
             elif .protocol == "vmess" and .settings.clients then
-              .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
+              .settings.clients +=[{"id": $uuid, "alterId": 0, "email": $user}]
             else . end
           )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
         
@@ -900,6 +907,7 @@ uninstall_autoxray() {
         rm -rf /usr/local/etc/xray /etc/ssl/autoxray
         rm -f /usr/local/bin/xray \
               /usr/local/bin/menu \
+              /usr/local/bin/autoxray \
               /usr/local/bin/ws-proxy.py \
               /etc/nginx/conf.d/autoxray-*.conf
         systemctl daemon-reload
