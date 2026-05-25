@@ -13,7 +13,8 @@ yellow="\033[1;33m"
 nc="\033[0m"
 
 # Configuration
-BASE_URL="https://raw.githubusercontent.com/BlackBat21/trial/main"
+BASE_URL="https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master"
+SELF_UPDATE_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
 export DEBIAN_FRONTEND=noninteractive
 
 # Xray Payload Constants
@@ -916,34 +917,176 @@ XRAYMENU
 # Install FreeNetLabs scripts helper
 install_scripts() {
     log_info "Installing scripts..."
+
+    # ── Attempt optional upstream downloads (best-effort, non-fatal) ─────────
+    # These augment the inline scripts below. If the upstream paths change or
+    # the repo is unavailable, every critical function still works because the
+    # core scripts are written inline further down.
     declare -A script_dirs=(
-        [menu]="menu.sh slowdns-menu.sh"
+        [menu]="slowdns-menu.sh"
         [ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
         [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
     for dir in "${!script_dirs[@]}"; do
         for s in ${script_dirs[$dir]}; do
             local base="${s%.sh}"
-            wget -qO "/usr/bin/${base}" "$BASE_URL/scripts/$dir/$s" > /dev/null 2>&1 || log_warning "Failed to download $s."
-            chmod +x "/usr/bin/${base}"
+            wget -qO "/usr/bin/${base}" "$BASE_URL/scripts/$dir/$s" > /dev/null 2>&1 \
+                && chmod +x "/usr/bin/${base}" \
+                || log_warning "Optional script unavailable (non-fatal): $s"
         done
     done
 
-    _write_xray_menu
-
-    if [[ -f /usr/bin/menu ]]; then
-        sed -i 's/xui-menu/xray-menu/g'       /usr/bin/menu
-        sed -i 's/X-UI Manager/Xray Manager/g' /usr/bin/menu
-    fi
-    if [[ -f /usr/bin/manage-services ]]; then
+    # Patch manage-services if the upstream download succeeded
+    if [[ -s /usr/bin/manage-services ]]; then
         sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
         sed -i 's/x-ui/xray/g'                  /usr/bin/manage-services
         sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
         sed -i 's/XUI Watcher/Xray Watcher/g'   /usr/bin/manage-services
         sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
     fi
-    wget -qO /etc/AutoScriptX/uninstall.sh "$BASE_URL/uninstall.sh" > /dev/null 2>&1 || log_warning "Failed to download uninstall.sh."
-    chmod +x /etc/AutoScriptX/uninstall.sh
+
+    # ── Write xray-menu inline (always available) ─────────────────────────────
+    _write_xray_menu
+
+    # ── Write main menu inline (always available) ─────────────────────────────
+    # This guarantees `asx` / `autoscriptx` always produces a working menu
+    # even when every upstream download above fails.
+    cat > /usr/bin/menu << 'MAINMENU'
+#!/bin/bash
+# =============================================================================
+# AutoScriptX — Main Menu  v4.1.0
+# =============================================================================
+green="\033[0;32m"
+blue="\033[0;34m"
+yellow="\033[1;33m"
+red="\033[0;31m"
+cyan="\033[0;36m"
+nc="\033[0m"
+
+show_main_menu() {
+    clear
+    DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
+    XRAY_VER=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
+    UPTIME=$(uptime -p 2>/dev/null || echo "unknown")
+    echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
+    echo -e "${cyan}║       AutoScriptX  v4.1.0  —  Main Menu     ║${nc}"
+    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
+    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}\n" "$DOMAIN"
+    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$XRAY_VER"
+    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}\n" "$UPTIME"
+    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
+    echo -e "${cyan}║${nc}  ${green}1)${nc} Xray Manager (VLESS / VMESS / Trojan)    ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${green}2)${nc} Service Status                           ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${green}3)${nc} Restart All Services                     ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${green}4)${nc} System Info                              ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${green}5)${nc} Change Domain                            ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${yellow}9)${nc} UPDATE AutoScriptX (non-destructive)     ${cyan}║${nc}"
+    echo -e "${cyan}║${nc}  ${red}0)${nc} Exit                                     ${cyan}║${nc}"
+    echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
+    read -rp "Select option: " opt
+}
+
+service_status() {
+    clear
+    echo -e "${blue}══════════════ Service Status ══════════════${nc}"
+    for svc in xray nginx dropbear stunnel4 squid sshguard ws-proxy; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            echo -e "  ${green}●${nc} $svc — running"
+        else
+            echo -e "  ${red}●${nc} $svc — stopped / not installed"
+        fi
+    done
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+restart_services() {
+    clear
+    echo -e "${blue}Restarting services...${nc}"
+    for svc in xray nginx dropbear stunnel4 squid; do
+        systemctl restart "$svc" > /dev/null 2>&1 \
+            && echo -e "  ${green}✔${nc} $svc restarted" \
+            || echo -e "  ${yellow}✘${nc} $svc could not be restarted"
+    done
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+system_info() {
+    clear
+    echo -e "${blue}══════════════ System Info ══════════════${nc}"
+    echo -e "  OS      : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    echo -e "  Kernel  : $(uname -r)"
+    echo -e "  CPU     : $(nproc) core(s)"
+    echo -e "  RAM     : $(free -h | awk '/^Mem/{print $3 " used / " $2 " total"}')"
+    echo -e "  Disk    : $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+    echo -e "  IP      : $(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+    echo -e "  Domain  : $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
+    echo -e "  Uptime  : $(uptime -p 2>/dev/null)"
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+change_domain() {
+    if [[ -f /usr/bin/change-domain && -s /usr/bin/change-domain ]]; then
+        bash /usr/bin/change-domain
+    else
+        clear
+        echo -e "${yellow}Current domain:${nc} $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
+        read -rp "Enter new domain (leave blank to cancel): " new_domain
+        new_domain=$(echo "$new_domain" | tr -d ' ')
+        if [[ -n "$new_domain" ]]; then
+            echo "$new_domain" > /etc/AutoScriptX/domain
+            # Update nginx server_name if possible
+            sed -i "s/server_name .*;/server_name ${new_domain};/g" \
+                /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
+            sed -i "s/server_name .*;/server_name ${new_domain};/g" \
+                /etc/nginx/conf.d/xhttp-port80.conf 2>/dev/null || true
+            systemctl reload nginx > /dev/null 2>&1 || true
+            echo -e "${green}Domain updated to: ${new_domain}${nc}"
+        else
+            echo -e "${yellow}Cancelled.${nc}"
+        fi
+        read -p "Press Enter to return..."
+    fi
+}
+
+do_update() {
+    echo -e "${blue}Fetching latest update engine...${nc}"
+    menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
+    if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
+           "https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh" \
+           -o "$menu_updater"; then
+        chmod +x "$menu_updater"
+        bash "$menu_updater" --update-only
+        rm -f "$menu_updater"
+    else
+        echo -e "${red}Failed to fetch update. Check your internet connection.${nc}"
+    fi
+    read -p "Press Enter to return..."
+}
+
+while true; do
+    show_main_menu
+    case $opt in
+        1) xray-menu ;;
+        2) service_status ;;
+        3) restart_services ;;
+        4) system_info ;;
+        5) change_domain ;;
+        9) do_update ;;
+        0) exit 0 ;;
+        *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
+    esac
+done
+MAINMENU
+    chmod +x /usr/bin/menu
+
+    # Optional: attempt uninstall.sh download (non-fatal)
+    wget -qO /etc/AutoScriptX/uninstall.sh "$BASE_URL/uninstall.sh" > /dev/null 2>&1 \
+        && chmod +x /etc/AutoScriptX/uninstall.sh \
+        || log_warning "Optional script unavailable (non-fatal): uninstall.sh"
+
     log_success "Scripts installed."
 }
 
