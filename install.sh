@@ -841,13 +841,15 @@ case $opt in
 
         v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
         v_b64=$(echo -n "$v_json" | base64 -w0)
+        vxt_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP-TLS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"tls\"}"
+        vxt_b64=$(echo -n "$vxt_json" | base64 -w0)
         vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
         vx_b64=$(echo -n "$vx_json" | base64 -w0)
 
         echo -e "\n${green}╔══════════════════════════════════════════════╗"
         echo -e "║         Account Created Successfully!        ║"
         echo -e "╚══════════════════════════════════════════════╝${nc}"
-        echo -e "\n${blue}── TLS Links (Port 443) ────────────────────────────────${nc}"
+        echo -e "\n${blue}── TLS WebSocket Links (Port 443) ──────────────────────${nc}"
         echo -e "${yellow}VLESS-WS (TLS):${nc}"
         echo -e "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
         echo ""
@@ -856,11 +858,17 @@ case $opt in
         echo ""
         echo -e "${yellow}TROJAN-WS (TLS):${nc}"
         echo -e "trojan://${u_uuid}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
-        echo -e "\n${blue}── Non-TLS xHTTP Links (Port 80) ───────────────────────${nc}"
-        echo -e "${yellow}VLESS-xHTTP (Plain, no TLS):${nc}"
+        echo -e "\n${blue}── TLS xHTTP Links (Port 443) ──────────────────────────${nc}"
+        echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
+        echo -e "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
+        echo ""
+        echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
+        echo -e "vmess://${vxt_b64}"
+        echo -e "\n${blue}── Plain xHTTP Links (Port 80, no TLS) ─────────────────${nc}"
+        echo -e "${yellow}VLESS-xHTTP (Plain):${nc}"
         echo -e "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
         echo ""
-        echo -e "${yellow}VMESS-xHTTP (Plain, no TLS):${nc}"
+        echo -e "${yellow}VMESS-xHTTP (Plain):${nc}"
         echo -e "vmess://${vx_b64}"
         echo ""
         read -p "Press Enter to return..."
