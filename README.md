@@ -1,4 +1,4 @@
-# AutoXray — Ubuntu 24 VPS Installer
+# BEN10-TUNNEL — Ubuntu 24 VPS Installer
 
 > **Xray-core + SSH over WebSocket** — production-ready, single-command deployment.
 
