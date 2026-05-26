@@ -598,6 +598,7 @@ update_script() {
     done
 
     # Patch manage-services if upstream download succeeded
+    if [[ -s /usr/bin/manage-services ]]; then
         sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
         sed -i 's/x-ui/xray/g'                  /usr/bin/manage-services
         sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
@@ -806,12 +807,12 @@ _write_main_menu() {
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 
-green="[0;32m"
-blue="[0;34m"
-yellow="[1;33m"
-red="[0;31m"
-cyan="[0;36m"
-nc="[0m"
+green="\033[0;32m"
+blue="\033[0;34m"
+yellow="\033[1;33m"
+red="\033[0;31m"
+cyan="\033[0;36m"
+nc="\033[0m"
 
 show_header() {
     clear
@@ -822,12 +823,9 @@ show_header() {
     echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
     echo -e "${cyan}║       AutoScriptX  v4.2.0  —  Main Menu     ║${nc}"
     echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
-    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}
-" "$domain"
-    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}
-" "$xray_ver"
-    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}
-" "$uptime_str"
+    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}\n" "$domain"
+    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$xray_ver"
+    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}\n" "$uptime_str"
     echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
 }
 
@@ -883,16 +881,14 @@ create_account() {
     echo -e "${green}╔══════════════════════════════════════════════════╗"
     echo -e "║          Account Created Successfully!           ║"
     echo -e "╚══════════════════════════════════════════════════╝${nc}"
-    echo -e "
-${blue}── SSH / Tunnel ─────────────────────────────────────────${nc}"
+    echo -e "\n${blue}── SSH / Tunnel ─────────────────────────────────────────${nc}"
     echo -e "  ${yellow}Host       :${nc} ${DOMAIN}"
     echo -e "  ${yellow}Username   :${nc} ${u_name}"
     echo -e "  ${yellow}Password   :${nc} ${u_pass}"
     echo -e "  ${yellow}SSH Port   :${nc} 22"
     echo -e "  ${yellow}Dropbear   :${nc} 443"
     echo -e "  ${yellow}Expiry     :${nc} ${u_exp}"
-    echo -e "
-${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
+    echo -e "\n${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
     echo -e "${yellow}VLESS-WS:${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
     echo ""
@@ -901,15 +897,13 @@ ${blue}── TLS WebSocket (Port 443) ─────────────�
     echo ""
     echo -e "${yellow}TROJAN-WS:${nc}"
     echo "trojan://${u_trojan}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
-    echo -e "
-${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
+    echo -e "\n${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
     echo ""
     echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
     echo "vmess://${vxt_b64}"
-    echo -e "
-${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
+    echo -e "\n${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP:${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
     echo ""
@@ -921,18 +915,14 @@ ${blue}── Plain xHTTP (Port 80, no TLS) ────────────
 
 delete_account() {
     show_header
-    echo -e "${blue}── Delete Account ──────────────────────────────────────${nc}
-"
+    echo -e "${blue}── Delete Account ──────────────────────────────────────${nc}\n"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
         echo -e "  ${yellow}No accounts found.${nc}"
         read -p "  Press Enter to return..."; return
     fi
-    printf "  %-20s %-12s
-" "USERNAME" "EXPIRY"
-    printf "  %-20s %-12s
-" "────────────────────" "──────────"
-    awk -F',' 'NR>1 {printf "  %-20s %-12s
-", $1, $5}' "$CSV_DB"
+    printf "  %-20s %-12s\n" "USERNAME" "EXPIRY"
+    printf "  %-20s %-12s\n" "────────────────────" "──────────"
+    awk -F',' 'NR>1 {printf "  %-20s %-12s\n", $1, $5}' "$CSV_DB"
     echo ""
     read -rp "  Username to delete (Enter to cancel): " u_name
     [[ -z "$u_name" ]] && return
@@ -955,18 +945,15 @@ delete_account() {
 
 list_accounts() {
     show_header
-    echo -e "${blue}── Active Accounts ─────────────────────────────────────${nc}
-"
+    echo -e "${blue}── Active Accounts ─────────────────────────────────────${nc}\n"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
         echo -e "  ${yellow}No accounts found.${nc}"
         read -p "  Press Enter to return..."; return
     fi
     local today
     today=$(date +%Y-%m-%d)
-    printf "  %-18s %-12s %-36s %s
-" "USERNAME" "EXPIRY" "XRAY UUID" "STATUS"
-    printf "  %-18s %-12s %-36s %s
-" "──────────────────" "──────────" "────────────────────────────────────" "──────"
+    printf "  %-18s %-12s %-36s %s\n" "USERNAME" "EXPIRY" "XRAY UUID" "STATUS"
+    printf "  %-18s %-12s %-36s %s\n" "──────────────────" "──────────" "────────────────────────────────────" "──────"
     while IFS=',' read -r name pass uuid trojan exp; do
         [[ "$name" == "Username" ]] && continue
         if [[ "$exp" < "$today" ]]; then
@@ -983,8 +970,7 @@ list_accounts() {
 
 service_status() {
     show_header
-    echo -e "${blue}── Service Status ──────────────────────────────────────${nc}
-"
+    echo -e "${blue}── Service Status ──────────────────────────────────────${nc}\n"
     for svc in xray nginx dropbear stunnel4 squid sshguard ws-proxy; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             echo -e "  ${green}●${nc} $svc — running"
@@ -998,8 +984,7 @@ service_status() {
 
 restart_services() {
     show_header
-    echo -e "${blue}Restarting services...${nc}
-"
+    echo -e "${blue}Restarting services...${nc}\n"
     for svc in xray nginx dropbear stunnel4 squid; do
         systemctl restart "$svc" > /dev/null 2>&1 \
             && echo -e "  ${green}✔${nc} $svc restarted" \
@@ -1011,8 +996,7 @@ restart_services() {
 
 system_info() {
     show_header
-    echo -e "${blue}── System Info ─────────────────────────────────────────${nc}
-"
+    echo -e "${blue}── System Info ─────────────────────────────────────────${nc}\n"
     echo -e "  OS      : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
     echo -e "  Kernel  : $(uname -r)"
     echo -e "  CPU     : $(nproc) core(s)"
@@ -1027,8 +1011,7 @@ system_info() {
 
 change_domain() {
     show_header
-    echo -e "${blue}── Change Domain ───────────────────────────────────────${nc}
-"
+    echo -e "${blue}── Change Domain ───────────────────────────────────────${nc}\n"
     echo -e "  ${yellow}Current:${nc} $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
     echo ""
     read -rp "  New domain (Enter to cancel): " new_domain
@@ -1040,8 +1023,7 @@ change_domain() {
         sed -i "s/server_name .*;/server_name ${new_domain};/g" \
             /etc/nginx/conf.d/xhttp-port80.conf  2>/dev/null || true
         systemctl reload nginx > /dev/null 2>&1 || true
-        echo -e "
-  ${green}Domain updated to: ${new_domain}${nc}"
+        echo -e "\n  ${green}Domain updated to: ${new_domain}${nc}"
     else
         echo -e "  ${yellow}Cancelled.${nc}"
     fi
@@ -1050,8 +1032,7 @@ change_domain() {
 
 do_update() {
     show_header
-    echo -e "${blue}Fetching latest update engine from repo...${nc}
-"
+    echo -e "${blue}Fetching latest update engine from repo...${nc}\n"
     local menu_updater
     menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
     if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
