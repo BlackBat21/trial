@@ -831,21 +831,34 @@ show_header() {
 
 create_account() {
     show_header
-    local DOMAIN
+    local DOMAIN PUBLIC_IP
     DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
-    echo -e "${blue}── Create Unified Account ──────────────────────────────${nc}"
-    echo ""
-    read -rp "  Username                      : " u_name
+    PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+
+    # ── Prompts (gum if available, plain read fallback) ───────────────────────
+    if command -v gum &>/dev/null; then
+        echo -e "\n# 🧑 Create SSH Account\n"
+        u_name=$(gum input --placeholder "username"  --prompt "🔵 Username: ")
+        u_pass=$(gum input --placeholder "password"  --prompt "🔑 Password: ")
+        days=$(gum input   --placeholder "30"        --prompt "📅 Expired (days): ")
+    else
+        echo -e "${blue}── Create Account ──────────────────────────────────────${nc}\n"
+        read -rp "  🔵 Username       : " u_name
+        read -rp "  🔑 Password       : " u_pass
+        read -rp "  📅 Expired (days) : " days
+    fi
+
     [[ -z "$u_name" ]] && { echo -e "${red}Username cannot be empty.${nc}"; sleep 2; return; }
-    read -rp "  Password (Enter to auto-gen)  : " u_pass
     [[ -z "$u_pass" ]] && u_pass=$(openssl rand -base64 10 | tr -d '/+=')
-    read -rp "  Expiry days (default 30)      : " days
     days=${days:-30}
-    local u_exp u_uuid u_trojan
+
+    local u_exp u_exp_fmt u_uuid u_trojan
     u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    u_exp_fmt=$(date -d "+${days} days" +"%B %d, %Y")
     u_uuid=$(cat /proc/sys/kernel/random/uuid)
     u_trojan=$(openssl rand -hex 20)
 
+    # ── Create SSH/Linux user ─────────────────────────────────────────────────
     if id "$u_name" &>/dev/null; then
         echo -e "${red}  User '$u_name' already exists.${nc}"
         read -p "  Press Enter to return..."; return
@@ -853,9 +866,10 @@ create_account() {
     useradd -M -s /bin/false -e "$u_exp" "$u_name"
     echo "${u_name}:${u_pass}" | chpasswd
 
-    jq --arg user    "$u_name"   \
-       --arg uuid    "$u_uuid"   \
-       --arg tpw     "$u_trojan" \
+    # ── Add to all Xray inbounds ──────────────────────────────────────────────
+    jq --arg user "$u_name"   \
+       --arg uuid "$u_uuid"   \
+       --arg tpw  "$u_trojan" \
        '.inbounds |= map(
           if   .protocol == "vless"  and .settings.clients
             then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
@@ -867,8 +881,10 @@ create_account() {
         )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
     systemctl restart xray > /dev/null 2>&1
 
+    # ── Persist to CSV ────────────────────────────────────────────────────────
     echo "${u_name},${u_pass},${u_uuid},${u_trojan},${u_exp}" >> "$CSV_DB"
 
+    # ── Build Xray share-links ────────────────────────────────────────────────
     local v_json v_b64 vxt_json vxt_b64 vx_json vx_b64
     v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
     v_b64=$(echo -n "$v_json" | base64 -w0)
@@ -877,18 +893,35 @@ create_account() {
     vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
     vx_b64=$(echo -n "$vx_json" | base64 -w0)
 
+    # ── Output — SSH section (Image 1 format) ─────────────────────────────────
     clear
-    echo -e "${green}╔══════════════════════════════════════════════════╗"
-    echo -e "║          Account Created Successfully!           ║"
-    echo -e "╚══════════════════════════════════════════════════╝${nc}"
-    echo -e "\n${blue}── SSH / Tunnel ─────────────────────────────────────────${nc}"
-    echo -e "  ${yellow}Host       :${nc} ${DOMAIN}"
-    echo -e "  ${yellow}Username   :${nc} ${u_name}"
-    echo -e "  ${yellow}Password   :${nc} ${u_pass}"
-    echo -e "  ${yellow}SSH Port   :${nc} 22"
-    echo -e "  ${yellow}Dropbear   :${nc} 443"
-    echo -e "  ${yellow}Expiry     :${nc} ${u_exp}"
-    echo -e "\n${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
+    echo -e "# ✅ SSH Account Created\n"
+    echo -e "🔵 ${yellow}Username${nc}    : ${green}${u_name}${nc}"
+    echo -e "🔑 ${yellow}Password${nc}    : ${green}${u_pass}${nc}"
+    echo -e "📅 ${yellow}Expires On${nc}  : ${green}${u_exp_fmt}${nc}"
+    echo -e "🌐 ${yellow}Public IP${nc}   : ${green}${PUBLIC_IP}${nc}"
+    echo -e "🐳 ${yellow}Host${nc}        : ${green}${DOMAIN}${nc}"
+
+    echo -e "\n# 📦 Ports\n"
+    echo -e "• SSH WS      : ${green}80${nc}"
+    echo -e "• SSH SSL WS  : ${green}443${nc}"
+    echo -e "• SSL/TLS     : ${green}443${nc}"
+    echo -e "• SQUID       : ${green}8080${nc}"
+    echo -e "• UDPGW       : ${green}7200,7300${nc}"
+
+    echo -e "\n# ✏️  Payloads\n"
+    echo -e "${yellow}WSS Payload${nc}\n"
+    echo -e "   GET wss://example.com HTTP/1.1[crlf]"
+    echo -e "   Host: ${DOMAIN}[crlf]"
+    echo -e "   Upgrade: websocket[crlf][crlf]"
+    echo -e "\n${yellow}WS Payload${nc}\n"
+    echo -e "   GET / HTTP/1.1[crlf]"
+    echo -e "   Host: ${DOMAIN}[crlf]"
+    echo -e "   Upgrade: websocket[crlf][crlf]"
+
+    # ── Output — Xray links (appended below) ──────────────────────────────────
+    echo -e "\n# 🔐 Xray Links\n"
+    echo -e "${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
     echo -e "${yellow}VLESS-WS:${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
     echo ""
@@ -897,12 +930,14 @@ create_account() {
     echo ""
     echo -e "${yellow}TROJAN-WS:${nc}"
     echo "trojan://${u_trojan}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
+
     echo -e "\n${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
     echo ""
     echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
     echo "vmess://${vxt_b64}"
+
     echo -e "\n${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP:${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
@@ -910,7 +945,13 @@ create_account() {
     echo -e "${yellow}VMESS-xHTTP:${nc}"
     echo "vmess://${vx_b64}"
     echo ""
-    read -p "Press Enter to return..."
+
+    # ── Return prompt ─────────────────────────────────────────────────────────
+    if command -v gum &>/dev/null; then
+        gum confirm "Return to menu?" && return || return
+    else
+        read -p "Press Enter to return..."
+    fi
 }
 
 delete_account() {
