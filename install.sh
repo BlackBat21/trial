@@ -235,9 +235,7 @@ VMESS_UUID="${uuid_vmess}"
 TROJAN_PASS="${trojan_pass}"
 DOMAIN="${domain}"
 EOF
-    echo "Username,ServiceType,Secret,ExpiryDate" > "$CSV_DB"
-    echo "admin_vless,Xray,${uuid_vless},Never"   >> "$CSV_DB"
-    echo "admin_vmess,Xray,${uuid_vmess},Never"   >> "$CSV_DB"
+    echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate" > "$CSV_DB"
     chmod 600 "${XRAY_DIR}/credentials.env" "$CSV_DB"
 
     cat > "${XRAY_DIR}/config.json" << XRAY_JSON
@@ -599,11 +597,7 @@ update_script() {
         done
     done
 
-    if [[ -f /usr/bin/menu ]]; then
-        sed -i 's/xui-menu/xray-menu/g'       /usr/bin/menu
-        sed -i 's/X-UI Manager/Xray Manager/g' /usr/bin/menu
-    fi
-    if [[ -f /usr/bin/manage-services ]]; then
+    # Patch manage-services if upstream download succeeded
         sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
         sed -i 's/x-ui/xray/g'                  /usr/bin/manage-services
         sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
@@ -611,9 +605,10 @@ update_script() {
         sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
     fi
 
-    log_info "Rebuilding /usr/bin/xray-menu..."
-    _write_xray_menu
-    log_success "xray-menu updated."
+    log_info "Rebuilding /usr/bin/menu (unified main menu)..."
+    _write_main_menu
+    rm -f /usr/bin/xray-menu   # remove legacy binary if present
+    log_success "Main menu updated."
 
     log_info "Refreshing nginx xray-locations.conf..."
     cat > /etc/nginx/xray-locations.conf << 'NGINXLOC'
@@ -791,135 +786,315 @@ EOF
     read -p "Press Enter to return..."
 }
 
-# Shared helper writing /usr/bin/xray-menu
-_write_xray_menu() {
-    cat > /usr/bin/xray-menu << 'XRAYMENU'
+# Shared helper writing /usr/bin/menu (unified main menu)
+# ─── _write_main_menu ─────────────────────────────────────────────────────────
+# Writes /usr/bin/menu as a single self-contained script covering account
+# management (SSH + all Xray protocols), service control, and system tools.
+# Called from both install_scripts (fresh install) and update_script (update).
+# Single-quoted heredoc — variables expand at runtime when menu executes.
+# ─────────────────────────────────────────────────────────────────────────────
+_write_main_menu() {
+    cat > /usr/bin/menu << 'MAINMENU'
 #!/bin/bash
+# =============================================================================
+# AutoScriptX — Unified Main Menu  v4.2.0
+# Protocols: SSH · VLESS-WS · VMESS-WS · TROJAN-WS ·
+#            VLESS-xHTTP(TLS) · VMESS-xHTTP(TLS) ·
+#            VLESS-xHTTP(Plain) · VMESS-xHTTP(Plain)
+# =============================================================================
+
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
-DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
-green="\033[0;32m"
-blue="\033[0;34m"
-yellow="\033[1;33m"
-red="\033[0;31m"
-nc="\033[0m"
 
-show_menu() {
+green="[0;32m"
+blue="[0;34m"
+yellow="[1;33m"
+red="[0;31m"
+cyan="[0;36m"
+nc="[0m"
+
+show_header() {
     clear
-    echo "============================================"
-    echo "           XRAY MANAGER  v4.1.0            "
-    echo "============================================"
-    echo "  1) Create Xray Account"
-    echo "  2) Delete Xray Account"
-    echo "  3) List Xray Accounts"
-    echo "  ─────────────────────────────────────────"
-    echo "  9) UPDATE AutoScriptX (non-destructive)"
-    echo "  0) Back to Main Menu"
-    echo "============================================"
-    read -rp "Select Option: " opt
+    local domain xray_ver uptime_str
+    domain=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
+    xray_ver=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
+    uptime_str=$(uptime -p 2>/dev/null || echo "?")
+    echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
+    echo -e "${cyan}║       AutoScriptX  v4.2.0  —  Main Menu     ║${nc}"
+    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
+    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}
+" "$domain"
+    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}
+" "$xray_ver"
+    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}
+" "$uptime_str"
+    echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
 }
 
-show_menu
-case $opt in
-    1)
-        read -rp "Username : " u_name
-        read -rp "Expiry (days) : " days
-        u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
-        u_uuid=$(cat /proc/sys/kernel/random/uuid)
-        jq --arg user "$u_name" --arg uuid "$u_uuid" '
-          .inbounds |= map(
-            if   .protocol == "vless"  and .settings.clients
-              then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
-            elif .protocol == "vmess"  and .settings.clients
-              then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
-            elif .protocol == "trojan" and .settings.clients
-              then .settings.clients += [{"password": $uuid, "email": $user}]
-            else . end
-          )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-        systemctl restart xray > /dev/null 2>&1
-        echo "${u_name},Xray,${u_uuid},${u_exp}" >> "$CSV_DB"
+create_account() {
+    show_header
+    local DOMAIN
+    DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
+    echo -e "${blue}── Create Unified Account ──────────────────────────────${nc}"
+    echo ""
+    read -rp "  Username                      : " u_name
+    [[ -z "$u_name" ]] && { echo -e "${red}Username cannot be empty.${nc}"; sleep 2; return; }
+    read -rp "  Password (Enter to auto-gen)  : " u_pass
+    [[ -z "$u_pass" ]] && u_pass=$(openssl rand -base64 10 | tr -d '/+=')
+    read -rp "  Expiry days (default 30)      : " days
+    days=${days:-30}
+    local u_exp u_uuid u_trojan
+    u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    u_uuid=$(cat /proc/sys/kernel/random/uuid)
+    u_trojan=$(openssl rand -hex 20)
 
-        v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
-        v_b64=$(echo -n "$v_json" | base64 -w0)
-        vxt_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP-TLS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"tls\"}"
-        vxt_b64=$(echo -n "$vxt_json" | base64 -w0)
-        vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
-        vx_b64=$(echo -n "$vx_json" | base64 -w0)
+    if id "$u_name" &>/dev/null; then
+        echo -e "${red}  User '$u_name' already exists.${nc}"
+        read -p "  Press Enter to return..."; return
+    fi
+    useradd -M -s /bin/false -e "$u_exp" "$u_name"
+    echo "${u_name}:${u_pass}" | chpasswd
 
-        echo -e "\n${green}╔══════════════════════════════════════════════╗"
-        echo -e "║         Account Created Successfully!        ║"
-        echo -e "╚══════════════════════════════════════════════╝${nc}"
-        echo -e "\n${blue}── TLS WebSocket Links (Port 443) ──────────────────────${nc}"
-        echo -e "${yellow}VLESS-WS (TLS):${nc}"
-        echo -e "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
-        echo ""
-        echo -e "${yellow}VMESS-WS (TLS):${nc}"
-        echo -e "vmess://${v_b64}"
-        echo ""
-        echo -e "${yellow}TROJAN-WS (TLS):${nc}"
-        echo -e "trojan://${u_uuid}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
-        echo -e "\n${blue}── TLS xHTTP Links (Port 443) ──────────────────────────${nc}"
-        echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
-        echo -e "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
-        echo ""
-        echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
-        echo -e "vmess://${vxt_b64}"
-        echo -e "\n${blue}── Plain xHTTP Links (Port 80, no TLS) ─────────────────${nc}"
-        echo -e "${yellow}VLESS-xHTTP (Plain):${nc}"
-        echo -e "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
-        echo ""
-        echo -e "${yellow}VMESS-xHTTP (Plain):${nc}"
-        echo -e "vmess://${vx_b64}"
-        echo ""
-        read -p "Press Enter to return..."
-        ;;
-    2)
-        read -rp "Enter Username to delete: " u_name
-        jq --arg user "$u_name" '
-          .inbounds |= map(
-            if .settings.clients
-              then .settings.clients |= map(select(.email != $user))
-            else . end
-          )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-        systemctl restart xray > /dev/null 2>&1
-        sed -i "/^${u_name},/d" "$CSV_DB"
-        echo -e "${green}Account deleted.${nc}"
-        read -p "Press Enter to return..."
-        ;;
-    3)
-        echo -e "\n${blue}Current Xray Accounts:${nc}"
-        if grep -q "Xray" "$CSV_DB" 2>/dev/null; then
-            grep "Xray" "$CSV_DB" | awk -F',' '{printf "  User: %-20s | Expiry: %s\n", $1, $4}'
+    jq --arg user    "$u_name"   \
+       --arg uuid    "$u_uuid"   \
+       --arg tpw     "$u_trojan" \
+       '.inbounds |= map(
+          if   .protocol == "vless"  and .settings.clients
+            then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
+          elif .protocol == "vmess"  and .settings.clients
+            then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
+          elif .protocol == "trojan" and .settings.clients
+            then .settings.clients += [{"password": $tpw, "email": $user}]
+          else . end
+        )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+    systemctl restart xray > /dev/null 2>&1
+
+    echo "${u_name},${u_pass},${u_uuid},${u_trojan},${u_exp}" >> "$CSV_DB"
+
+    local v_json v_b64 vxt_json vxt_b64 vx_json vx_b64
+    v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
+    v_b64=$(echo -n "$v_json" | base64 -w0)
+    vxt_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP-TLS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"tls\"}"
+    vxt_b64=$(echo -n "$vxt_json" | base64 -w0)
+    vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
+    vx_b64=$(echo -n "$vx_json" | base64 -w0)
+
+    clear
+    echo -e "${green}╔══════════════════════════════════════════════════╗"
+    echo -e "║          Account Created Successfully!           ║"
+    echo -e "╚══════════════════════════════════════════════════╝${nc}"
+    echo -e "
+${blue}── SSH / Tunnel ─────────────────────────────────────────${nc}"
+    echo -e "  ${yellow}Host       :${nc} ${DOMAIN}"
+    echo -e "  ${yellow}Username   :${nc} ${u_name}"
+    echo -e "  ${yellow}Password   :${nc} ${u_pass}"
+    echo -e "  ${yellow}SSH Port   :${nc} 22"
+    echo -e "  ${yellow}Dropbear   :${nc} 443"
+    echo -e "  ${yellow}Expiry     :${nc} ${u_exp}"
+    echo -e "
+${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
+    echo -e "${yellow}VLESS-WS:${nc}"
+    echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
+    echo ""
+    echo -e "${yellow}VMESS-WS:${nc}"
+    echo "vmess://${v_b64}"
+    echo ""
+    echo -e "${yellow}TROJAN-WS:${nc}"
+    echo "trojan://${u_trojan}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
+    echo -e "
+${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
+    echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
+    echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
+    echo ""
+    echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
+    echo "vmess://${vxt_b64}"
+    echo -e "
+${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
+    echo -e "${yellow}VLESS-xHTTP:${nc}"
+    echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
+    echo ""
+    echo -e "${yellow}VMESS-xHTTP:${nc}"
+    echo "vmess://${vx_b64}"
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+delete_account() {
+    show_header
+    echo -e "${blue}── Delete Account ──────────────────────────────────────${nc}
+"
+    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
+        echo -e "  ${yellow}No accounts found.${nc}"
+        read -p "  Press Enter to return..."; return
+    fi
+    printf "  %-20s %-12s
+" "USERNAME" "EXPIRY"
+    printf "  %-20s %-12s
+" "────────────────────" "──────────"
+    awk -F',' 'NR>1 {printf "  %-20s %-12s
+", $1, $5}' "$CSV_DB"
+    echo ""
+    read -rp "  Username to delete (Enter to cancel): " u_name
+    [[ -z "$u_name" ]] && return
+    if ! grep -q "^${u_name}," "$CSV_DB" 2>/dev/null; then
+        echo -e "${red}  User '${u_name}' not found.${nc}"
+        read -p "  Press Enter to return..."; return
+    fi
+    jq --arg user "$u_name" '
+      .inbounds |= map(
+        if .settings.clients
+          then .settings.clients |= map(select(.email != $user))
+        else . end
+      )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+    systemctl restart xray > /dev/null 2>&1
+    userdel -r "$u_name" 2>/dev/null || true
+    sed -i "/^${u_name},/d" "$CSV_DB"
+    echo -e "${green}  Account '${u_name}' deleted successfully.${nc}"
+    read -p "  Press Enter to return..."
+}
+
+list_accounts() {
+    show_header
+    echo -e "${blue}── Active Accounts ─────────────────────────────────────${nc}
+"
+    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
+        echo -e "  ${yellow}No accounts found.${nc}"
+        read -p "  Press Enter to return..."; return
+    fi
+    local today
+    today=$(date +%Y-%m-%d)
+    printf "  %-18s %-12s %-36s %s
+" "USERNAME" "EXPIRY" "XRAY UUID" "STATUS"
+    printf "  %-18s %-12s %-36s %s
+" "──────────────────" "──────────" "────────────────────────────────────" "──────"
+    while IFS=',' read -r name pass uuid trojan exp; do
+        [[ "$name" == "Username" ]] && continue
+        if [[ "$exp" < "$today" ]]; then
+            status="${red}Expired${nc}"
         else
-            echo -e "  ${yellow}No accounts found.${nc}"
+            status="${green}Active${nc}"
         fi
-        read -p "Press Enter to return..."
-        ;;
-    9)
-        echo -e "${blue}Fetching latest update engine...${nc}"
-        # Fixed scoping declaration for standalone executing context
-        menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
-        if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
-               "https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh" \
-               -o "$menu_updater"; then
-            chmod +x "$menu_updater"
-            bash "$menu_updater" --update-only
-            rm -f "$menu_updater"
+        printf "  %-18s %-12s %-36s " "$name" "$exp" "$uuid"
+        echo -e "$status"
+    done < "$CSV_DB"
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+service_status() {
+    show_header
+    echo -e "${blue}── Service Status ──────────────────────────────────────${nc}
+"
+    for svc in xray nginx dropbear stunnel4 squid sshguard ws-proxy; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            echo -e "  ${green}●${nc} $svc — running"
         else
-            echo -e "${red}Failed to fetch update. Check your internet connection.${nc}"
-            read -p "Press Enter to return..."
+            echo -e "  ${red}●${nc} $svc — stopped / not installed"
         fi
-        ;;
-    0)
-        exit 0
-        ;;
-    *)
-        echo -e "${red}Invalid option.${nc}"
-        read -p "Press Enter to return..."
-        ;;
-esac
-XRAYMENU
-    chmod +x /usr/bin/xray-menu
+    done
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+restart_services() {
+    show_header
+    echo -e "${blue}Restarting services...${nc}
+"
+    for svc in xray nginx dropbear stunnel4 squid; do
+        systemctl restart "$svc" > /dev/null 2>&1 \
+            && echo -e "  ${green}✔${nc} $svc restarted" \
+            || echo -e "  ${yellow}✘${nc} $svc — could not restart"
+    done
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+system_info() {
+    show_header
+    echo -e "${blue}── System Info ─────────────────────────────────────────${nc}
+"
+    echo -e "  OS      : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    echo -e "  Kernel  : $(uname -r)"
+    echo -e "  CPU     : $(nproc) core(s)"
+    echo -e "  RAM     : $(free -h | awk '/^Mem/{print $3 " used / " $2 " total"}')"
+    echo -e "  Disk    : $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+    echo -e "  IP      : $(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+    echo -e "  Domain  : $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
+    echo -e "  Uptime  : $(uptime -p 2>/dev/null)"
+    echo ""
+    read -p "Press Enter to return..."
+}
+
+change_domain() {
+    show_header
+    echo -e "${blue}── Change Domain ───────────────────────────────────────${nc}
+"
+    echo -e "  ${yellow}Current:${nc} $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
+    echo ""
+    read -rp "  New domain (Enter to cancel): " new_domain
+    new_domain=$(echo "$new_domain" | tr -d ' ')
+    if [[ -n "$new_domain" ]]; then
+        echo "$new_domain" > /etc/AutoScriptX/domain
+        sed -i "s/server_name .*;/server_name ${new_domain};/g" \
+            /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
+        sed -i "s/server_name .*;/server_name ${new_domain};/g" \
+            /etc/nginx/conf.d/xhttp-port80.conf  2>/dev/null || true
+        systemctl reload nginx > /dev/null 2>&1 || true
+        echo -e "
+  ${green}Domain updated to: ${new_domain}${nc}"
+    else
+        echo -e "  ${yellow}Cancelled.${nc}"
+    fi
+    read -p "  Press Enter to return..."
+}
+
+do_update() {
+    show_header
+    echo -e "${blue}Fetching latest update engine from repo...${nc}
+"
+    local menu_updater
+    menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
+    if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
+           "https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh" \
+           -o "$menu_updater"; then
+        chmod +x "$menu_updater"
+        bash "$menu_updater" --update-only
+        rm -f "$menu_updater"
+    else
+        echo -e "${red}Failed to fetch update. Check your internet connection.${nc}"
+    fi
+    read -p "Press Enter to return..."
+}
+
+while true; do
+    show_header
+    echo ""
+    echo -e "  ${green}1)${nc} Create Account"
+    echo -e "  ${green}2)${nc} Delete Account"
+    echo -e "  ${green}3)${nc} List Accounts"
+    echo -e "  ${green}4)${nc} Service Status"
+    echo -e "  ${green}5)${nc} Restart Services"
+    echo -e "  ${green}6)${nc} System Info"
+    echo -e "  ${green}7)${nc} Change Domain"
+    echo -e "  ${yellow}9)${nc} Update AutoScriptX"
+    echo -e "  ${red}0)${nc} Exit"
+    echo ""
+    read -rp "Select option: " opt
+    case $opt in
+        1) create_account  ;;
+        2) delete_account  ;;
+        3) list_accounts   ;;
+        4) service_status  ;;
+        5) restart_services;;
+        6) system_info     ;;
+        7) change_domain   ;;
+        9) do_update       ;;
+        0) exit 0          ;;
+        *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
+    esac
+done
+MAINMENU
+    chmod +x /usr/bin/menu
 }
 
 # Install FreeNetLabs scripts helper
@@ -953,142 +1128,11 @@ install_scripts() {
         sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
     fi
 
-    # ── Write xray-menu inline (always available) ─────────────────────────────
-    _write_xray_menu
 
-    # ── Write main menu inline (always available) ─────────────────────────────
-    # This guarantees `asx` / `autoscriptx` always produces a working menu
-    # even when every upstream download above fails.
-    cat > /usr/bin/menu << 'MAINMENU'
-#!/bin/bash
-# =============================================================================
-# AutoScriptX — Main Menu  v4.1.0
-# =============================================================================
-green="\033[0;32m"
-blue="\033[0;34m"
-yellow="\033[1;33m"
-red="\033[0;31m"
-cyan="\033[0;36m"
-nc="\033[0m"
+    # ── Write unified main menu (always inline, never depends on downloads) ───
+    _write_main_menu
+    rm -f /usr/bin/xray-menu   # clean up legacy binary if present from old installs
 
-show_main_menu() {
-    clear
-    DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
-    XRAY_VER=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
-    UPTIME=$(uptime -p 2>/dev/null || echo "unknown")
-    echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
-    echo -e "${cyan}║       AutoScriptX  v4.1.0  —  Main Menu     ║${nc}"
-    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
-    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}\n" "$DOMAIN"
-    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$XRAY_VER"
-    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}\n" "$UPTIME"
-    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
-    echo -e "${cyan}║${nc}  ${green}1)${nc} Xray Manager (VLESS / VMESS / Trojan)    ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${green}2)${nc} Service Status                           ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${green}3)${nc} Restart All Services                     ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${green}4)${nc} System Info                              ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${green}5)${nc} Change Domain                            ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${yellow}9)${nc} UPDATE AutoScriptX (non-destructive)     ${cyan}║${nc}"
-    echo -e "${cyan}║${nc}  ${red}0)${nc} Exit                                     ${cyan}║${nc}"
-    echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
-    read -rp "Select option: " opt
-}
-
-service_status() {
-    clear
-    echo -e "${blue}══════════════ Service Status ══════════════${nc}"
-    for svc in xray nginx dropbear stunnel4 squid sshguard ws-proxy; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            echo -e "  ${green}●${nc} $svc — running"
-        else
-            echo -e "  ${red}●${nc} $svc — stopped / not installed"
-        fi
-    done
-    echo ""
-    read -p "Press Enter to return..."
-}
-
-restart_services() {
-    clear
-    echo -e "${blue}Restarting services...${nc}"
-    for svc in xray nginx dropbear stunnel4 squid; do
-        systemctl restart "$svc" > /dev/null 2>&1 \
-            && echo -e "  ${green}✔${nc} $svc restarted" \
-            || echo -e "  ${yellow}✘${nc} $svc could not be restarted"
-    done
-    echo ""
-    read -p "Press Enter to return..."
-}
-
-system_info() {
-    clear
-    echo -e "${blue}══════════════ System Info ══════════════${nc}"
-    echo -e "  OS      : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
-    echo -e "  Kernel  : $(uname -r)"
-    echo -e "  CPU     : $(nproc) core(s)"
-    echo -e "  RAM     : $(free -h | awk '/^Mem/{print $3 " used / " $2 " total"}')"
-    echo -e "  Disk    : $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
-    echo -e "  IP      : $(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
-    echo -e "  Domain  : $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
-    echo -e "  Uptime  : $(uptime -p 2>/dev/null)"
-    echo ""
-    read -p "Press Enter to return..."
-}
-
-change_domain() {
-    if [[ -f /usr/bin/change-domain && -s /usr/bin/change-domain ]]; then
-        bash /usr/bin/change-domain
-    else
-        clear
-        echo -e "${yellow}Current domain:${nc} $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
-        read -rp "Enter new domain (leave blank to cancel): " new_domain
-        new_domain=$(echo "$new_domain" | tr -d ' ')
-        if [[ -n "$new_domain" ]]; then
-            echo "$new_domain" > /etc/AutoScriptX/domain
-            # Update nginx server_name if possible
-            sed -i "s/server_name .*;/server_name ${new_domain};/g" \
-                /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
-            sed -i "s/server_name .*;/server_name ${new_domain};/g" \
-                /etc/nginx/conf.d/xhttp-port80.conf 2>/dev/null || true
-            systemctl reload nginx > /dev/null 2>&1 || true
-            echo -e "${green}Domain updated to: ${new_domain}${nc}"
-        else
-            echo -e "${yellow}Cancelled.${nc}"
-        fi
-        read -p "Press Enter to return..."
-    fi
-}
-
-do_update() {
-    echo -e "${blue}Fetching latest update engine...${nc}"
-    menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
-    if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
-           "https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh" \
-           -o "$menu_updater"; then
-        chmod +x "$menu_updater"
-        bash "$menu_updater" --update-only
-        rm -f "$menu_updater"
-    else
-        echo -e "${red}Failed to fetch update. Check your internet connection.${nc}"
-    fi
-    read -p "Press Enter to return..."
-}
-
-while true; do
-    show_main_menu
-    case $opt in
-        1) xray-menu ;;
-        2) service_status ;;
-        3) restart_services ;;
-        4) system_info ;;
-        5) change_domain ;;
-        9) do_update ;;
-        0) exit 0 ;;
-        *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
-    esac
-done
-MAINMENU
-    chmod +x /usr/bin/menu
 
     # Optional: attempt uninstall.sh download (non-fatal)
     wget -qO /etc/AutoScriptX/uninstall.sh "$BASE_URL/uninstall.sh" > /dev/null 2>&1 \
