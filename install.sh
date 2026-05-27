@@ -1071,6 +1071,74 @@ change_domain() {
     read -p "  Press Enter to return..."
 }
 
+edit_banner() {
+    show_header
+    local banner_file="/etc/AutoScriptX/banner"
+    echo -e "${blue}── Edit SSH Banner ──────────────────────────────────────${nc}\n"
+    echo -e "  ${yellow}Current banner:${nc}"
+    echo -e "  ─────────────────────────────────────────────────────"
+    cat "$banner_file" 2>/dev/null || echo -e "  ${yellow}(empty)${nc}"
+    echo -e "  ─────────────────────────────────────────────────────\n"
+    echo -e "  ${yellow}Options:${nc}"
+    echo -e "  ${green}1)${nc} Edit with nano"
+    echo -e "  ${green}2)${nc} Clear banner"
+    echo -e "  ${green}0)${nc} Cancel"
+    echo ""
+    read -rp "  Select: " choice
+    case $choice in
+        1)
+            nano "$banner_file"
+            systemctl restart dropbear > /dev/null 2>&1
+            echo -e "\n  ${green}Banner updated and Dropbear restarted.${nc}"
+            ;;
+        2)
+            > "$banner_file"
+            systemctl restart dropbear > /dev/null 2>&1
+            echo -e "\n  ${green}Banner cleared.${nc}"
+            ;;
+        *)
+            echo -e "  ${yellow}Cancelled.${nc}"
+            ;;
+    esac
+    read -p "  Press Enter to return..."
+}
+
+edit_response() {
+    show_header
+    local response_file="/etc/AutoScriptX/response"
+    echo -e "${blue}── Edit 101 WebSocket Response ─────────────────────────${nc}\n"
+    echo -e "  ${yellow}Current response:${nc}"
+    echo -e "  ─────────────────────────────────────────────────────"
+    cat "$response_file" 2>/dev/null || echo -e "  ${yellow}(empty — using ws-proxy default)${nc}"
+    echo -e "  ─────────────────────────────────────────────────────\n"
+    echo -e "  ${yellow}Options:${nc}"
+    echo -e "  ${green}1)${nc} Edit with nano"
+    echo -e "  ${green}2)${nc} Reset to default"
+    echo -e "  ${green}0)${nc} Cancel"
+    echo ""
+    read -rp "  Select: " choice
+    case $choice in
+        1)
+            nano "$response_file"
+            systemctl restart ws-proxy.service > /dev/null 2>&1
+            echo -e "\n  ${green}Response updated and ws-proxy restarted.${nc}"
+            ;;
+        2)
+            cat > "$response_file" << 'DEFAULTRESP'
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+DEFAULTRESP
+            systemctl restart ws-proxy.service > /dev/null 2>&1
+            echo -e "\n  ${green}Response reset to default.${nc}"
+            ;;
+        *)
+            echo -e "  ${yellow}Cancelled.${nc}"
+            ;;
+    esac
+    read -p "  Press Enter to return..."
+}
+
 do_update() {
     show_header
     echo -e "${blue}Fetching latest update engine from repo...${nc}\n"
@@ -1098,7 +1166,9 @@ while true; do
     echo -e "  ${green}5)${nc} Restart Services"
     echo -e "  ${green}6)${nc} System Info"
     echo -e "  ${green}7)${nc} Change Domain"
-    echo -e "  ${yellow}9)${nc} Update AutoScriptX"
+    echo -e "  ${green}8)${nc} Edit Banner"
+    echo -e "  ${green}9)${nc} Edit 101 Response"
+    echo -e "  ${yellow}u)${nc} Update AutoScriptX"
     echo -e "  ${red}0)${nc} Exit"
     echo ""
     read -rp "Select option: " opt
@@ -1110,7 +1180,9 @@ while true; do
         5) restart_services;;
         6) system_info     ;;
         7) change_domain   ;;
-        9) do_update       ;;
+        8) edit_banner     ;;
+        9) edit_response   ;;
+        u|U) do_update     ;;
         0) exit 0          ;;
         *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
     esac
