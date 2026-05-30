@@ -26,6 +26,7 @@ readonly PORT_VMESS_WS=10002
 readonly PORT_TROJAN_WS=10003
 readonly PORT_VLESS_XHTTP=10004
 readonly PORT_VMESS_XHTTP=10005
+readonly PORT_XRAY_API=10085
 
 # Global variables
 localip=""
@@ -104,7 +105,7 @@ install_packages() {
     apt install -y \
       netfilter-persistent iptables-persistent screen curl jq bzip2 gzip vnstat coreutils rsyslog \
       zip unzip net-tools nano lsof shc gnupg dos2unix dirmngr bc \
-      stunnel4 nginx dropbear socat xz-utils sshguard squid > /dev/null 2>&1
+      stunnel4 nginx dropbear socat xz-utils fail2ban squid > /dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         log_error "Failed to install one or more packages."
         exit 1
@@ -235,19 +236,44 @@ VMESS_UUID="${uuid_vmess}"
 TROJAN_PASS="${trojan_pass}"
 DOMAIN="${domain}"
 EOF
-    echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate" > "$CSV_DB"
+    echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes" > "$CSV_DB"
     chmod 600 "${XRAY_DIR}/credentials.env" "$CSV_DB"
 
     cat > "${XRAY_DIR}/config.json" << XRAY_JSON
 {
   "log": { "loglevel": "warning" },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink":   true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink":   true,
+      "statsInboundDownlink": true
+    }
+  },
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [
-      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked" }
+      { "type": "field", "inboundTag": ["api"],           "outboundTag": "direct"  },
+      { "type": "field", "protocol":  ["bittorrent"],     "outboundTag": "blocked" }
     ]
   },
   "inbounds": [
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": ${PORT_XRAY_API},
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1" }
+    },
     {
       "tag": "vless-ws",
       "listen": "127.0.0.1",
@@ -323,8 +349,8 @@ EOF
     }
   ],
   "outbounds": [
-    { "tag": "direct",  "protocol": "freedom"   },
-    { "tag": "blocked", "protocol": "blackhole"  }
+    { "tag": "direct",  "protocol": "freedom"  },
+    { "tag": "blocked", "protocol": "blackhole" }
   ]
 }
 XRAY_JSON
@@ -517,11 +543,124 @@ configure_stunnel() {
 }
 
 # Configure SSHGuard
-configure_sshguard() {
-    log_info "Configuring SSHGuard..."
-    systemctl enable sshguard  > /dev/null 2>&1
-    systemctl restart sshguard > /dev/null 2>&1 || log_warning "Failed to restart sshguard."
-    log_success "SSHGuard configured."
+configure_fail2ban() {
+    log_info "Configuring fail2ban..."
+
+    # ── Write jail.local ──────────────────────────────────────────────────────
+    cat > /etc/fail2ban/jail.local << 'F2B_JAIL'
+[DEFAULT]
+# ── CDN / trusted range whitelist ────────────────────────────────────────────
+# Prevents Cloudflare, CloudFront, and Fastly edge nodes from being banned
+# when their probes or health-checks produce auth/log noise.
+ignoreip = 127.0.0.1/8 ::1
+           # Cloudflare
+           103.21.244.0/22
+           103.22.200.0/22
+           103.31.4.0/22
+           104.16.0.0/13
+           104.24.0.0/14
+           108.162.192.0/18
+           131.0.72.0/22
+           141.101.64.0/18
+           162.158.0.0/15
+           172.64.0.0/13
+           173.245.48.0/20
+           188.114.96.0/20
+           190.93.240.0/20
+           197.234.240.0/22
+           198.41.128.0/17
+           # Fastly
+           151.101.0.0/16
+           199.232.0.0/16
+           23.235.32.0/20
+           23.235.39.0/24
+           185.31.16.0/22
+           199.27.72.0/21
+           # CloudFront (major ranges)
+           13.32.0.0/15
+           13.35.0.0/16
+           52.84.0.0/15
+           54.182.0.0/16
+           54.192.0.0/16
+           54.230.0.0/16
+           54.239.128.0/18
+           54.239.192.0/19
+           99.84.0.0/16
+           204.246.164.0/22
+           204.246.168.0/22
+           204.246.174.0/23
+           204.246.176.0/20
+           205.251.192.0/19
+
+bantime   = 1h
+findtime  = 10m
+maxretry  = 5
+backend   = auto
+banaction = iptables-multiport
+
+# ── SSH ───────────────────────────────────────────────────────────────────────
+[sshd]
+enabled  = true
+port     = ssh,22,443
+filter   = sshd
+logpath  = /var/log/auth.log
+maxretry = 3
+bantime  = 2h
+
+# ── Nginx auth failures ───────────────────────────────────────────────────────
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+filter   = nginx-http-auth
+logpath  = /var/log/nginx/error.log
+maxretry = 5
+
+# ── Nginx bot scanning ────────────────────────────────────────────────────────
+[nginx-botsearch]
+enabled  = true
+port     = http,https
+filter   = nginx-botsearch
+logpath  = /var/log/nginx/access.log
+maxretry = 2
+bantime  = 2h
+
+# ── Nginx 4xx flood (too many bad requests) ───────────────────────────────────
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+filter   = nginx-limit-req
+logpath  = /var/log/nginx/error.log
+maxretry = 10
+bantime  = 30m
+F2B_JAIL
+
+    # ── Write custom Xray auth filter ────────────────────────────────────────
+    cat > /etc/fail2ban/filter.d/xray-auth.conf << 'F2B_XRAY'
+[Definition]
+# Matches Xray rejection messages in its log (if loglevel = warning or info)
+failregex = .*rejected.*<HOST>.*
+            .*failed.*<HOST>.*
+ignoreregex =
+F2B_XRAY
+
+    # ── Add Xray jail only if Xray log exists ────────────────────────────────
+    if [[ -f /var/log/xray/access.log ]]; then
+        cat >> /etc/fail2ban/jail.local << 'F2B_XRAY_JAIL'
+
+# ── Xray auth failures ────────────────────────────────────────────────────────
+[xray-auth]
+enabled  = true
+port     = 443,80
+filter   = xray-auth
+logpath  = /var/log/xray/access.log
+maxretry = 5
+bantime  = 1h
+F2B_XRAY_JAIL
+    fi
+
+    systemctl enable fail2ban  > /dev/null 2>&1
+    systemctl restart fail2ban > /dev/null 2>&1 || log_warning "Failed to restart fail2ban."
+    log_success "fail2ban configured (SSH + Nginx jails active, CDN ranges whitelisted)."
 }
 
 # Apply firewall rules safely with pre-execution sanitization
@@ -610,6 +749,10 @@ update_script() {
     _write_main_menu
     rm -f /usr/bin/xray-menu   # remove legacy binary if present
     log_success "Main menu updated."
+
+    log_info "Rebuilding bandwidth limit monitor..."
+    _write_limit_monitor
+    log_success "Limit monitor updated."
 
     log_info "Refreshing nginx xray-locations.conf..."
     cat > /etc/nginx/xray-locations.conf << 'NGINXLOC'
@@ -799,13 +942,11 @@ _write_main_menu() {
 #!/bin/bash
 # =============================================================================
 # AutoScriptX — Unified Main Menu  v4.2.0
-# Protocols: SSH · VLESS-WS · VMESS-WS · TROJAN-WS ·
-#            VLESS-xHTTP(TLS) · VMESS-xHTTP(TLS) ·
-#            VLESS-xHTTP(Plain) · VMESS-xHTTP(Plain)
 # =============================================================================
-
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_API="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
 
 green="\033[0;32m"
 blue="\033[0;34m"
@@ -814,11 +955,12 @@ red="\033[0;31m"
 cyan="\033[0;36m"
 nc="\033[0m"
 
+# ── Header ────────────────────────────────────────────────────────────────────
 show_header() {
     clear
     local domain xray_ver uptime_str
     domain=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
-    xray_ver=$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
+    xray_ver=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
     uptime_str=$(uptime -p 2>/dev/null || echo "?")
     echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
     echo -e "${cyan}║       AutoScriptX  v4.2.0  —  Main Menu     ║${nc}"
@@ -829,28 +971,60 @@ show_header() {
     echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
 }
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Format bytes into human-readable string
+fmt_bytes() {
+    local b="${1:-0}"
+    b=$(echo "$b" | tr -dc '0-9'); b=${b:-0}
+    if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2; $b/1073741824" | bc)"
+    elif [[ $b -ge 1048576    ]]; then printf "%.2f MB" "$(echo "scale=2; $b/1048576"    | bc)"
+    elif [[ $b -ge 1024       ]]; then printf "%.2f KB" "$(echo "scale=2; $b/1024"       | bc)"
+    else echo "${b} B"
+    fi
+}
+
+# Migrate old 5-column CSV rows to 7-column format in place
+migrate_csv() {
+    local tmp; tmp=$(mktemp)
+    while IFS=',' read -r f1 f2 f3 f4 f5 f6 f7; do
+        if [[ "$f1" == "Username" ]]; then
+            echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes"
+        else
+            # If columns 6 or 7 are missing, default to 0
+            f6=${f6:-0}; f7=${f7:-0}
+            echo "${f1},${f2},${f3},${f4},${f5},${f6},${f7}"
+        fi
+    done < "$CSV_DB" > "$tmp"
+    mv "$tmp" "$CSV_DB"
+    chmod 600 "$CSV_DB"
+}
+
+# ── Create Account ────────────────────────────────────────────────────────────
 create_account() {
     show_header
     local DOMAIN PUBLIC_IP
     DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
     PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
-    # ── Prompts (gum if available, plain read fallback) ───────────────────────
     if command -v gum &>/dev/null; then
         echo -e "\n# 🧑 Create SSH Account\n"
         u_name=$(gum input --placeholder "username"  --prompt "🔵 Username: ")
         u_pass=$(gum input --placeholder "password"  --prompt "🔑 Password: ")
         days=$(gum input   --placeholder "30"        --prompt "📅 Expired (days): ")
+        limit_gb=$(gum input --placeholder "0 = unlimited" --prompt "🌐 Limit (GB): ")
     else
         echo -e "${blue}── Create Account ──────────────────────────────────────${nc}\n"
-        read -rp "  🔵 Username       : " u_name
-        read -rp "  🔑 Password       : " u_pass
-        read -rp "  📅 Expired (days) : " days
+        read -rp "  🔵 Username          : " u_name
+        read -rp "  🔑 Password          : " u_pass
+        read -rp "  📅 Expired (days)    : " days
+        read -rp "  🌐 Limit GB (0=∞)    : " limit_gb
     fi
 
-    [[ -z "$u_name" ]] && { echo -e "${red}Username cannot be empty.${nc}"; sleep 2; return; }
-    [[ -z "$u_pass" ]] && u_pass=$(openssl rand -base64 10 | tr -d '/+=')
+    [[ -z "$u_name"   ]] && { echo -e "${red}Username cannot be empty.${nc}"; sleep 2; return; }
+    [[ -z "$u_pass"   ]] && u_pass=$(openssl rand -base64 10 | tr -d '/+=')
     days=${days:-30}
+    limit_gb=$(echo "${limit_gb:-0}" | tr -dc '0-9'); limit_gb=${limit_gb:-0}
 
     local u_exp u_exp_fmt u_uuid u_trojan
     u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
@@ -858,7 +1032,6 @@ create_account() {
     u_uuid=$(cat /proc/sys/kernel/random/uuid)
     u_trojan=$(openssl rand -hex 20)
 
-    # ── Create SSH/Linux user ─────────────────────────────────────────────────
     if id "$u_name" &>/dev/null; then
         echo -e "${red}  User '$u_name' already exists.${nc}"
         read -p "  Press Enter to return..."; return
@@ -866,25 +1039,22 @@ create_account() {
     useradd -M -s /bin/false -e "$u_exp" "$u_name"
     echo "${u_name}:${u_pass}" | chpasswd
 
-    # ── Add to all Xray inbounds ──────────────────────────────────────────────
-    jq --arg user "$u_name"   \
-       --arg uuid "$u_uuid"   \
-       --arg tpw  "$u_trojan" \
-       '.inbounds |= map(
-          if   .protocol == "vless"  and .settings.clients
-            then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
-          elif .protocol == "vmess"  and .settings.clients
-            then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
-          elif .protocol == "trojan" and .settings.clients
-            then .settings.clients += [{"password": $tpw, "email": $user}]
-          else . end
-        )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+    jq --arg user "$u_name" --arg uuid "$u_uuid" --arg tpw "$u_trojan" '
+      .inbounds |= map(
+        if   .protocol == "vless"  and .settings.clients
+          then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
+        elif .protocol == "vmess"  and .settings.clients
+          then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
+        elif .protocol == "trojan" and .settings.clients
+          then .settings.clients += [{"password": $tpw, "email": $user}]
+        else . end
+      )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
     systemctl restart xray > /dev/null 2>&1
 
-    # ── Persist to CSV ────────────────────────────────────────────────────────
-    echo "${u_name},${u_pass},${u_uuid},${u_trojan},${u_exp}" >> "$CSV_DB"
+    migrate_csv
+    echo "${u_name},${u_pass},${u_uuid},${u_trojan},${u_exp},${limit_gb},0" >> "$CSV_DB"
 
-    # ── Build Xray share-links ────────────────────────────────────────────────
+    # Build vmess links
     local v_json v_b64 vxt_json vxt_b64 vx_json vx_b64
     v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
     v_b64=$(echo -n "$v_json" | base64 -w0)
@@ -893,7 +1063,9 @@ create_account() {
     vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
     vx_b64=$(echo -n "$vx_json" | base64 -w0)
 
-    # ── Output — SSH section (Image 1 format) ─────────────────────────────────
+    local limit_display
+    [[ "$limit_gb" -eq 0 ]] && limit_display="Unlimited" || limit_display="${limit_gb} GB"
+
     clear
     echo -e "# ✅ SSH Account Created\n"
     echo -e "🔵 ${yellow}Username${nc}    : ${green}${u_name}${nc}"
@@ -901,6 +1073,7 @@ create_account() {
     echo -e "📅 ${yellow}Expires On${nc}  : ${green}${u_exp_fmt}${nc}"
     echo -e "🌐 ${yellow}Public IP${nc}   : ${green}${PUBLIC_IP}${nc}"
     echo -e "🐳 ${yellow}Host${nc}        : ${green}${DOMAIN}${nc}"
+    echo -e "📊 ${yellow}BW Limit${nc}    : ${green}${limit_display}${nc}"
 
     echo -e "\n# 📦 Ports\n"
     echo -e "• SSH WS      : ${green}80${nc}"
@@ -919,7 +1092,6 @@ create_account() {
     echo -e "   Host: ${DOMAIN}[crlf]"
     echo -e "   Upgrade: websocket[crlf][crlf]"
 
-    # ── Output — Xray links (appended below) ──────────────────────────────────
     echo -e "\n# 🔐 Xray Links\n"
     echo -e "${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
     echo -e "${yellow}VLESS-WS:${nc}"
@@ -930,14 +1102,12 @@ create_account() {
     echo ""
     echo -e "${yellow}TROJAN-WS:${nc}"
     echo "trojan://${u_trojan}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
-
     echo -e "\n${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
     echo ""
     echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
     echo "vmess://${vxt_b64}"
-
     echo -e "\n${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
     echo -e "${yellow}VLESS-xHTTP:${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
@@ -946,7 +1116,6 @@ create_account() {
     echo "vmess://${vx_b64}"
     echo ""
 
-    # ── Return prompt ─────────────────────────────────────────────────────────
     if command -v gum &>/dev/null; then
         gum confirm "Return to menu?" && return || return
     else
@@ -954,16 +1123,22 @@ create_account() {
     fi
 }
 
+# ── Delete Account ────────────────────────────────────────────────────────────
 delete_account() {
     show_header
+    migrate_csv
     echo -e "${blue}── Delete Account ──────────────────────────────────────${nc}\n"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
         echo -e "  ${yellow}No accounts found.${nc}"
         read -p "  Press Enter to return..."; return
     fi
-    printf "  %-20s %-12s\n" "USERNAME" "EXPIRY"
-    printf "  %-20s %-12s\n" "────────────────────" "──────────"
-    awk -F',' 'NR>1 {printf "  %-20s %-12s\n", $1, $5}' "$CSV_DB"
+    printf "  %-20s %-12s %-10s %-10s\n" "USERNAME" "EXPIRY" "LIMIT" "USED"
+    printf "  %-20s %-12s %-10s %-10s\n" "────────────────────" "──────────" "──────────" "──────────"
+    while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
+        [[ "$name" == "Username" ]] && continue
+        local lstr; [[ "${limit_gb:-0}" -eq 0 ]] && lstr="Unlimited" || lstr="${limit_gb}GB"
+        printf "  %-20s %-12s %-10s %-10s\n" "$name" "$exp" "$lstr" "$(fmt_bytes "${used_bytes:-0}")"
+    done < "$CSV_DB"
     echo ""
     read -rp "  Username to delete (Enter to cancel): " u_name
     [[ -z "$u_name" ]] && return
@@ -984,35 +1159,157 @@ delete_account() {
     read -p "  Press Enter to return..."
 }
 
+# ── List Accounts ─────────────────────────────────────────────────────────────
 list_accounts() {
     show_header
+    migrate_csv
     echo -e "${blue}── Active Accounts ─────────────────────────────────────${nc}\n"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
         echo -e "  ${yellow}No accounts found.${nc}"
         read -p "  Press Enter to return..."; return
     fi
-    local today
-    today=$(date +%Y-%m-%d)
-    printf "  %-18s %-12s %-36s %s\n" "USERNAME" "EXPIRY" "XRAY UUID" "STATUS"
-    printf "  %-18s %-12s %-36s %s\n" "──────────────────" "──────────" "────────────────────────────────────" "──────"
-    while IFS=',' read -r name pass uuid trojan exp; do
+    local today; today=$(date +%Y-%m-%d)
+    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" "USERNAME" "EXPIRY" "USED" "LIMIT" "%" "STATUS"
+    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" "────────────────" "──────────" "──────────" "──────────" "─────" "──────────"
+    while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
-        if [[ "$exp" < "$today" ]]; then
-            status="${red}Expired${nc}"
+        limit_gb=${limit_gb:-0}; used_bytes=${used_bytes:-0}
+        used_bytes=$(echo "$used_bytes" | tr -dc '0-9'); used_bytes=${used_bytes:-0}
+        local lstr pct_str status_str
+        if [[ "$limit_gb" -eq 0 ]]; then
+            lstr="Unlimited"; pct_str="—"
         else
-            status="${green}Active${nc}"
+            lstr="${limit_gb} GB"
+            local limit_bytes=$(( limit_gb * 1024 * 1024 * 1024 ))
+            if [[ $limit_bytes -gt 0 ]]; then
+                pct_str="$(( used_bytes * 100 / limit_bytes ))%"
+            else
+                pct_str="—"
+            fi
         fi
-        printf "  %-18s %-12s %-36s " "$name" "$exp" "$uuid"
-        echo -e "$status"
+        if [[ "$exp" < "$today" ]]; then
+            status_str="${red}Expired${nc}"
+        elif [[ "$limit_gb" -gt 0 ]] && [[ "$used_bytes" -ge $(( limit_gb * 1024 * 1024 * 1024 )) ]]; then
+            status_str="${red}CAPPED${nc}"
+        else
+            status_str="${green}Active${nc}"
+        fi
+        printf "  %-16s %-12s %-10s %-10s %-5s " "$name" "$exp" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct_str"
+        echo -e "$status_str"
     done < "$CSV_DB"
     echo ""
     read -p "Press Enter to return..."
 }
 
+# ── Bandwidth Monitor ─────────────────────────────────────────────────────────
+bandwidth_monitor() {
+    while true; do
+        show_header
+        migrate_csv
+        echo -e "${blue}── Bandwidth Monitor ───────────────────────────────────${nc}\n"
+
+        if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
+            echo -e "  ${yellow}No accounts found.${nc}"
+            read -p "  Press Enter to return..."; return
+        fi
+
+        printf "  %-16s %-10s %-10s %-6s %-10s\n" "USERNAME" "USED" "LIMIT" "%" "STATUS"
+        printf "  %-16s %-10s %-10s %-6s %-10s\n" "────────────────" "──────────" "──────────" "──────" "──────────"
+
+        while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
+            [[ "$name" == "Username" ]] && continue
+            limit_gb=${limit_gb:-0}
+            used_bytes=$(echo "${used_bytes:-0}" | tr -dc '0-9'); used_bytes=${used_bytes:-0}
+            local lstr pct_str status_str
+            if [[ "$limit_gb" -eq 0 ]]; then
+                lstr="Unlimited"; pct_str="—"; status_str="${green}Active${nc}"
+            else
+                lstr="${limit_gb} GB"
+                local lb=$(( limit_gb * 1024 * 1024 * 1024 ))
+                local pct=0
+                [[ $lb -gt 0 ]] && pct=$(( used_bytes * 100 / lb ))
+                pct_str="${pct}%"
+                if   [[ $used_bytes -ge $lb ]]; then status_str="${red}CAPPED${nc}"
+                elif [[ $pct -ge 80            ]]; then status_str="${yellow}Warning${nc}"
+                else                                    status_str="${green}Active${nc}"
+                fi
+            fi
+            printf "  %-16s %-10s %-10s %-6s " "$name" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct_str"
+            echo -e "$status_str"
+        done < "$CSV_DB"
+
+        echo ""
+        echo -e "  ${green}r)${nc} Reset usage for a user"
+        echo -e "  ${green}s)${nc} Set/change limit for a user"
+        echo -e "  ${green}0)${nc} Return to main menu"
+        echo ""
+        read -rp "  Select: " bw_opt
+        case $bw_opt in
+            r|R) _bw_reset_user     ;;
+            s|S) _bw_set_limit      ;;
+            0)   return             ;;
+            *)   sleep 1            ;;
+        esac
+    done
+}
+
+_bw_reset_user() {
+    read -rp "  Username to reset: " reset_user
+    [[ -z "$reset_user" ]] && return
+    if ! grep -q "^${reset_user}," "$CSV_DB" 2>/dev/null; then
+        echo -e "${red}  User not found.${nc}"; sleep 2; return
+    fi
+    # Zero out UsedBytes in CSV
+    local tmp; tmp=$(mktemp)
+    awk -F',' -v u="$reset_user" 'BEGIN{OFS=","} NR>1&&$1==u{$7=0} {print}' "$CSV_DB" > "$tmp"
+    mv "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    # Re-add user to Xray inbounds if they were capped
+    local r_uuid r_trojan
+    r_uuid=$(awk  -F',' -v u="$reset_user" 'NR>1&&$1==u{print $3}' "$CSV_DB")
+    r_trojan=$(awk -F',' -v u="$reset_user" 'NR>1&&$1==u{print $4}' "$CSV_DB")
+    local already_active
+    already_active=$(jq -r --arg u "$reset_user" \
+        '[.inbounds[].settings.clients[]? | select(.email==$u)] | length' \
+        "$XRAY_CONF" 2>/dev/null)
+    if [[ "${already_active:-0}" -eq 0 ]]; then
+        jq --arg user "$reset_user" --arg uuid "$r_uuid" --arg tpw "$r_trojan" '
+          .inbounds |= map(
+            if   .protocol=="vless"  and .settings.clients
+              then .settings.clients += [{"id":$uuid,"flow":"","email":$user}]
+            elif .protocol=="vmess"  and .settings.clients
+              then .settings.clients += [{"id":$uuid,"alterId":0,"email":$user}]
+            elif .protocol=="trojan" and .settings.clients
+              then .settings.clients += [{"password":$tpw,"email":$user}]
+            else . end
+          )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
+        systemctl restart xray > /dev/null 2>&1
+        passwd -u "$reset_user" > /dev/null 2>&1
+    fi
+    echo -e "${green}  Usage reset for '${reset_user}'. Account reactivated.${nc}"
+    sleep 2
+}
+
+_bw_set_limit() {
+    read -rp "  Username: " tgt_user
+    [[ -z "$tgt_user" ]] && return
+    if ! grep -q "^${tgt_user}," "$CSV_DB" 2>/dev/null; then
+        echo -e "${red}  User not found.${nc}"; sleep 2; return
+    fi
+    read -rp "  New limit in GB (0 = unlimited): " new_limit
+    new_limit=$(echo "${new_limit:-0}" | tr -dc '0-9'); new_limit=${new_limit:-0}
+    local tmp; tmp=$(mktemp)
+    awk -F',' -v u="$tgt_user" -v l="$new_limit" \
+        'BEGIN{OFS=","} NR>1&&$1==u{$6=l} {print}' "$CSV_DB" > "$tmp"
+    mv "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    echo -e "${green}  Limit for '${tgt_user}' set to ${new_limit} GB.${nc}"
+    sleep 2
+}
+
+# ── Service Status ────────────────────────────────────────────────────────────
 service_status() {
     show_header
     echo -e "${blue}── Service Status ──────────────────────────────────────${nc}\n"
-    for svc in xray nginx dropbear stunnel4 squid sshguard ws-proxy; do
+    for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             echo -e "  ${green}●${nc} $svc — running"
         else
@@ -1023,10 +1320,11 @@ service_status() {
     read -p "Press Enter to return..."
 }
 
+# ── Restart Services ──────────────────────────────────────────────────────────
 restart_services() {
     show_header
     echo -e "${blue}Restarting services...${nc}\n"
-    for svc in xray nginx dropbear stunnel4 squid; do
+    for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor; do
         systemctl restart "$svc" > /dev/null 2>&1 \
             && echo -e "  ${green}✔${nc} $svc restarted" \
             || echo -e "  ${yellow}✘${nc} $svc — could not restart"
@@ -1035,6 +1333,7 @@ restart_services() {
     read -p "Press Enter to return..."
 }
 
+# ── System Info ───────────────────────────────────────────────────────────────
 system_info() {
     show_header
     echo -e "${blue}── System Info ─────────────────────────────────────────${nc}\n"
@@ -1050,6 +1349,7 @@ system_info() {
     read -p "Press Enter to return..."
 }
 
+# ── Change Domain ─────────────────────────────────────────────────────────────
 change_domain() {
     show_header
     echo -e "${blue}── Change Domain ───────────────────────────────────────${nc}\n"
@@ -1071,6 +1371,7 @@ change_domain() {
     read -p "  Press Enter to return..."
 }
 
+# ── Edit Banner ───────────────────────────────────────────────────────────────
 edit_banner() {
     show_header
     local banner_file="/etc/AutoScriptX/banner"
@@ -1079,30 +1380,23 @@ edit_banner() {
     echo -e "  ─────────────────────────────────────────────────────"
     cat "$banner_file" 2>/dev/null || echo -e "  ${yellow}(empty)${nc}"
     echo -e "  ─────────────────────────────────────────────────────\n"
-    echo -e "  ${yellow}Options:${nc}"
     echo -e "  ${green}1)${nc} Edit with nano"
     echo -e "  ${green}2)${nc} Clear banner"
     echo -e "  ${green}0)${nc} Cancel"
-    echo ""
-    read -rp "  Select: " choice
+    echo ""; read -rp "  Select: " choice
     case $choice in
-        1)
-            nano "$banner_file"
-            systemctl restart dropbear > /dev/null 2>&1
-            echo -e "\n  ${green}Banner updated and Dropbear restarted.${nc}"
-            ;;
-        2)
-            > "$banner_file"
-            systemctl restart dropbear > /dev/null 2>&1
-            echo -e "\n  ${green}Banner cleared.${nc}"
-            ;;
-        *)
-            echo -e "  ${yellow}Cancelled.${nc}"
-            ;;
+        1) nano "$banner_file"
+           systemctl restart dropbear > /dev/null 2>&1
+           echo -e "\n  ${green}Banner updated.${nc}" ;;
+        2) > "$banner_file"
+           systemctl restart dropbear > /dev/null 2>&1
+           echo -e "\n  ${green}Banner cleared.${nc}" ;;
+        *) echo -e "  ${yellow}Cancelled.${nc}" ;;
     esac
     read -p "  Press Enter to return..."
 }
 
+# ── Edit 101 Response ─────────────────────────────────────────────────────────
 edit_response() {
     show_header
     local response_file="/etc/AutoScriptX/response"
@@ -1111,34 +1405,24 @@ edit_response() {
     echo -e "  ─────────────────────────────────────────────────────"
     cat "$response_file" 2>/dev/null || echo -e "  ${yellow}(empty — using ws-proxy default)${nc}"
     echo -e "  ─────────────────────────────────────────────────────\n"
-    echo -e "  ${yellow}Options:${nc}"
     echo -e "  ${green}1)${nc} Edit with nano"
     echo -e "  ${green}2)${nc} Reset to default"
     echo -e "  ${green}0)${nc} Cancel"
-    echo ""
-    read -rp "  Select: " choice
+    echo ""; read -rp "  Select: " choice
     case $choice in
-        1)
-            nano "$response_file"
-            systemctl restart ws-proxy.service > /dev/null 2>&1
-            echo -e "\n  ${green}Response updated and ws-proxy restarted.${nc}"
-            ;;
-        2)
-            cat > "$response_file" << 'DEFAULTRESP'
-HTTP/1.1 101 Switching Protocols
-Upgrade: websocket
-Connection: Upgrade
-DEFAULTRESP
-            systemctl restart ws-proxy.service > /dev/null 2>&1
-            echo -e "\n  ${green}Response reset to default.${nc}"
-            ;;
-        *)
-            echo -e "  ${yellow}Cancelled.${nc}"
-            ;;
+        1) nano "$response_file"
+           systemctl restart ws-proxy.service > /dev/null 2>&1
+           echo -e "\n  ${green}Response updated.${nc}" ;;
+        2) printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
+               > "$response_file"
+           systemctl restart ws-proxy.service > /dev/null 2>&1
+           echo -e "\n  ${green}Response reset to default.${nc}" ;;
+        *) echo -e "  ${yellow}Cancelled.${nc}" ;;
     esac
     read -p "  Press Enter to return..."
 }
 
+# ── Update ────────────────────────────────────────────────────────────────────
 do_update() {
     show_header
     echo -e "${blue}Fetching latest update engine from repo...${nc}\n"
@@ -1156,6 +1440,7 @@ do_update() {
     read -p "Press Enter to return..."
 }
 
+# ── Main Loop ─────────────────────────────────────────────────────────────────
 while true; do
     show_header
     echo ""
@@ -1168,22 +1453,24 @@ while true; do
     echo -e "  ${green}7)${nc} Change Domain"
     echo -e "  ${green}8)${nc} Edit Banner"
     echo -e "  ${green}9)${nc} Edit 101 Response"
+    echo -e "  ${cyan}b)${nc} Bandwidth Monitor"
     echo -e "  ${yellow}u)${nc} Update AutoScriptX"
     echo -e "  ${red}0)${nc} Exit"
     echo ""
     read -rp "Select option: " opt
     case $opt in
-        1) create_account  ;;
-        2) delete_account  ;;
-        3) list_accounts   ;;
-        4) service_status  ;;
-        5) restart_services;;
-        6) system_info     ;;
-        7) change_domain   ;;
-        8) edit_banner     ;;
-        9) edit_response   ;;
-        u|U) do_update     ;;
-        0) exit 0          ;;
+        1) create_account   ;;
+        2) delete_account   ;;
+        3) list_accounts    ;;
+        4) service_status   ;;
+        5) restart_services ;;
+        6) system_info      ;;
+        7) change_domain    ;;
+        8) edit_banner      ;;
+        9) edit_response    ;;
+        b|B) bandwidth_monitor ;;
+        u|U) do_update      ;;
+        0) exit 0           ;;
         *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
     esac
 done
@@ -1192,6 +1479,133 @@ MAINMENU
 }
 
 # Install FreeNetLabs scripts helper
+# ─── _write_limit_monitor ─────────────────────────────────────────────────────
+# Writes the bandwidth enforcement daemon and its systemd unit.
+# The daemon polls Xray's stats API every 60 s, updates UsedBytes in users.csv,
+# and suspends any account that has exceeded its LimitGB quota.
+# ─────────────────────────────────────────────────────────────────────────────
+_write_limit_monitor() {
+    # ── Daemon script ─────────────────────────────────────────────────────────
+    cat > /usr/local/bin/xray-limit-monitor << 'MONITOR_SCRIPT'
+#!/bin/bash
+# =============================================================================
+# AutoScriptX — Bandwidth Limit Monitor Daemon
+# Polls Xray Stats API every 60 s. Suspends accounts that exceed their quota.
+# =============================================================================
+CSV_DB="/usr/local/etc/xray/users.csv"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_API="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
+
+# Query Xray stats API for a single user; returns total bytes (up + down)
+query_user_bytes() {
+    local username="$1"
+    local stats uplink downlink
+    stats=$("$XRAY_BIN" api statsquery \
+        --server="$XRAY_API" \
+        -pattern "user>>>${username}>>>traffic" 2>/dev/null)
+    uplink=$(echo  "$stats" | jq -r '.stat[]? | select(.name | endswith("uplink"))   | .value // "0"' 2>/dev/null | head -1)
+    downlink=$(echo "$stats" | jq -r '.stat[]? | select(.name | endswith("downlink")) | .value // "0"' 2>/dev/null | head -1)
+    uplink=${uplink:-0}
+    downlink=${downlink:-0}
+    # Strip any non-numeric characters (API returns string int64)
+    uplink=$(echo "$uplink"   | tr -dc '0-9')
+    downlink=$(echo "$downlink" | tr -dc '0-9')
+    echo $(( ${uplink:-0} + ${downlink:-0} ))
+}
+
+# Check whether a user still has an active client entry in any inbound
+user_is_active() {
+    local username="$1"
+    jq -e --arg u "$username" \
+        '[.inbounds[].settings.clients[]? | select(.email == $u)] | length > 0' \
+        "$XRAY_CONF" > /dev/null 2>&1
+}
+
+# Remove user from all Xray inbounds and lock SSH
+suspend_user() {
+    local username="$1" limit_gb="$2"
+    jq --arg user "$username" '
+      .inbounds |= map(
+        if .settings.clients
+          then .settings.clients |= map(select(.email != $user))
+        else . end
+      )' "$XRAY_CONF" > /tmp/xlm_suspend.json \
+        && mv /tmp/xlm_suspend.json "$XRAY_CONF"
+    systemctl restart xray > /dev/null 2>&1
+    passwd -l "$username" > /dev/null 2>&1
+    logger "xray-limit-monitor: ${username} suspended — limit ${limit_gb}GB reached."
+}
+
+# ── Main polling loop ─────────────────────────────────────────────────────────
+while true; do
+    if [[ ! -f "$CSV_DB" ]]; then
+        sleep 60; continue
+    fi
+
+    # Build a temp file to safely rewrite CSV
+    tmp_csv=$(mktemp /tmp/xlm_csv_XXXXXX)
+    head -1 "$CSV_DB" > "$tmp_csv"   # preserve header
+
+    while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
+        [[ "$name" == "Username" ]] && continue
+
+        # Backward-compat: old CSVs have no LimitGB/UsedBytes columns
+        limit_gb=${limit_gb:-0}
+        used_bytes=${used_bytes:-0}
+
+        if [[ "$limit_gb" -gt 0 ]] 2>/dev/null; then
+            # Fetch fresh byte count from Xray stats API
+            fresh_bytes=$(query_user_bytes "$name")
+            # Only update if API returned a non-zero value (avoids resetting on API hiccup)
+            if [[ "$fresh_bytes" -gt 0 ]] 2>/dev/null; then
+                used_bytes=$fresh_bytes
+            fi
+
+            limit_bytes=$(( limit_gb * 1024 * 1024 * 1024 ))
+
+            if [[ "$used_bytes" -ge "$limit_bytes" ]]; then
+                # Suspend only if still active (idempotent)
+                if user_is_active "$name"; then
+                    suspend_user "$name" "$limit_gb"
+                fi
+            fi
+        fi
+
+        echo "${name},${pass},${uuid},${trojan},${exp},${limit_gb},${used_bytes}" >> "$tmp_csv"
+    done < "$CSV_DB"
+
+    # Atomically replace CSV
+    mv "$tmp_csv" "$CSV_DB"
+    chmod 600 "$CSV_DB"
+
+    sleep 60
+done
+MONITOR_SCRIPT
+    chmod +x /usr/local/bin/xray-limit-monitor
+
+    # ── Systemd unit ──────────────────────────────────────────────────────────
+    cat > /etc/systemd/system/xray-limit-monitor.service << 'MONITOR_SVC'
+[Unit]
+Description=AutoScriptX Bandwidth Limit Monitor
+After=xray.service
+Requires=xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray-limit-monitor
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+MONITOR_SVC
+
+    systemctl daemon-reload                    > /dev/null 2>&1
+    systemctl enable xray-limit-monitor        > /dev/null 2>&1
+    systemctl restart xray-limit-monitor       > /dev/null 2>&1
+}
+
 install_scripts() {
     log_info "Installing scripts..."
 
@@ -1226,6 +1640,9 @@ install_scripts() {
     # ── Write unified main menu (always inline, never depends on downloads) ───
     _write_main_menu
     rm -f /usr/bin/xray-menu   # clean up legacy binary if present from old installs
+
+    # ── Write bandwidth limit monitor daemon + systemd unit ───────────────────
+    _write_limit_monitor
 
 
     # Optional: attempt uninstall.sh download (non-fatal)
@@ -1281,7 +1698,7 @@ main() {
     configure_nginx
     setup_badvpn
     configure_stunnel
-    configure_sshguard
+    configure_fail2ban
     apply_firewall_rules
     install_scripts
     setup_cron_jobs
