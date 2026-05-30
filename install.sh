@@ -918,13 +918,53 @@ EOF
         fi
     done
 
+    # ── Additive config.json migration (runs AFTER restore to preserve UUIDs) ─
+    # Adds stats/api/policy blocks and API inbound if missing from existing config.
+    # This is safe — it only adds new keys, never modifies existing client entries.
+    if [[ -f "${XRAY_DIR}/config.json" ]]; then
+        local cfg="${XRAY_DIR}/config.json"
+
+        if ! jq -e '.stats' "$cfg" > /dev/null 2>&1; then
+            log_info "  Migrating config.json: adding stats block..."
+            jq '. + {"stats":{}}' "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        fi
+
+        if ! jq -e '.api' "$cfg" > /dev/null 2>&1; then
+            log_info "  Migrating config.json: adding api block..."
+            jq '. + {"api":{"tag":"api","services":["StatsService"]}}' \
+                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        fi
+
+        if ! jq -e '.policy' "$cfg" > /dev/null 2>&1; then
+            log_info "  Migrating config.json: adding policy block..."
+            jq '. + {"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true}}}' \
+                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        fi
+
+        if ! jq -e '.inbounds[] | select(.tag == "api")' "$cfg" > /dev/null 2>&1; then
+            log_info "  Migrating config.json: adding API inbound (port 10085)..."
+            jq '.inbounds = [{"tag":"api","listen":"127.0.0.1","port":10085,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}] + .inbounds' \
+                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        fi
+
+        if ! jq -e '.routing.rules[] | select(.inboundTag and (.inboundTag | contains(["api"])))' \
+                "$cfg" > /dev/null 2>&1; then
+            log_info "  Migrating config.json: adding API routing rule..."
+            jq '.routing.rules = [{"type":"field","inboundTag":["api"],"outboundTag":"direct"}] + .routing.rules' \
+                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        fi
+
+        chmod 600 "$cfg"
+        log_success "  config.json stats API migration complete."
+    fi
+
     log_info "Reloading Xray and Nginx..."
     systemctl restart xray  > /dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
     nginx -t > /dev/null 2>&1 && systemctl reload nginx > /dev/null 2>&1 && log_success "Nginx reloaded." || log_warning "Nginx config test failed — nginx NOT reloaded."
 
     rm -rf "$snap_dir"
     log_success "═══════════════════════════════════════════════════"
-    log_success " Update complete.  Version 4.1.0"
+    log_success " Update complete.  Version 4.2.0"
     log_success " Users, UUIDs, certs, and domain: UNTOUCHED."
     log_success "═══════════════════════════════════════════════════"
     read -p "Press Enter to return..."
