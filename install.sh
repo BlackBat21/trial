@@ -1480,6 +1480,194 @@ do_update() {
     read -p "Press Enter to return..."
 }
 
+# ── Full Uninstall ────────────────────────────────────────────────────────────
+full_uninstall() {
+    clear
+    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
+    echo -e "${red}║          ⚠  AutoScriptX — FULL UNINSTALL  ⚠                ║${nc}"
+    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
+    echo -e "${red}║  This will PERMANENTLY remove:                               ║${nc}"
+    echo -e "${red}║   • Xray-core binary, config, and ALL user accounts          ║${nc}"
+    echo -e "${red}║   • Nginx, Dropbear, Squid, Stunnel4, Fail2ban configs       ║${nc}"
+    echo -e "${red}║   • BadVPN, ws-proxy, gum binaries                           ║${nc}"
+    echo -e "${red}║   • xray-limit-monitor daemon                                ║${nc}"
+    echo -e "${red}║   • All cron jobs added by this script                       ║${nc}"
+    echo -e "${red}║   • Custom iptables / BitTorrent FORWARD rules               ║${nc}"
+    echo -e "${red}║   • /etc/AutoScriptX  /usr/local/etc/xray  directories       ║${nc}"
+    echo -e "${red}║   • /home/vps/public_html  web root                          ║${nc}"
+    echo -e "${red}║   • All menu / helper scripts placed in /usr/bin             ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${red}║  Core OS utilities (curl, jq, screen, etc.) are NOT removed. ║${nc}"
+    echo -e "${red}║  SSL certificates and SSH host keys are NOT removed.         ║${nc}"
+    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
+    echo ""
+    echo -e "${yellow}  STEP 1 of 2 — Are you absolutely sure you want to continue?${nc}"
+    echo -e "  Type  ${red}UNINSTALL${nc}  (all caps) to proceed, or anything else to abort."
+    echo ""
+    read -rp "  Confirmation: " _confirm1
+    if [[ "$_confirm1" != "UNINSTALL" ]]; then
+        echo -e "\n${green}  Aborted. No changes were made.${nc}"
+        read -p "  Press Enter to return..."
+        return 0
+    fi
+
+    echo ""
+    echo -e "${yellow}  STEP 2 of 2 — Final confirmation.${nc}"
+    echo -e "  Type  ${red}YES${nc}  to begin the uninstall, or anything else to abort."
+    echo ""
+    read -rp "  Final confirmation: " _confirm2
+    if [[ "$_confirm2" != "YES" ]]; then
+        echo -e "\n${green}  Aborted. No changes were made.${nc}"
+        read -p "  Press Enter to return..."
+        return 0
+    fi
+
+    echo ""
+    echo -e "${blue}[ Info    ]${nc} Starting full uninstall of AutoScriptX..."
+    echo ""
+
+    # ── 1. Stop and disable all services ──────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Stopping and disabling services..."
+    local _services=(
+        xray xray-limit-monitor ws-proxy nginx dropbear
+        stunnel4 squid fail2ban "badvpn-udpgw@7200" "badvpn-udpgw@7300"
+        netfilter-persistent
+    )
+    for _svc in "${_services[@]}"; do
+        systemctl stop    "$_svc" > /dev/null 2>&1 || true
+        systemctl disable "$_svc" > /dev/null 2>&1 || true
+    done
+    echo -e "${green}[ Success ]${nc} Services stopped and disabled."
+
+    # ── 2. Remove custom systemd unit files ───────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing custom systemd unit files..."
+    rm -rf /etc/systemd/system/xray.service \
+           /etc/systemd/system/xray-limit-monitor.service \
+           /etc/systemd/system/ws-proxy.service \
+           /etc/systemd/system/badvpn-udpgw@.service \
+           /etc/systemd/system/nginx.service.d
+    systemctl daemon-reload > /dev/null 2>&1
+    echo -e "${green}[ Success ]${nc} Custom systemd unit files removed."
+
+    # ── 3. Purge script-installed packages ────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Purging AutoScriptX-installed packages..."
+    apt-get purge -y stunnel4 dropbear squid fail2ban nginx \
+        netfilter-persistent iptables-persistent vnstat > /dev/null 2>&1 \
+        || echo -e "${yellow}[ Warning ]${nc} Some packages may not be installed via apt — continuing."
+    apt-get autoremove -y > /dev/null 2>&1
+    apt-get autoclean  -y > /dev/null 2>&1
+    echo -e "${green}[ Success ]${nc} Packages purged."
+
+    # ── 4. Remove Xray-core binary, configs, logs ─────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing Xray-core..."
+    rm -f  /usr/local/bin/xray /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
+    rm -rf /usr/local/etc/xray /var/log/xray
+    echo -e "${green}[ Success ]${nc} Xray-core removed."
+
+    # ── 5. Remove AutoScriptX configuration directory ─────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing /etc/AutoScriptX..."
+    rm -rf /etc/AutoScriptX
+    echo -e "${green}[ Success ]${nc} /etc/AutoScriptX removed."
+
+    # ── 6. Remove web root ────────────────────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing /home/vps web root..."
+    rm -rf /home/vps/public_html
+    rmdir  /home/vps 2>/dev/null || true
+    echo -e "${green}[ Success ]${nc} Web root removed."
+
+    # ── 7. Remove Nginx config fragments ──────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing Nginx configuration fragments..."
+    rm -f /etc/nginx/xray-locations.conf \
+          /etc/nginx/conf.d/xhttp-port80.conf \
+          /etc/nginx/conf.d/reverse-proxy.conf \
+          /etc/nginx/conf.d/real_ip_sources.conf
+    echo -e "${green}[ Success ]${nc} Nginx fragments removed."
+
+    # ── 8. Remove acme.sh ────────────────────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing acme.sh..."
+    rm -rf /root/.acme.sh
+    echo -e "${green}[ Success ]${nc} acme.sh removed."
+
+    # ── 9. Remove auxiliary binaries ─────────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing auxiliary binaries..."
+    rm -f /usr/local/bin/ws-proxy \
+          /usr/local/bin/xray-limit-monitor \
+          /usr/local/bin/gum \
+          /usr/bin/badvpn-udpgw
+    echo -e "${green}[ Success ]${nc} Auxiliary binaries removed."
+
+    # ── 10. Remove menu / helper scripts ──────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing menu and helper scripts..."
+    rm -f /usr/bin/menu /usr/bin/autoscriptx /usr/bin/asx /usr/bin/xray-menu \
+          /usr/bin/slowdns-menu /usr/bin/create-account /usr/bin/delete-account \
+          /usr/bin/edit-banner /usr/bin/edit-response /usr/bin/lock-unlock \
+          /usr/bin/renew-account /usr/bin/change-domain /usr/bin/manage-services \
+          /usr/bin/system-info /usr/bin/clean-expired-accounts \
+          /usr/bin/setup-slowdns /usr/bin/slowdns-status
+    echo -e "${green}[ Success ]${nc} Helper scripts removed."
+
+    # ── 11. Remove cron jobs ──────────────────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing AutoScriptX cron jobs..."
+    rm -f /etc/cron.d/auto-reboot /etc/cron.d/clean-expired-accounts
+    service cron restart > /dev/null 2>&1 || true
+    echo -e "${green}[ Success ]${nc} Cron jobs removed."
+
+    # ── 12. Flush custom iptables rules ───────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Flushing custom iptables rules..."
+    local _bt_strings=(
+        "get_peers" "announce_peer" "find_node" "BitTorrent"
+        "BitTorrent protocol" "peer_id=" ".torrent"
+        "announce.php?passkey=" "torrent" "announce" "info_hash"
+    )
+    for _s in "${_bt_strings[@]}"; do
+        while iptables -D FORWARD -m string --string "$_s" --algo bm -j DROP > /dev/null 2>&1; do
+            true
+        done
+    done
+    iptables -D INPUT -p tcp --dport 80  -j ACCEPT > /dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 443 -j ACCEPT > /dev/null 2>&1 || true
+    rm -f /etc/iptables.up.rules
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    echo -e "${green}[ Success ]${nc} Custom iptables rules flushed."
+
+    # ── 13. Remove IPv6 sysctl config ─────────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing IPv6 sysctl config..."
+    rm -f /etc/sysctl.d/99-disable-ipv6.conf
+    sysctl --system > /dev/null 2>&1 || true
+    echo -e "${green}[ Success ]${nc} IPv6 sysctl config removed."
+
+    # ── 14. Remove Stunnel certificates ───────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing Stunnel self-signed certificates..."
+    rm -f /etc/stunnel/key.pem /etc/stunnel/cert.pem /etc/stunnel/stunnel.pem
+    echo -e "${green}[ Success ]${nc} Stunnel certificates removed."
+
+    # ── 15. Remove Fail2ban customisations ────────────────────────────────────
+    echo -e "${blue}[ Info    ]${nc} Removing Fail2ban customisations..."
+    rm -f /etc/fail2ban/filter.d/xray-auth.conf /etc/fail2ban/jail.local
+    echo -e "${green}[ Success ]${nc} Fail2ban customisations removed."
+
+    echo ""
+    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
+    echo -e "${red}║           AutoScriptX Uninstall Complete                     ║${nc}"
+    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
+    echo -e "${red}║  All AutoScriptX services, configs, binaries, cron jobs,     ║${nc}"
+    echo -e "${red}║  and firewall rules have been removed.                       ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${red}║  Core OS packages (curl, jq, screen, etc.) were kept.        ║${nc}"
+    echo -e "${red}║  SSH host keys and existing SSL certificates were kept.      ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${yellow}║  ▶  A reboot is strongly recommended.                        ║${nc}"
+    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
+    echo ""
+    read -rp "  Reboot now? (y/N): " _do_reboot
+    if [[ "$_do_reboot" =~ ^[Yy]$ ]]; then
+        echo -e "${blue}[ Info    ]${nc} Rebooting..."
+        reboot
+    else
+        echo -e "${blue}[ Info    ]${nc} Reboot skipped. Please reboot manually when convenient."
+    fi
+}
+
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 while true; do
     show_header
@@ -1495,6 +1683,7 @@ while true; do
     echo -e "  ${green}9)${nc} Edit 101 Response"
     echo -e "  ${cyan}b)${nc} Bandwidth Monitor"
     echo -e "  ${yellow}u)${nc} Update AutoScriptX"
+    echo -e "  ${red}x)${nc} Uninstall AutoScriptX"
     echo -e "  ${red}0)${nc} Exit"
     echo ""
     read -rp "Select option: " opt
@@ -1510,6 +1699,7 @@ while true; do
         9) edit_response    ;;
         b|B) bandwidth_monitor ;;
         u|U) do_update      ;;
+        x|X) full_uninstall ;;
         0) exit 0           ;;
         *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
     esac
@@ -1644,6 +1834,253 @@ MONITOR_SVC
     systemctl daemon-reload                    > /dev/null 2>&1
     systemctl enable xray-limit-monitor        > /dev/null 2>&1
     systemctl restart xray-limit-monitor       > /dev/null 2>&1
+}
+
+# =============================================================================
+# Full Uninstall — removes every component installed by AutoScriptX
+# Two-step confirmation required before any destructive action is taken.
+# =============================================================================
+full_uninstall() {
+    clear
+    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
+    echo -e "${red}║          ⚠  AutoScriptX — FULL UNINSTALL  ⚠                ║${nc}"
+    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
+    echo -e "${red}║  This will PERMANENTLY remove:                               ║${nc}"
+    echo -e "${red}║   • Xray-core binary, config, and ALL user accounts          ║${nc}"
+    echo -e "${red}║   • Nginx, Dropbear, Squid, Stunnel4, Fail2ban configs       ║${nc}"
+    echo -e "${red}║   • BadVPN, ws-proxy, gum binaries                           ║${nc}"
+    echo -e "${red}║   • xray-limit-monitor daemon                                ║${nc}"
+    echo -e "${red}║   • All cron jobs added by this script                       ║${nc}"
+    echo -e "${red}║   • Custom iptables / BitTorrent FORWARD rules               ║${nc}"
+    echo -e "${red}║   • /etc/AutoScriptX  /usr/local/etc/xray  directories       ║${nc}"
+    echo -e "${red}║   • /home/vps/public_html  web root                          ║${nc}"
+    echo -e "${red}║   • All menu / helper scripts placed in /usr/bin             ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${red}║  Core OS utilities (curl, jq, screen, etc.) are NOT removed. ║${nc}"
+    echo -e "${red}║  SSL certificates and SSH host keys are NOT removed.         ║${nc}"
+    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
+    echo ""
+    echo -e "${yellow}  STEP 1 of 2 — Are you absolutely sure you want to continue?${nc}"
+    echo -e "  Type  ${red}UNINSTALL${nc}  (all caps) to proceed, or anything else to abort."
+    echo ""
+    read -rp "  Confirmation: " _confirm1
+    if [[ "$_confirm1" != "UNINSTALL" ]]; then
+        echo -e "\n${green}  Aborted. No changes were made.${nc}"
+        read -p "  Press Enter to return..."
+        return 0
+    fi
+
+    echo ""
+    echo -e "${yellow}  STEP 2 of 2 — Final confirmation.${nc}"
+    echo -e "  Type  ${red}YES${nc}  to begin the uninstall, or anything else to abort."
+    echo ""
+    read -rp "  Final confirmation: " _confirm2
+    if [[ "$_confirm2" != "YES" ]]; then
+        echo -e "\n${green}  Aborted. No changes were made.${nc}"
+        read -p "  Press Enter to return..."
+        return 0
+    fi
+
+    echo ""
+    log_info "Starting full uninstall of AutoScriptX..."
+    echo ""
+
+    # ── 1. Stop and disable all AutoScriptX-managed systemd services ──────────
+    log_info "Stopping and disabling services..."
+    local _services=(
+        xray
+        xray-limit-monitor
+        ws-proxy
+        nginx
+        dropbear
+        stunnel4
+        squid
+        fail2ban
+        "badvpn-udpgw@7200"
+        "badvpn-udpgw@7300"
+        netfilter-persistent
+    )
+    for _svc in "${_services[@]}"; do
+        systemctl stop    "$_svc" > /dev/null 2>&1 || true
+        systemctl disable "$_svc" > /dev/null 2>&1 || true
+    done
+    log_success "Services stopped and disabled."
+
+    # ── 2. Remove custom systemd unit files ───────────────────────────────────
+    log_info "Removing custom systemd unit files..."
+    local _units=(
+        /etc/systemd/system/xray.service
+        /etc/systemd/system/xray-limit-monitor.service
+        /etc/systemd/system/ws-proxy.service
+        /etc/systemd/system/badvpn-udpgw@.service
+        /etc/systemd/system/nginx.service.d
+    )
+    for _u in "${_units[@]}"; do
+        rm -rf "$_u"
+    done
+    systemctl daemon-reload > /dev/null 2>&1
+    log_success "Custom systemd unit files removed."
+
+    # ── 3. Purge script-installed packages ────────────────────────────────────
+    log_info "Purging AutoScriptX-installed packages..."
+    # We purge only the packages that are exclusive to AutoScriptX and not
+    # commonly required by the base OS (curl, jq, screen, etc. are left alone).
+    local _pkgs=(
+        stunnel4
+        dropbear
+        squid
+        fail2ban
+        badvpn
+        nginx
+        netfilter-persistent
+        iptables-persistent
+        vnstat
+    )
+    apt-get purge -y "${_pkgs[@]}" > /dev/null 2>&1 || log_warning "Some packages may not have been installed via apt — skipping those."
+    apt-get autoremove -y > /dev/null 2>&1
+    apt-get autoclean  -y > /dev/null 2>&1
+    log_success "Packages purged."
+
+    # ── 4. Remove Xray-core binary and data files ─────────────────────────────
+    log_info "Removing Xray-core binaries and configuration..."
+    rm -f  /usr/local/bin/xray
+    rm -f  /usr/local/bin/geoip.dat
+    rm -f  /usr/local/bin/geosite.dat
+    rm -rf /usr/local/etc/xray
+    rm -rf /var/log/xray
+    log_success "Xray-core removed."
+
+    # ── 5. Remove AutoScriptX configuration directory ─────────────────────────
+    log_info "Removing /etc/AutoScriptX directory..."
+    rm -rf /etc/AutoScriptX
+    log_success "/etc/AutoScriptX removed."
+
+    # ── 6. Remove web root ────────────────────────────────────────────────────
+    log_info "Removing /home/vps web root..."
+    rm -rf /home/vps/public_html
+    rmdir  /home/vps 2>/dev/null || true
+    log_success "Web root removed."
+
+    # ── 7. Remove Nginx config fragments written by this script ───────────────
+    log_info "Removing Nginx configuration fragments..."
+    rm -f /etc/nginx/xray-locations.conf
+    rm -f /etc/nginx/conf.d/xhttp-port80.conf
+    rm -f /etc/nginx/conf.d/reverse-proxy.conf
+    rm -f /etc/nginx/conf.d/real_ip_sources.conf
+    log_success "Nginx fragments removed."
+
+    # ── 8. Remove acme.sh and SSL cert directory ──────────────────────────────
+    log_info "Removing acme.sh certificate tooling..."
+    rm -rf /root/.acme.sh
+    # Note: cert.crt / cert.key were already removed with /etc/AutoScriptX above.
+    log_success "acme.sh removed."
+
+    # ── 9. Remove auxiliary binaries ─────────────────────────────────────────
+    log_info "Removing auxiliary binaries..."
+    local _bins=(
+        /usr/local/bin/ws-proxy
+        /usr/local/bin/xray-limit-monitor
+        /usr/local/bin/gum
+        /usr/bin/badvpn-udpgw
+    )
+    for _b in "${_bins[@]}"; do
+        rm -f "$_b"
+    done
+    log_success "Auxiliary binaries removed."
+
+    # ── 10. Remove menu / helper scripts placed in /usr/bin ───────────────────
+    log_info "Removing menu and helper scripts..."
+    local _scripts=(
+        /usr/bin/menu
+        /usr/bin/autoscriptx
+        /usr/bin/asx
+        /usr/bin/xray-menu
+        /usr/bin/slowdns-menu
+        /usr/bin/create-account
+        /usr/bin/delete-account
+        /usr/bin/edit-banner
+        /usr/bin/edit-response
+        /usr/bin/lock-unlock
+        /usr/bin/renew-account
+        /usr/bin/change-domain
+        /usr/bin/manage-services
+        /usr/bin/system-info
+        /usr/bin/clean-expired-accounts
+        /usr/bin/setup-slowdns
+        /usr/bin/slowdns-status
+    )
+    for _s in "${_scripts[@]}"; do
+        rm -f "$_s"
+    done
+    log_success "Helper scripts removed."
+
+    # ── 11. Remove cron jobs added by setup_cron_jobs() ──────────────────────
+    log_info "Removing AutoScriptX cron jobs..."
+    rm -f /etc/cron.d/auto-reboot
+    rm -f /etc/cron.d/clean-expired-accounts
+    service cron restart > /dev/null 2>&1 || true
+    log_success "Cron jobs removed."
+
+    # ── 12. Flush custom iptables FORWARD rules (BitTorrent blocking) ─────────
+    log_info "Flushing custom iptables FORWARD rules..."
+    local _bt_strings=(
+        "get_peers" "announce_peer" "find_node" "BitTorrent"
+        "BitTorrent protocol" "peer_id=" ".torrent"
+        "announce.php?passkey=" "torrent" "announce" "info_hash"
+    )
+    for _s in "${_bt_strings[@]}"; do
+        while iptables -D FORWARD -m string --string "$_s" --algo bm -j DROP > /dev/null 2>&1; do
+            true  # keep deleting until the rule no longer exists
+        done
+    done
+    # Remove the INPUT accept rules added for ports 80 and 443
+    iptables -D INPUT -p tcp --dport 80  -j ACCEPT > /dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 443 -j ACCEPT > /dev/null 2>&1 || true
+    # Remove the saved rules file written by this script
+    rm -f /etc/iptables.up.rules
+    # Persist the cleaned state
+    netfilter-persistent save > /dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    log_success "Custom iptables rules flushed."
+
+    # ── 13. Remove sysctl IPv6-disable config ─────────────────────────────────
+    log_info "Removing IPv6 disable sysctl config..."
+    rm -f /etc/sysctl.d/99-disable-ipv6.conf
+    sysctl --system > /dev/null 2>&1 || true
+    log_success "IPv6 sysctl config removed (IPv6 may re-enable after reboot)."
+
+    # ── 14. Remove Stunnel certificates written by this script ────────────────
+    log_info "Removing Stunnel self-signed certificate files..."
+    rm -f /etc/stunnel/key.pem
+    rm -f /etc/stunnel/cert.pem
+    rm -f /etc/stunnel/stunnel.pem
+    log_success "Stunnel certificates removed."
+
+    # ── 15. Remove Fail2ban custom filter written by this script ──────────────
+    log_info "Removing custom Fail2ban filter..."
+    rm -f /etc/fail2ban/filter.d/xray-auth.conf
+    rm -f /etc/fail2ban/jail.local
+    log_success "Fail2ban customisation removed."
+
+    echo ""
+    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
+    echo -e "${red}║           AutoScriptX Uninstall Complete                     ║${nc}"
+    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
+    echo -e "${red}║  All AutoScriptX services, configs, binaries, cron jobs,     ║${nc}"
+    echo -e "${red}║  and firewall rules have been removed.                       ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${red}║  Core OS packages (curl, jq, screen, etc.) were kept.        ║${nc}"
+    echo -e "${red}║  SSH host keys and existing SSL certificates were kept.      ║${nc}"
+    echo -e "${red}║                                                              ║${nc}"
+    echo -e "${yellow}║  ▶  A reboot is strongly recommended.                        ║${nc}"
+    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
+    echo ""
+    read -rp "  Reboot now? (y/N): " _do_reboot
+    if [[ "$_do_reboot" =~ ^[Yy]$ ]]; then
+        log_info "Rebooting..."
+        reboot
+    else
+        log_info "Reboot skipped. Please reboot manually when convenient."
+    fi
 }
 
 install_scripts() {
