@@ -169,6 +169,18 @@ setup_websocket_service() {
     rm -f /usr/local/bin/ws-proxy
     wget -qO /usr/local/bin/ws-proxy "$BASE_URL/bin/ws-proxy" && chmod +x /usr/local/bin/ws-proxy || log_warning "Failed to install websocket proxy."
     wget -qO /etc/systemd/system/ws-proxy.service "$BASE_URL/service/systemd/ws-proxy.service" && chmod +x /etc/systemd/system/ws-proxy.service || log_warning "Failed to install websocket proxy service."
+
+    # Pre-create the 101 response file with the correct CRLF default so
+    # ws-proxy has a valid file on first start, and edit_response() always
+    # has a file to display and edit.
+    mkdir -p /etc/AutoScriptX
+    if [[ ! -s /etc/AutoScriptX/response ]]; then
+        printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
+            > /etc/AutoScriptX/response
+        chmod 644 /etc/AutoScriptX/response
+        log_info "Default 101 response file created."
+    fi
+
     systemctl daemon-reload > /dev/null 2>&1
     systemctl enable ws-proxy.service > /dev/null 2>&1
     systemctl restart ws-proxy.service > /dev/null 2>&1 || log_warning "Failed to restart ws-proxy.service."
@@ -1440,23 +1452,62 @@ edit_banner() {
 edit_response() {
     show_header
     local response_file="/etc/AutoScriptX/response"
+
+    # Bug fix 1: Ensure the file and its parent directory always exist before
+    # attempting to display or edit it.  ws-proxy reads this file at start; if
+    # it was never created the service falls back to a hard-coded internal
+    # default and edits here have no effect.
+    mkdir -p /etc/AutoScriptX
+    if [[ ! -f "$response_file" ]]; then
+        printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
+            > "$response_file"
+        chmod 644 "$response_file"
+    fi
+
     echo -e "${blue}── Edit 101 WebSocket Response ─────────────────────────${nc}\n"
-    echo -e "  ${yellow}Current response:${nc}"
+    echo -e "  ${yellow}Current response (hex view — CRLF shown as \\\\r\\\\n):${nc}"
     echo -e "  ─────────────────────────────────────────────────────"
-    cat "$response_file" 2>/dev/null || echo -e "  ${yellow}(empty — using ws-proxy default)${nc}"
+    # Bug fix 2: cat prints control chars invisibly; use cat -A so the admin
+    # can actually see whether CRLF line endings are present (shown as ^M$).
+    cat -A "$response_file" 2>/dev/null || echo -e "  ${yellow}(file unreadable)${nc}"
     echo -e "  ─────────────────────────────────────────────────────\n"
-    echo -e "  ${green}1)${nc} Edit with nano"
-    echo -e "  ${green}2)${nc} Reset to default"
+    echo -e "  ${yellow}Note:${nc} Lines must end with ${green}^M\$${nc} (CRLF) as required by HTTP/1.1."
+    echo -e "  Do NOT use a plain text editor that strips carriage returns.\n"
+    echo -e "  ${green}1)${nc} Edit with nano  (nano preserves CRLF if present)"
+    echo -e "  ${green}2)${nc} Reset to default (correct CRLF response)"
     echo -e "  ${green}0)${nc} Cancel"
     echo ""; read -rp "  Select: " choice
     case $choice in
-        1) nano "$response_file"
-           systemctl restart ws-proxy.service > /dev/null 2>&1
-           echo -e "\n  ${green}Response updated.${nc}" ;;
-        2) printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
-               > "$response_file"
-           systemctl restart ws-proxy.service > /dev/null 2>&1
-           echo -e "\n  ${green}Response reset to default.${nc}" ;;
+        1)
+            # Bug fix 3: pre-create the file so nano opens something real, and
+            # capture whether the file changed so we only restart when needed.
+            local _before _after
+            _before=$(md5sum "$response_file" 2>/dev/null)
+            nano "$response_file"
+            _after=$(md5sum "$response_file" 2>/dev/null)
+            if [[ "$_before" != "$_after" ]]; then
+                if systemctl restart ws-proxy.service 2>/dev/null; then
+                    echo -e "\n  ${green}Response updated and ws-proxy restarted.${nc}"
+                else
+                    echo -e "\n  ${yellow}File saved but ws-proxy restart failed — check: systemctl status ws-proxy${nc}"
+                fi
+            else
+                echo -e "\n  ${yellow}No changes detected — ws-proxy not restarted.${nc}"
+            fi
+            ;;
+        2)
+            # Bug fix 4: use printf with explicit \r\n escape sequences so the
+            # correct CRLF bytes (0x0D 0x0A) are always written regardless of
+            # whether the shell is bash or dash, and regardless of locale.
+            printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
+                > "$response_file"
+            chmod 644 "$response_file"
+            if systemctl restart ws-proxy.service 2>/dev/null; then
+                echo -e "\n  ${green}Response reset to default and ws-proxy restarted.${nc}"
+            else
+                echo -e "\n  ${yellow}File reset but ws-proxy restart failed — check: systemctl status ws-proxy${nc}"
+            fi
+            ;;
         *) echo -e "  ${yellow}Cancelled.${nc}" ;;
     esac
     read -p "  Press Enter to return..."
