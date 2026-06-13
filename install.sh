@@ -1451,69 +1451,149 @@ edit_banner() {
 # ── Edit 101 Response ─────────────────────────────────────────────────────────
 edit_response() {
     show_header
-    local response_file="/etc/AutoScriptX/response"
+    echo -e "${blue}── Edit 101 WebSocket Response ─────────────────────────${nc}\n"
 
-    # Bug fix 1: Ensure the file and its parent directory always exist before
-    # attempting to display or edit it.  ws-proxy reads this file at start; if
-    # it was never created the service falls back to a hard-coded internal
-    # default and edits here have no effect.
-    mkdir -p /etc/AutoScriptX
-    if [[ ! -f "$response_file" ]]; then
+    # ── Step 1: Detect which response file ws-proxy actually reads ────────────
+    # Different builds of ws-proxy use different paths/flags. Inspect the
+    # running service unit and the binary's own help output to find the real
+    # path before touching anything.
+    local response_file=""
+    local ws_exec ws_args
+
+    # Check ExecStart in the live systemd unit
+    ws_exec=$(systemctl cat ws-proxy.service 2>/dev/null \
+        | grep -i 'ExecStart' | head -1)
+
+    # Try common flag patterns: --response, --banner, --wspath, positional arg
+    for _flag in "--response" "--banner" "--file" "--wspath"; do
+        if echo "$ws_exec" | grep -q "$_flag"; then
+            response_file=$(echo "$ws_exec" \
+                | grep -oP "(?<=${_flag}[= ])\S+")
+            break
+        fi
+    done
+
+    # If not found in unit, try the binary's help text
+    if [[ -z "$response_file" ]]; then
+        local _help
+        _help=$(/usr/local/bin/ws-proxy --help 2>&1 || /usr/local/bin/ws-proxy -h 2>&1 || true)
+        for _flag in "--response" "--banner" "--file" "--wspath"; do
+            if echo "$_help" | grep -q "$_flag"; then
+                response_file=$(echo "$_help" \
+                    | grep -oP "(?<=${_flag}[= ])(\S+)" | head -1)
+                break
+            fi
+        done
+    fi
+
+    # Check common hardcoded paths used by popular ws-proxy builds
+    if [[ -z "$response_file" ]]; then
+        for _p in \
+            "/etc/AutoScriptX/response" \
+            "/etc/ws-proxy/response" \
+            "/etc/ws-proxy.conf" \
+            "/etc/AutoScriptX/ws-response" \
+            "/tmp/ws-response"
+        do
+            if [[ -f "$_p" ]]; then
+                response_file="$_p"
+                break
+            fi
+        done
+    fi
+
+    # Last resort: use our canonical path
+    [[ -z "$response_file" ]] && response_file="/etc/AutoScriptX/response"
+
+    echo -e "  ${yellow}ws-proxy response file path:${nc} ${green}${response_file}${nc}"
+    echo -e "  ${yellow}ws-proxy ExecStart:${nc} $(echo "$ws_exec" | sed 's/ExecStart=//' | xargs)"
+    echo ""
+
+    # ── Step 2: Ensure the file exists with correct CRLF content ─────────────
+    mkdir -p "$(dirname "$response_file")"
+    if [[ ! -f "$response_file" ]] || [[ ! -s "$response_file" ]]; then
         printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
             > "$response_file"
         chmod 644 "$response_file"
+        echo -e "  ${yellow}File was missing — written default 101 response.${nc}\n"
     fi
 
-    echo -e "${blue}── Edit 101 WebSocket Response ─────────────────────────${nc}\n"
-    echo -e "  ${yellow}Current response (hex view — CRLF shown as \\\\r\\\\n):${nc}"
+    # ── Step 3: Display current content ──────────────────────────────────────
+    echo -e "  ${yellow}Current content (^M = carriage return, required for HTTP/1.1):${nc}"
     echo -e "  ─────────────────────────────────────────────────────"
-    # Bug fix 2: cat prints control chars invisibly; use cat -A so the admin
-    # can actually see whether CRLF line endings are present (shown as ^M$).
-    cat -A "$response_file" 2>/dev/null || echo -e "  ${yellow}(file unreadable)${nc}"
+    cat -A "$response_file" 2>/dev/null || echo -e "  ${yellow}(unreadable)${nc}"
     echo -e "  ─────────────────────────────────────────────────────\n"
-    echo -e "  ${yellow}Note:${nc} Lines must end with ${green}^M\$${nc} (CRLF) as required by HTTP/1.1."
-    echo -e "  Do NOT use a plain text editor that strips carriage returns.\n"
-    echo -e "  ${green}1)${nc} Edit with nano  (nano preserves CRLF if present)"
-    echo -e "  ${green}2)${nc} Reset to default (correct CRLF response)"
+
+    # Warn if no ^M (missing CRLF)
+    if ! cat -A "$response_file" 2>/dev/null | grep -q '\^M'; then
+        echo -e "  ${red}⚠  WARNING: No CRLF detected. HTTP clients will reject this response.${nc}"
+        echo -e "  ${yellow}   Use option 2 to reset to a correct default.${nc}\n"
+    fi
+
+    echo -e "  ${green}1)${nc} Edit with nano"
+    echo -e "  ${green}2)${nc} Reset to correct CRLF default"
+    echo -e "  ${green}3)${nc} Show ws-proxy service status"
+    echo -e "  ${green}4)${nc} Override response file path manually"
     echo -e "  ${green}0)${nc} Cancel"
     echo ""; read -rp "  Select: " choice
     case $choice in
         1)
-            # Bug fix 3: pre-create the file so nano opens something real, and
-            # capture whether the file changed so we only restart when needed.
             local _before _after
             _before=$(md5sum "$response_file" 2>/dev/null)
             nano "$response_file"
             _after=$(md5sum "$response_file" 2>/dev/null)
             if [[ "$_before" != "$_after" ]]; then
+                if ! cat -A "$response_file" | grep -q '\^M'; then
+                    echo -e "\n  ${red}⚠  Saved file has no CRLF (^M) — HTTP clients may reject it.${nc}"
+                    echo -e "  ${yellow}   Run option 2 to restore a correct default.${nc}"
+                fi
                 if systemctl restart ws-proxy.service 2>/dev/null; then
-                    echo -e "\n  ${green}Response updated and ws-proxy restarted.${nc}"
+                    echo -e "\n  ${green}Response updated and ws-proxy restarted successfully.${nc}"
                 else
-                    echo -e "\n  ${yellow}File saved but ws-proxy restart failed — check: systemctl status ws-proxy${nc}"
+                    echo -e "\n  ${red}File saved but ws-proxy failed to restart:${nc}"
+                    systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -10
                 fi
             else
                 echo -e "\n  ${yellow}No changes detected — ws-proxy not restarted.${nc}"
             fi
             ;;
         2)
-            # Bug fix 4: use printf with explicit \r\n escape sequences so the
-            # correct CRLF bytes (0x0D 0x0A) are always written regardless of
-            # whether the shell is bash or dash, and regardless of locale.
             printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
                 > "$response_file"
             chmod 644 "$response_file"
+            echo -e "\n  ${green}Written (hex verify):${nc}"
+            cat -A "$response_file"
+            echo ""
             if systemctl restart ws-proxy.service 2>/dev/null; then
-                echo -e "\n  ${green}Response reset to default and ws-proxy restarted.${nc}"
+                echo -e "  ${green}ws-proxy restarted successfully.${nc}"
             else
-                echo -e "\n  ${yellow}File reset but ws-proxy restart failed — check: systemctl status ws-proxy${nc}"
+                echo -e "  ${red}ws-proxy restart failed:${nc}"
+                systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -10
+            fi
+            ;;
+        3)
+            echo ""
+            systemctl status ws-proxy.service --no-pager -l 2>/dev/null || \
+                echo -e "  ${red}ws-proxy.service not found.${nc}"
+            ;;
+        4)
+            echo ""
+            read -rp "  Enter full path to response file: " _new_path
+            _new_path=$(echo "$_new_path" | tr -d ' ')
+            if [[ -n "$_new_path" ]]; then
+                mkdir -p "$(dirname "$_new_path")"
+                printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
+                    > "$_new_path"
+                chmod 644 "$_new_path"
+                echo -e "\n  ${green}Default response written to: ${_new_path}${nc}"
+                echo -e "  ${yellow}Note: Update your ws-proxy.service ExecStart to point to this path,${nc}"
+                echo -e "  ${yellow}then run: systemctl daemon-reload && systemctl restart ws-proxy${nc}"
             fi
             ;;
         *) echo -e "  ${yellow}Cancelled.${nc}" ;;
     esac
     read -p "  Press Enter to return..."
 }
-
-# ── Update ────────────────────────────────────────────────────────────────────
 do_update() {
     show_header
     echo -e "${blue}Fetching latest update engine from repo...${nc}\n"
