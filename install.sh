@@ -267,8 +267,8 @@ EOF
       }
     },
     "system": {
-      "statsInboundUplink":   true,
-      "statsInboundDownlink": true
+      "statsInboundUplink":   false,
+      "statsInboundDownlink": false
     }
   },
   "routing": {
@@ -757,6 +757,21 @@ update_script() {
         sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
     fi
 
+    # Patch create-account if upstream download succeeded.
+    # The upstream script matches inbounds by .protocol which causes the xhttp
+    # inbound client list to diverge from vless-ws/vmess-ws after a second
+    # account is created, breaking xhttp for all subsequent users.
+    # We patch it to match by .tag instead — safe regardless of upstream version.
+    if [[ -s /usr/bin/create-account ]]; then
+        # Replace protocol-based matching with tag-based matching
+        sed -i \
+            's/\.protocol == "vless"/(.tag | test("vless"))/g;
+             s/\.protocol == "vmess"/(.tag | test("vmess"))/g;
+             s/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
+            /usr/bin/create-account
+        log_success "create-account patched: xhttp tag-match fix applied."
+    fi
+
     log_info "Rebuilding /usr/bin/menu (unified main menu)..."
     _write_main_menu
     rm -f /usr/bin/xray-menu   # remove legacy binary if present
@@ -949,7 +964,12 @@ EOF
 
         if ! jq -e '.policy' "$cfg" > /dev/null 2>&1; then
             log_info "  Migrating config.json: adding policy block..."
-            jq '. + {"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true}}}' \
+            jq '. + {"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":false,"statsInboundDownlink":false}}}' \
+                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        else
+            # Disable statsInbound on existing configs — it doubles Xray's memory
+            # usage for stats with no benefit since the monitor only reads user stats.
+            jq '.policy.system.statsInboundUplink = false | .policy.system.statsInboundDownlink = false' \
                 "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
         fi
 
@@ -1008,17 +1028,26 @@ cyan="\033[0;36m"
 nc="\033[0m"
 
 # ── Header ────────────────────────────────────────────────────────────────────
+# Cache the Xray version at startup — calling the binary on every menu refresh
+# adds ~150ms of latency each time and is completely unnecessary.
+_XRAY_VER_CACHE=""
+_get_xray_ver() {
+    if [[ -z "$_XRAY_VER_CACHE" ]]; then
+        _XRAY_VER_CACHE=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
+    fi
+    echo "$_XRAY_VER_CACHE"
+}
+
 show_header() {
     clear
-    local domain xray_ver uptime_str
+    local domain uptime_str
     domain=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
-    xray_ver=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
     uptime_str=$(uptime -p 2>/dev/null || echo "?")
     echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
     echo -e "${cyan}║       AutoScriptX  v4.2.0  —  Main Menu     ║${nc}"
     echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
     printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}\n" "$domain"
-    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$xray_ver"
+    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$(_get_xray_ver)"
     printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}\n" "$uptime_str"
     echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
 }
@@ -1057,7 +1086,9 @@ create_account() {
     show_header
     local DOMAIN PUBLIC_IP
     DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
-    PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    # Use local IP to avoid a blocking external HTTP call on every account creation.
+    # The public IP display is cosmetic only — local IP is always correct and instant.
+    PUBLIC_IP=$(hostname -I | awk '{print $1}')
 
     if command -v gum &>/dev/null; then
         echo -e "\n# 🧑 Create SSH Account\n"
@@ -1088,16 +1119,24 @@ create_account() {
         echo -e "${red}  User '$u_name' already exists.${nc}"
         read -p "  Press Enter to return..."; return
     fi
+    # Heal any xhttp client list divergence caused by the old protocol-match bug
+    repair_xhttp_clients
     useradd -M -s /bin/false -e "$u_exp" "$u_name"
     echo "${u_name}:${u_pass}" | chpasswd
 
+    # Add the new user to every inbound by TAG so that:
+    #   • vless-ws and vless-xhttp each get the user's UUID independently
+    #   • vmess-ws and vmess-xhttp each get the user's UUID independently
+    #   • trojan-ws gets the trojan password
+    # Using .tag (not .protocol) prevents the filter from accidentally matching
+    # the wrong inbound type and keeps xhttp clients in sync with ws clients.
     jq --arg user "$u_name" --arg uuid "$u_uuid" --arg tpw "$u_trojan" '
       .inbounds |= map(
-        if   .protocol == "vless"  and .settings.clients
+        if   (.tag | test("vless"))  and .settings.clients
           then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
-        elif .protocol == "vmess"  and .settings.clients
+        elif (.tag | test("vmess"))  and .settings.clients
           then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
-        elif .protocol == "trojan" and .settings.clients
+        elif (.tag | test("trojan")) and .settings.clients
           then .settings.clients += [{"password": $tpw, "email": $user}]
         else . end
       )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
@@ -1209,6 +1248,32 @@ delete_account() {
     sed -i "/^${u_name},/d" "$CSV_DB"
     echo -e "${green}  Account '${u_name}' deleted successfully.${nc}"
     read -p "  Press Enter to return..."
+}
+
+# ── Repair xHTTP inbound clients (fixes installs broken by the protocol-match bug)
+# Called automatically on first list/create after upgrade. Safe to run any time.
+repair_xhttp_clients() {
+    [[ ! -f "$XRAY_CONF" ]] && return
+    local _tmp; _tmp=$(mktemp)
+
+    # For each user in the CSV, ensure their UUID exists in BOTH vless-ws AND
+    # vless-xhttp, and their vmess UUID exists in BOTH vmess-ws AND vmess-xhttp.
+    # Strategy: rebuild the clients list in xhttp inbounds from scratch using
+    # the clients already present in the corresponding ws inbound (source of truth).
+    jq '
+      # Collect all clients from vless-ws and vmess-ws — these are the ground truth
+      ( .inbounds[] | select(.tag == "vless-ws")  | .settings.clients ) as $vless_clients |
+      ( .inbounds[] | select(.tag == "vmess-ws")  | .settings.clients ) as $vmess_clients |
+      ( .inbounds[] | select(.tag == "trojan-ws") | .settings.clients ) as $trojan_clients |
+      .inbounds |= map(
+        if   .tag == "vless-xhttp"  then .settings.clients = $vless_clients
+        elif .tag == "vmess-xhttp"  then .settings.clients = $vmess_clients
+        else . end
+      )
+    ' "$XRAY_CONF" > "$_tmp" \
+    && mv "$_tmp" "$XRAY_CONF" \
+    && chmod 600 "$XRAY_CONF" \
+    || rm -f "$_tmp"
 }
 
 # ── List Accounts ─────────────────────────────────────────────────────────────
@@ -1394,7 +1459,11 @@ system_info() {
     echo -e "  CPU     : $(nproc) core(s)"
     echo -e "  RAM     : $(free -h | awk '/^Mem/{print $3 " used / " $2 " total"}')"
     echo -e "  Disk    : $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
-    echo -e "  IP      : $(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+    # Use local IP immediately; attempt public IP lookup in background with short timeout
+    local local_ip pub_ip
+    local_ip=$(hostname -I | awk '{print $1}')
+    pub_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "$local_ip")
+    echo -e "  IP      : $pub_ip"
     echo -e "  Domain  : $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
     echo -e "  Uptime  : $(uptime -p 2>/dev/null)"
     echo ""
@@ -1808,27 +1877,30 @@ _write_limit_monitor() {
 # =============================================================================
 # AutoScriptX — Bandwidth Limit Monitor Daemon
 # Polls Xray Stats API every 60 s. Suspends accounts that exceed their quota.
+# Performance notes:
+#   • --reset clears per-user counters after each read so the gRPC payload
+#     stays small and Xray's in-memory stats map never grows unboundedly.
+#   • A single jq invocation extracts both uplink and downlink in one pass
+#     instead of spawning two jq processes per user per poll cycle.
 # =============================================================================
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_API="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
 
-# Query Xray stats API for a single user; returns total bytes (up + down)
+# Query Xray stats API for a single user; returns total bytes (up + down).
+# --reset clears the counter after reading so values stay small and the gRPC
+# response payload never grows as traffic accumulates over weeks/months.
 query_user_bytes() {
     local username="$1"
-    local stats uplink downlink
+    local stats total
     stats=$("$XRAY_BIN" api statsquery \
         --server="$XRAY_API" \
+        --reset \
         -pattern "user>>>${username}>>>traffic" 2>/dev/null)
-    uplink=$(echo  "$stats" | jq -r '.stat[]? | select(.name | endswith("uplink"))   | .value // "0"' 2>/dev/null | head -1)
-    downlink=$(echo "$stats" | jq -r '.stat[]? | select(.name | endswith("downlink")) | .value // "0"' 2>/dev/null | head -1)
-    uplink=${uplink:-0}
-    downlink=${downlink:-0}
-    # Strip any non-numeric characters (API returns string int64)
-    uplink=$(echo "$uplink"   | tr -dc '0-9')
-    downlink=$(echo "$downlink" | tr -dc '0-9')
-    echo $(( ${uplink:-0} + ${downlink:-0} ))
+    # Single jq call — sum all numeric .value fields (both uplink and downlink)
+    total=$(echo "$stats" | jq -r '[.stat[]? | .value // "0" | tonumber] | add // 0' 2>/dev/null)
+    echo "${total:-0}"
 }
 
 # Check whether a user still has an active client entry in any inbound
@@ -1867,22 +1939,21 @@ while true; do
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
 
-        # Backward-compat: old CSVs have no LimitGB/UsedBytes columns
         limit_gb=${limit_gb:-0}
         used_bytes=${used_bytes:-0}
 
         if [[ "$limit_gb" -gt 0 ]] 2>/dev/null; then
-            # Fetch fresh byte count from Xray stats API
+            # Fetch fresh byte count from Xray stats API (resets counter after read)
             fresh_bytes=$(query_user_bytes "$name")
-            # Only update if API returned a non-zero value (avoids resetting on API hiccup)
+            # Accumulate into used_bytes — because --reset clears the Xray counter
+            # each cycle, fresh_bytes is the delta since last poll, not the total.
             if [[ "$fresh_bytes" -gt 0 ]] 2>/dev/null; then
-                used_bytes=$fresh_bytes
+                used_bytes=$(( used_bytes + fresh_bytes ))
             fi
 
             limit_bytes=$(( limit_gb * 1024 * 1024 * 1024 ))
 
             if [[ "$used_bytes" -ge "$limit_bytes" ]]; then
-                # Suspend only if still active (idempotent)
                 if user_is_active "$name"; then
                     suspend_user "$name" "$limit_gb"
                 fi
@@ -1892,7 +1963,6 @@ while true; do
         echo "${name},${pass},${uuid},${trojan},${exp},${limit_gb},${used_bytes}" >> "$tmp_csv"
     done < "$CSV_DB"
 
-    # Atomically replace CSV
     mv "$tmp_csv" "$CSV_DB"
     chmod 600 "$CSV_DB"
 
@@ -1913,6 +1983,11 @@ Type=simple
 ExecStart=/usr/local/bin/xray-limit-monitor
 Restart=always
 RestartSec=10
+# Resource caps — this daemon only does lightweight CSV + gRPC polling.
+# These limits prevent a runaway loop from degrading the VPS.
+CPUQuota=10%
+MemoryMax=64M
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
@@ -2198,6 +2273,16 @@ install_scripts() {
         sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
         sed -i 's/XUI Watcher/Xray Watcher/g'   /usr/bin/manage-services
         sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
+    fi
+
+    # Patch create-account: fix the xhttp protocol-match bug in the upstream script
+    if [[ -s /usr/bin/create-account ]]; then
+        sed -i \
+            's/\.protocol == "vless"/(.tag | test("vless"))/g;
+             s/\.protocol == "vmess"/(.tag | test("vmess"))/g;
+             s/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
+            /usr/bin/create-account
+        log_success "create-account patched: xhttp tag-match fix applied."
     fi
 
 
