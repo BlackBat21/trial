@@ -1,26 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
-# AutoScriptX Hybrid — FreeNetLabs Base + Elite Xray Payload
-# Version : 4.1.0 (xHTTP Port-80 Non-TLS + Non-Destructive Update Engine)
-# Fully Patched & Hardened Release
+# AutoScriptX Hybrid — Hardened Release
+# Version : 4.2.0-hardened (xHTTP + WS, integrity-checked, injection-safe)
+# Repo    : BlackBat21/trial (single trust boundary for code + self-update)
 # =============================================================================
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
-# Color definitions
-green="\033[0;32m"
-blue="\033[0;34m"
-red="\033[0;31m"
-yellow="\033[1;33m"
-nc="\033[0m"
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+green="\033[0;32m"; blue="\033[0;34m"; red="\033[0;31m"
+yellow="\033[1;33m"; cyan="\033[0;36m"; nc="\033[0m"
 
-# Configuration
-BASE_URL="https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master"
-SELF_UPDATE_URL="https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh"
+# ---------------------------------------------------------------------------
+# Configuration — ONE repository, ONE trust boundary.
+#   REPO_RAW      : source of truth for install.sh, configs, binaries,
+#                   helper scripts, AND self-update. Override at runtime with
+#                   AUTOSCRIPTX_REPO=... if you fork.
+#   MANIFEST_URL  : "sha256  path" list. When reachable, every fetched binary
+#                   is verified against it. Publish SHA256SUMS in the repo.
+#   REQUIRE_INTEGRITY=1 aborts on any unverifiable binary (recommended prod).
+# ---------------------------------------------------------------------------
+REPO_RAW="${AUTOSCRIPTX_REPO:-https://raw.githubusercontent.com/BlackBat21/trial/main}"
+BASE_URL="$REPO_RAW"
+SELF_UPDATE_URL="${REPO_RAW}/install.sh"
+MANIFEST_URL="${AUTOSCRIPTX_MANIFEST:-${REPO_RAW}/SHA256SUMS}"
+REQUIRE_INTEGRITY="${REQUIRE_INTEGRITY:-0}"
+UA="AutoScriptX-Deployment"
 export DEBIAN_FRONTEND=noninteractive
 
-# Xray Payload Constants
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 readonly XRAY_DIR="/usr/local/etc/xray"
 readonly CSV_DB="${XRAY_DIR}/users.csv"
 readonly XRAY_BIN="/usr/local/bin/xray"
+readonly ASX_DIR="/etc/AutoScriptX"
+readonly CSV_LOCK="/run/lock/autoscriptx-csv.lock"
+readonly CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 readonly PORT_VLESS_WS=10001
 readonly PORT_VMESS_WS=10002
 readonly PORT_TROJAN_WS=10003
@@ -28,352 +47,391 @@ readonly PORT_VLESS_XHTTP=10004
 readonly PORT_VMESS_XHTTP=10005
 readonly PORT_XRAY_API=10085
 
-# Global variables
-localip=""
-public_ip=""
-hostname=""
-domain=""
+localip="" ; public_ip="" ; hostname_v="" ; domain=""
 
-# Logging functions
+# ---------------------------------------------------------------------------
+# Logging + error trap
+# ---------------------------------------------------------------------------
 log_info()    { echo -e "${blue}[ Info    ]${nc} $1"; }
 log_success() { echo -e "${green}[ Success ]${nc} $1"; }
-log_error()   { echo -e "${red}[ Error   ]${nc} $1"; }
-log_warning() { echo -e "${yellow}[ Warning ]${nc} $1"; }
+log_error()   { echo -e "${red}[ Error   ]${nc} $1" >&2; }
+log_warning() { echo -e "${yellow}[ Warning ]${nc} $1" >&2; }
+die() { log_error "$1"; exit "${2:-1}"; }
+on_err() { log_error "Failed at line ${1} (exit ${2}). Aborting."; }
+trap 'on_err "$LINENO" "$?"' ERR
 
-# Check if script is run as root
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        log_error "Run as root."
-        exit 1
-    fi
+check_root() { [[ "$(id -u)" -eq 0 ]] || die "Run as root."; }
+
+# ---------------------------------------------------------------------------
+# Validation (allowlists — inputs are treated as data, never code)
+# ---------------------------------------------------------------------------
+validate_domain() {
+    local d="$1"
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$ ]] || return 1
+    [[ "$d" != *".."* ]] || return 1
+    return 0
+}
+validate_username() {
+    # Linux-safe + parser-safe: no comma/regex/sed metacharacters.
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# ---------------------------------------------------------------------------
+# Networking helpers (retry + integrity)
+# ---------------------------------------------------------------------------
+# fetch <url> <dest> [tries] : download to temp, verify non-empty, atomic move.
+fetch() {
+    local url="$1" dest="$2" tries="${3:-3}" tmp i
+    tmp="$(mktemp "${dest}.dl.XXXXXX")"
+    for ((i=1;i<=tries;i++)); do
+        if curl -fsSL -H "User-Agent: ${UA}" --max-time 60 -o "$tmp" "$url"; then
+            if [[ -s "$tmp" ]]; then mv -f "$tmp" "$dest"; return 0; fi
+        fi
+        sleep 2
+    done
+    rm -f "$tmp"
+    return 1
 }
 
-# Setup hostname and hosts file
+# sha256 verification against the optional manifest.
+_manifest=""
+load_manifest() {
+    _manifest="$(mktemp)"
+    curl -fsSL -H "User-Agent: ${UA}" --max-time 30 "$MANIFEST_URL" -o "$_manifest" 2>/dev/null \
+        || { rm -f "$_manifest"; _manifest=""; }
+}
+verify_file() {
+    # verify_file <file> <manifest-key>
+    local file="$1" key="$2" want got
+    if [[ -z "$_manifest" ]]; then
+        [[ "$REQUIRE_INTEGRITY" == "1" ]] && die "Integrity required but no manifest for $key."
+        return 0
+    fi
+    want="$(awk -v k="$key" '$2==k || $2=="./"k {print $1; exit}' "$_manifest")"
+    if [[ -z "$want" ]]; then
+        [[ "$REQUIRE_INTEGRITY" == "1" ]] && die "No checksum entry for $key."
+        log_warning "No checksum entry for $key (continuing, integrity not enforced)."
+        return 0
+    fi
+    got="$(sha256sum "$file" | awk '{print $1}')"
+    [[ "$want" == "$got" ]] || die "Checksum mismatch for $key (expected $want got $got)."
+    log_success "Integrity verified: $key"
+}
+
+# fetch_verified <url> <dest> <manifest-key>
+fetch_verified() {
+    fetch "$1" "$2" || die "Download failed: $1"
+    verify_file "$2" "$3"
+}
+
+# ---------------------------------------------------------------------------
+# Atomic + locked state mutation
+# ---------------------------------------------------------------------------
+# atomic_write <dest> : reads stdin, writes atomically in dest's dir.
+atomic_write() {
+    local dest="$1" tmp
+    tmp="$(mktemp "$(dirname "$dest")/.tmp.XXXXXX")"
+    cat > "$tmp"
+    mv -f "$tmp" "$dest"
+}
+# json_edit <file> <lockfile> <jq-args...> : locked, atomic jq in-place.
+json_edit() {
+    local file="$1" lock="$2"; shift 2
+    local tmp; tmp="$(mktemp "$(dirname "$file")/.jq.XXXXXX")"
+    (
+        flock 9
+        if jq "$@" "$file" > "$tmp"; then
+            mv -f "$tmp" "$file"; chmod 600 "$file"
+        else
+            rm -f "$tmp"; return 1
+        fi
+    ) 9>"$lock"
+}
+
+# ---------------------------------------------------------------------------
+# --verify-only : check that every artifact referenced by the manifest is
+# actually reachable in the live repo and matches its published checksum.
+# Run this BEFORE cutting a release. Requires no root, makes no changes.
+# ---------------------------------------------------------------------------
+verify_release() {
+    log_info "Verifying live repo against manifest: ${MANIFEST_URL}"
+    load_manifest
+    [[ -n "$_manifest" ]] || die "No manifest found at ${MANIFEST_URL}."
+    local fail=0 line sum key url tmp got
+    while read -r sum key; do
+        [[ -z "$sum" || "$sum" == \#* ]] && continue
+        # Binaries live under bin/, release archives at repo root — try both.
+        for url in "${REPO_RAW}/${key}" "${REPO_RAW}/bin/${key}"; do
+            tmp="$(mktemp)"
+            if curl -fsSL -H "User-Agent: ${UA}" --max-time 30 -o "$tmp" "$url" 2>/dev/null && [[ -s "$tmp" ]]; then
+                got="$(sha256sum "$tmp" | awk '{print $1}')"
+                if [[ "$got" == "$sum" ]]; then
+                    log_success "OK   $key"
+                    rm -f "$tmp"; url=""; break
+                else
+                    log_error "HASH $key (got $got want $sum) at $url"
+                    fail=1; rm -f "$tmp"; url=""; break
+                fi
+            fi
+            rm -f "$tmp"
+        done
+        [[ -n "$url" ]] && { log_error "MISS $key (not reachable in repo)"; fail=1; }
+    done < "$_manifest"
+    rm -f "$_manifest"; _manifest=""
+    [[ "$fail" -eq 0 ]] && log_success "Release verification PASSED." \
+        || die "Release verification FAILED — do not publish."
+}
+
+# ===========================================================================
+# INSTALL STEPS
+# ===========================================================================
 setup_hosts() {
     log_info "Setting up hostname and hosts file..."
-    localip=$(hostname -I | cut -d ' ' -f1)
-    public_ip=$(curl -s -H "User-Agent: AutoScriptX-Deployment" --max-time 5 https://api.ipify.org || curl -s -H "User-Agent: AutoScriptX-Deployment" --max-time 5 ifconfig.me)
-    hostname=$(hostname)
-    domain_from_etc=$(grep -w "$hostname" /etc/hosts | awk '{print $2}')
-    [ "$hostname" != "$domain_from_etc" ] && echo "$localip $hostname" >> /etc/hosts
+    localip="$(hostname -I | awk '{print $1}')"
+    public_ip="$(curl -fsSL -H "User-Agent: ${UA}" --max-time 5 https://api.ipify.org \
+        || curl -fsSL -H "User-Agent: ${UA}" --max-time 5 https://ifconfig.me || true)"
+    [[ -n "$public_ip" ]] || public_ip="$localip"
+    hostname_v="$(hostname)"
+    if ! grep -qE "[[:space:]]${hostname_v}(\$|[[:space:]])" /etc/hosts; then
+        printf '%s %s\n' "$localip" "$hostname_v" >> /etc/hosts
+    fi
     log_success "Hostname and hosts file configured."
 }
 
-# Setup domain configuration
 setup_domain() {
-    mkdir -p /etc/AutoScriptX
-    clear
+    mkdir -p "$ASX_DIR"; clear
     echo "---------------------------"
     echo "      VPS DOMAIN SETUP     "
     echo "---------------------------"
     domain=""
-    if [ -t 0 ]; then
-        read -rp "Enter Your Domain (leave blank for IP): " domain
-    else
-        read -rp "Enter Your Domain (leave blank for IP): " domain </dev/tty || true
-    fi
-    domain=$(echo "$domain" | tr -d ' ')
+    if [[ -t 0 ]]; then read -rp "Enter Your Domain (leave blank for IP): " domain
+    else read -rp "Enter Your Domain (leave blank for IP): " domain </dev/tty || true; fi
+    domain="$(printf '%s' "$domain" | tr -d '[:space:]')"
     clear
     if [[ -z "$domain" ]]; then
         domain="${public_ip:-$localip}"
         log_info "No domain entered. Using IP: $domain"
+    elif ! validate_domain "$domain"; then
+        die "Invalid domain '$domain' (allowed: letters, digits, dot, hyphen)."
     fi
-    if echo "$domain" > /etc/AutoScriptX/domain; then
-        log_success "Domain saved."
-    else
-        log_error "Failed to save domain."
-        exit 1
-    fi
+    printf '%s\n' "$domain" | atomic_write "${ASX_DIR}/domain"
+    log_success "Domain saved."
 }
 
-# Update system packages
 update_system() {
     log_info "Updating system..."
-    apt update -y > /dev/null 2>&1 && apt dist-upgrade -y > /dev/null 2>&1
-    if [[ $? -ne 0 ]]; then
-        log_error "System update failed."
-        exit 1
-    fi
-    apt-get purge -y ufw firewalld exim4 samba* apache2* bind9* sendmail* unscd > /dev/null 2>&1 || log_warning "Some packages could not be purged."
-    apt autoremove -y > /dev/null 2>&1 && apt autoclean -y > /dev/null 2>&1
+    apt-get update -y >/dev/null 2>&1 || die "apt update failed."
+    apt-get dist-upgrade -y >/dev/null 2>&1 || die "dist-upgrade failed."
+    apt-get purge -y ufw firewalld exim4 'samba*' 'apache2*' 'bind9*' 'sendmail*' unscd \
+        >/dev/null 2>&1 || log_warning "Some packages could not be purged."
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    apt-get autoclean -y  >/dev/null 2>&1 || true
     log_success "System updated."
 }
 
-# Install required packages
 install_packages() {
     log_info "Installing packages..."
-    apt install -y \
-      netfilter-persistent iptables-persistent screen curl jq bzip2 gzip vnstat coreutils rsyslog \
-      zip unzip net-tools nano lsof shc gnupg dos2unix dirmngr bc \
-      stunnel4 nginx dropbear socat xz-utils fail2ban squid > /dev/null 2>&1
-    if [[ $? -ne 0 ]]; then
-        log_error "Failed to install one or more packages."
-        exit 1
-    fi
+    apt-get install -y \
+        netfilter-persistent iptables-persistent screen curl jq bzip2 gzip vnstat coreutils rsyslog \
+        zip unzip net-tools nano lsof shc gnupg dos2unix dirmngr bc \
+        stunnel4 nginx dropbear socat xz-utils fail2ban squid ca-certificates \
+        >/dev/null 2>&1 || die "Failed to install one or more packages."
     log_success "Packages installed."
 }
 
-# Setup Squid proxy
 configure_squid() {
     log_info "Setting up Squid proxy..."
-    wget -qO /etc/squid/squid.conf "$BASE_URL/config/squid.conf" || log_error "Failed to download squid.conf."
-    sed -i "s/IP/$public_ip/g" /etc/squid/squid.conf
+    fetch "$BASE_URL/config/squid.conf" /etc/squid/squid.conf || die "Failed to download squid.conf."
+    local esc; esc="$(printf '%s' "$public_ip" | sed 's/[&/\]/\\&/g')"
+    sed -i "s|__PUBLIC_IP__|${esc}|g; s|\bIP\b|${esc}|g" /etc/squid/squid.conf
     chmod 644 /etc/squid/squid.conf
-    systemctl daemon-reload > /dev/null 2>&1
-    systemctl enable squid > /dev/null 2>&1
-    systemctl restart squid > /dev/null 2>&1 || log_error "Failed to restart Squid."
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable squid  >/dev/null 2>&1 || true
+    systemctl restart squid >/dev/null 2>&1 || log_error "Failed to restart Squid."
     log_success "Squid proxy set up."
 }
 
-# Install gum tool
 install_gum() {
     log_info "Installing gum..."
-    wget -qO- https://github.com/charmbracelet/gum/releases/download/v0.16.2/gum_0.16.2_Linux_x86_64.tar.gz | \
-      tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/gum'
-    if [[ -f /usr/local/bin/gum ]]; then
-        chmod +x /usr/local/bin/gum
-        log_success "gum installed."
-    else
-        log_error "Failed to install gum."
-        exit 1
-    fi
+    local ver="0.16.2" tgz
+    tgz="$(mktemp)"
+    fetch "https://github.com/charmbracelet/gum/releases/download/v${ver}/gum_${ver}_Linux_x86_64.tar.gz" "$tgz" \
+        || die "Failed to download gum."
+    verify_file "$tgz" "gum_${ver}_Linux_x86_64.tar.gz"
+    tar -xzf "$tgz" -C /usr/local/bin --strip-components=1 --wildcards '*/gum'
+    rm -f "$tgz"
+    [[ -f /usr/local/bin/gum ]] || die "Failed to install gum."
+    chmod +x /usr/local/bin/gum
+    log_success "gum installed."
 }
 
-# Disable IPv6
 disable_ipv6() {
     log_info "Disabling IPv6..."
-    echo "net.ipv6.conf.all.disable_ipv6 = 1"     >> /etc/sysctl.d/99-disable-ipv6.conf
-    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.d/99-disable-ipv6.conf
-    sysctl --system > /dev/null 2>&1 || log_warning "Failed to reload sysctl settings."
+    cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+    sysctl --system >/dev/null 2>&1 || log_warning "Failed to reload sysctl."
     log_success "IPv6 disabled."
 }
 
-# Configure Dropbear SSH
 configure_dropbear() {
     log_info "Configuring Dropbear..."
-    wget -qO /etc/default/dropbear "$BASE_URL/config/dropbear.conf" || log_error "Failed to download dropbear.conf."
+    fetch "$BASE_URL/config/dropbear.conf" /etc/default/dropbear || die "Failed to download dropbear.conf."
     chmod 644 /etc/default/dropbear
-    wget -qO /etc/AutoScriptX/banner "$BASE_URL/config/banner.conf" || log_warning "Failed to download Dropbear banner."
-    chmod 644 /etc/AutoScriptX/banner
-    echo -e "/bin/false\n/usr/sbin/nologin" >> /etc/shells
-    systemctl daemon-reload > /dev/null 2>&1
-    systemctl enable dropbear > /dev/null 2>&1
-    systemctl restart dropbear > /dev/null 2>&1 || log_warning "Failed to restart Dropbear."
+    mkdir -p "$ASX_DIR"
+    fetch "$BASE_URL/config/banner.conf" "${ASX_DIR}/banner" || log_warning "Failed to download banner."
+    chmod 644 "${ASX_DIR}/banner" 2>/dev/null || true
+    grep -qxF '/bin/false'        /etc/shells || echo '/bin/false'        >> /etc/shells
+    grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable dropbear  >/dev/null 2>&1 || true
+    systemctl restart dropbear >/dev/null 2>&1 || log_warning "Failed to restart Dropbear."
     log_success "Dropbear configured."
 }
 
-# Setup WebSocket service
 setup_websocket_service() {
     log_info "Setting up SSH-WebSocket service..."
-    systemctl stop ws-proxy.service > /dev/null 2>&1 || true
+    systemctl stop ws-proxy.service >/dev/null 2>&1 || true
     rm -f /usr/local/bin/ws-proxy
-    wget -qO /usr/local/bin/ws-proxy "$BASE_URL/bin/ws-proxy" && chmod +x /usr/local/bin/ws-proxy || log_warning "Failed to install websocket proxy."
-    wget -qO /etc/systemd/system/ws-proxy.service "$BASE_URL/service/systemd/ws-proxy.service" && chmod +x /etc/systemd/system/ws-proxy.service || log_warning "Failed to install websocket proxy service."
-
-    # Pre-create the 101 response file with the correct CRLF default so
-    # ws-proxy has a valid file on first start, and edit_response() always
-    # has a file to display and edit.
-    mkdir -p /etc/AutoScriptX
-    if [[ ! -s /etc/AutoScriptX/response ]]; then
+    fetch_verified "$BASE_URL/bin/ws-proxy" /usr/local/bin/ws-proxy "ws-proxy"
+    chmod 0755 /usr/local/bin/ws-proxy
+    fetch "$BASE_URL/service/systemd/ws-proxy.service" /etc/systemd/system/ws-proxy.service \
+        || log_warning "Failed to install ws-proxy service unit."
+    chmod 644 /etc/systemd/system/ws-proxy.service 2>/dev/null || true
+    mkdir -p "$ASX_DIR"
+    if [[ ! -s "${ASX_DIR}/response" ]]; then
         printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
-            > /etc/AutoScriptX/response
-        chmod 644 /etc/AutoScriptX/response
-        log_info "Default 101 response file created."
+            > "${ASX_DIR}/response"
+        chmod 644 "${ASX_DIR}/response"
     fi
-
-    systemctl daemon-reload > /dev/null 2>&1
-    systemctl enable ws-proxy.service > /dev/null 2>&1
-    systemctl restart ws-proxy.service > /dev/null 2>&1 || log_warning "Failed to restart ws-proxy.service."
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ws-proxy.service  >/dev/null 2>&1 || true
+    systemctl restart ws-proxy.service >/dev/null 2>&1 || log_warning "Failed to restart ws-proxy."
     log_success "SSH-WebSocket service set up."
 }
 
-# Setup SSL certificate
 setup_ssl_cert() {
     log_info "Requesting SSL cert..."
-    systemctl stop nginx > /dev/null 2>&1
-    rm -rf /root/.acme.sh
-    rm -f /etc/AutoScriptX/cert.crt /etc/AutoScriptX/cert.key
-    mkdir -p /root/.acme.sh
-    curl -s https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh || log_error "Failed to download acme.sh."
-    chmod +x /root/.acme.sh/acme.sh
-    /root/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
-    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt > /dev/null 2>&1
-    /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 > /dev/null 2>&1 || log_warning "acme.sh certificate issue failed."
-    /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /etc/AutoScriptX/cert.crt --keypath /etc/AutoScriptX/cert.key --ecc > /dev/null 2>&1 || log_warning "acme.sh certificate install failed."
-
-    if [[ ! -s /etc/AutoScriptX/cert.crt || ! -s /etc/AutoScriptX/cert.key ]]; then
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout /etc/AutoScriptX/cert.key \
-            -out  /etc/AutoScriptX/cert.crt \
-            -subj "/CN=${domain}" > /dev/null 2>&1
+    systemctl stop nginx >/dev/null 2>&1 || true
+    mkdir -p "$ASX_DIR" /root/.acme.sh
+    if [[ -s "${ASX_DIR}/cert.crt" && -s "${ASX_DIR}/cert.key" ]]; then
+        log_info "Existing certificate found — keeping it."
+    else
+        if fetch "https://get.acme.sh" /root/.acme.sh/acme.sh; then
+            chmod +x /root/.acme.sh/acme.sh
+            /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+            /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+            if validate_domain "$domain"; then
+                /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 >/dev/null 2>&1 \
+                    || log_warning "acme.sh issue failed (will fall back to self-signed)."
+                /root/.acme.sh/acme.sh --installcert -d "$domain" \
+                    --fullchainpath "${ASX_DIR}/cert.crt" --keypath "${ASX_DIR}/cert.key" --ecc \
+                    >/dev/null 2>&1 || log_warning "acme.sh install failed."
+            fi
+        else
+            log_warning "Could not fetch acme.sh — using self-signed."
+        fi
     fi
+    if [[ ! -s "${ASX_DIR}/cert.crt" || ! -s "${ASX_DIR}/cert.key" ]]; then
+        log_warning "Falling back to SELF-SIGNED certificate (clients will see an untrusted cert)."
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "${ASX_DIR}/cert.key" -out "${ASX_DIR}/cert.crt" \
+            -subj "/CN=${domain}" >/dev/null 2>&1
+    fi
+    chmod 600 "${ASX_DIR}/cert.key"; chmod 644 "${ASX_DIR}/cert.crt"
     log_success "SSL cert installed."
 }
 
-# Inject Native Xray-core with User-Agent hardened API checks
 install_xray() {
     log_info "Installing Xray-core..."
-    local latest_tag
-    latest_tag=$(curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 10 \
+    local latest_tag arch tmp_dir
+    latest_tag="$(curl -fsSL -H "User-Agent: ${UA}" --max-time 10 \
         "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
-        | jq -r '.tag_name // empty' 2>/dev/null)
-    [[ -z "$latest_tag" || "$latest_tag" == "null" ]] && latest_tag="v1.8.24"
-    local arch
+        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    [[ -n "$latest_tag" ]] || latest_tag="v1.8.24"
     case "$(uname -m)" in
         x86_64)  arch="64" ;;
         aarch64) arch="arm64-v8a" ;;
-        *)       log_error "Unsupported arch"; exit 1 ;;
+        *)       die "Unsupported arch: $(uname -m)" ;;
     esac
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    wget -q -O "${tmp_dir}/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip"
+    tmp_dir="$(mktemp -d)"
+    fetch "https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip" \
+        "${tmp_dir}/xray.zip" || die "Failed to download Xray."
+    verify_file "${tmp_dir}/xray.zip" "Xray-linux-${arch}.zip"
     unzip -qo "${tmp_dir}/xray.zip" -d "${tmp_dir}/xray"
-    mkdir -p "${XRAY_DIR}/conf"
-    install -m 755 "${tmp_dir}/xray/xray" "$XRAY_BIN"
-    cp "${tmp_dir}/xray/"*.dat "/usr/local/bin/" 2>/dev/null || true
+    mkdir -p "${XRAY_DIR}/conf" /var/log/xray
+    install -m 0755 "${tmp_dir}/xray/xray" "$XRAY_BIN"
+    cp "${tmp_dir}/xray/"*.dat /usr/local/bin/ 2>/dev/null || true
     rm -rf "$tmp_dir"
     log_success "Xray-core ${latest_tag} installed."
 }
 
-# Configure Xray Config with aligned xHTTP Host fields
 configure_xray() {
     log_info "Configuring Xray-core..."
     local uuid_vless uuid_vmess trojan_pass
-    uuid_vless=$(cat /proc/sys/kernel/random/uuid)
-    uuid_vmess=$(cat /proc/sys/kernel/random/uuid)
-    trojan_pass=$(openssl rand -hex 20)
-    cat > "${XRAY_DIR}/credentials.env" << EOF
-VLESS_UUID="${uuid_vless}"
-VMESS_UUID="${uuid_vmess}"
-TROJAN_PASS="${trojan_pass}"
-DOMAIN="${domain}"
-EOF
-    echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes" > "$CSV_DB"
+    uuid_vless="$(cat /proc/sys/kernel/random/uuid)"
+    uuid_vmess="$(cat /proc/sys/kernel/random/uuid)"
+    trojan_pass="$(openssl rand -hex 20)"
+
+    umask 077
+    jq -n --arg v "$uuid_vless" --arg m "$uuid_vmess" --arg t "$trojan_pass" --arg d "$domain" \
+        '{VLESS_UUID:$v,VMESS_UUID:$m,TROJAN_PASS:$t,DOMAIN:$d}
+         | to_entries | map("\(.key)=\"\(.value)\"") | .[]' -r \
+        | atomic_write "${XRAY_DIR}/credentials.env"
+    printf 'Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes\n' \
+        | atomic_write "$CSV_DB"
     chmod 600 "${XRAY_DIR}/credentials.env" "$CSV_DB"
 
-    cat > "${XRAY_DIR}/config.json" << XRAY_JSON
-{
-  "log": { "loglevel": "warning" },
-  "stats": {},
-  "api": {
-    "tag": "api",
-    "services": ["StatsService"]
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "statsUserUplink":   true,
-        "statsUserDownlink": true
-      }
-    },
-    "system": {
-      "statsInboundUplink":   false,
-      "statsInboundDownlink": false
-    }
-  },
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      { "type": "field", "inboundTag": ["api"],           "outboundTag": "direct"  },
-      { "type": "field", "protocol":  ["bittorrent"],     "outboundTag": "blocked" }
-    ]
-  },
-  "inbounds": [
+    # config.json built with jq → $domain/uuids inserted as JSON DATA
+    # (no heredoc interpolation → no JSON-injection through the domain).
+    jq -n \
+      --arg vless "$uuid_vless" --arg vmess "$uuid_vmess" --arg trojan "$trojan_pass" \
+      --arg domain "$domain" \
+      --argjson p_api  "$PORT_XRAY_API" \
+      --argjson p_vw   "$PORT_VLESS_WS"    --argjson p_mw "$PORT_VMESS_WS" \
+      --argjson p_tw   "$PORT_TROJAN_WS" \
+      --argjson p_vx   "$PORT_VLESS_XHTTP"  --argjson p_mx "$PORT_VMESS_XHTTP" '
     {
-      "tag": "api",
-      "listen": "127.0.0.1",
-      "port": ${PORT_XRAY_API},
-      "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1" }
-    },
-    {
-      "tag": "vless-ws",
-      "listen": "127.0.0.1",
-      "port": ${PORT_VLESS_WS},
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }],
-        "decryption": "none"
+      log: { loglevel:"warning", access:"/var/log/xray/access.log", error:"/var/log/xray/error.log" },
+      stats: {},
+      api: { tag:"api", services:["StatsService"] },
+      policy: {
+        levels: { "0": { statsUserUplink:true, statsUserDownlink:true } },
+        system: { statsInboundUplink:false, statsInboundDownlink:false }
       },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "/vless-ws" }
-      }
-    },
-    {
-      "tag": "vmess-ws",
-      "listen": "127.0.0.1",
-      "port": ${PORT_VMESS_WS},
-      "protocol": "vmess",
-      "settings": {
-        "clients": [{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "/vmess-ws" }
-      }
-    },
-    {
-      "tag": "trojan-ws",
-      "listen": "127.0.0.1",
-      "port": ${PORT_TROJAN_WS},
-      "protocol": "trojan",
-      "settings": {
-        "clients": [{ "password": "${trojan_pass}", "email": "admin_trojan" }]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "/trojan-ws" }
-      }
-    },
-    {
-      "tag": "vless-xhttp",
-      "listen": "127.0.0.1",
-      "port": ${PORT_VLESS_XHTTP},
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "${uuid_vless}", "flow": "", "email": "admin_vless" }],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "path": "/vless-xhttp",
-          "host": "${domain}"
-        }
-      }
-    },
-    {
-      "tag": "vmess-xhttp",
-      "listen": "127.0.0.1",
-      "port": ${PORT_VMESS_XHTTP},
-      "protocol": "vmess",
-      "settings": {
-        "clients": [{ "id": "${uuid_vmess}", "alterId": 0, "email": "admin_vmess" }]
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "path": "/vmess-xhttp",
-          "host": "${domain}"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "tag": "direct",  "protocol": "freedom"  },
-    { "tag": "blocked", "protocol": "blackhole" }
-  ]
-}
-XRAY_JSON
+      routing: { domainStrategy:"AsIs", rules: [
+        { type:"field", inboundTag:["api"], outboundTag:"direct" },
+        { type:"field", protocol:["bittorrent"], outboundTag:"blocked" }
+      ]},
+      inbounds: [
+        { tag:"api", listen:"127.0.0.1", port:$p_api, protocol:"dokodemo-door",
+          settings:{ address:"127.0.0.1" } },
+        { tag:"vless-ws", listen:"127.0.0.1", port:$p_vw, protocol:"vless",
+          settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vless-ws" } } },
+        { tag:"vmess-ws", listen:"127.0.0.1", port:$p_mw, protocol:"vmess",
+          settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vmess-ws" } } },
+        { tag:"trojan-ws", listen:"127.0.0.1", port:$p_tw, protocol:"trojan",
+          settings:{ clients:[{password:$trojan,email:"admin_trojan"}] },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/trojan-ws" } } },
+        { tag:"vless-xhttp", listen:"127.0.0.1", port:$p_vx, protocol:"vless",
+          settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } } },
+        { tag:"vmess-xhttp", listen:"127.0.0.1", port:$p_mx, protocol:"vmess",
+          settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } } }
+      ],
+      outbounds: [ { tag:"direct", protocol:"freedom" }, { tag:"blocked", protocol:"blackhole" } ]
+    }' | atomic_write "${XRAY_DIR}/config.json"
+    chmod 600 "${XRAY_DIR}/config.json"
 
-    if ! jq empty "${XRAY_DIR}/config.json" > /dev/null 2>&1; then
-        log_error "config.json failed JSON validation — aborting Xray setup."
-        exit 1
-    fi
+    jq empty "${XRAY_DIR}/config.json" >/dev/null 2>&1 || die "config.json failed JSON validation."
     log_success "config.json passed JSON validation."
 
-    cat > /etc/systemd/system/xray.service << 'SERVICE'
+    cat > /etc/systemd/system/xray.service <<'SERVICE'
 [Unit]
 Description=Xray Service
 After=network.target
@@ -389,228 +447,158 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 SERVICE
 
-    systemctl daemon-reload  > /dev/null 2>&1
-    systemctl enable xray    > /dev/null 2>&1
-    systemctl restart xray   > /dev/null 2>&1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable xray   >/dev/null 2>&1 || true
+    systemctl restart xray  >/dev/null 2>&1 || log_warning "Xray restart failed."
     log_success "Xray-core configured (WS + xHTTP inbounds active)."
 }
 
-# Configure Nginx Locations
-configure_nginx() {
-    log_info "Setting up Nginx..."
-    rm -f /etc/nginx/{sites-available/default,sites-enabled/default,conf.d/default.conf}
-    mkdir -p /home/vps/public_html
-    mkdir -p /etc/systemd/system/nginx.service.d
-
-    cat > /etc/nginx/xray-locations.conf << 'NGINXLOC'
-# ── WebSocket (TLS) ──────────────────────────────────────────────────────────
+_write_xray_locations() {
+    cat > /etc/nginx/xray-locations.conf <<'NGINXLOC'
 location /vless-ws {
-    proxy_pass         http://127.0.0.1:10001;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:10001; proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host; proxy_read_timeout 86400s;
 }
 location /vmess-ws {
-    proxy_pass         http://127.0.0.1:10002;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:10002; proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host; proxy_read_timeout 86400s;
 }
 location /trojan-ws {
-    proxy_pass         http://127.0.0.1:10003;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:10003; proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host; proxy_read_timeout 86400s;
 }
-# ── xHTTP (TLS + Plain) ──────────────────────────────────────────────────────
 location /vless-xhttp {
-    proxy_pass                 http://127.0.0.1:10004;
-    proxy_http_version         1.1;
-    proxy_set_header           Host              $host;
-    proxy_set_header           X-Real-IP         $remote_addr;
-    proxy_set_header           X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_buffering            off;
-    proxy_cache                off;
-    proxy_request_buffering    off;
-    proxy_read_timeout         86400s;
-    client_max_body_size       0;
+    proxy_pass http://127.0.0.1:10004; proxy_http_version 1.1;
+    proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off; proxy_cache off; proxy_request_buffering off;
+    proxy_read_timeout 86400s; client_max_body_size 0;
 }
 location /vmess-xhttp {
-    proxy_pass                 http://127.0.0.1:10005;
-    proxy_http_version         1.1;
-    proxy_set_header           Host              $host;
-    proxy_set_header           X-Real-IP         $remote_addr;
-    proxy_set_header           X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_buffering            off;
-    proxy_cache                off;
-    proxy_request_buffering    off;
-    proxy_read_timeout         86400s;
-    client_max_body_size       0;
+    proxy_pass http://127.0.0.1:10005; proxy_http_version 1.1;
+    proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off; proxy_cache off; proxy_request_buffering off;
+    proxy_read_timeout 86400s; client_max_body_size 0;
 }
 NGINXLOC
+}
 
-    cat > /etc/nginx/conf.d/xhttp-port80.conf << EOF
-# =============================================================================
-# AutoScriptX — xHTTP Plain Transport (Port 80, Non-TLS)
-# Generated by install.sh v4.1.0  |  DO NOT EDIT MANUALLY
-# =============================================================================
+_write_xhttp_port80() {
+    local dom="$1"
+    validate_domain "$dom" || dom="localhost"
+    cat > /etc/nginx/conf.d/xhttp-port80.conf <<EOF
 server {
     listen      80;
-    server_name ${domain};
-
-    # ── xHTTP VLESS (no TLS) ─────────────────────────────────────────────────
+    server_name ${dom};
     location /vless-xhttp {
         proxy_pass                 http://127.0.0.1:${PORT_VLESS_XHTTP};
         proxy_http_version         1.1;
         proxy_set_header           Host              \$host;
         proxy_set_header           X-Real-IP         \$remote_addr;
         proxy_set_header           X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_buffering            off;
-        proxy_cache                off;
-        proxy_request_buffering    off;
-        proxy_read_timeout         86400s;
-        client_max_body_size       0;
+        proxy_buffering off; proxy_cache off; proxy_request_buffering off;
+        proxy_read_timeout 86400s; client_max_body_size 0;
     }
-    # ── xHTTP VMESS (no TLS) ─────────────────────────────────────────────────
     location /vmess-xhttp {
         proxy_pass                 http://127.0.0.1:${PORT_VMESS_XHTTP};
         proxy_http_version         1.1;
         proxy_set_header           Host              \$host;
         proxy_set_header           X-Real-IP         \$remote_addr;
         proxy_set_header           X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_buffering            off;
-        proxy_cache                off;
-        proxy_request_buffering    off;
-        proxy_read_timeout         86400s;
-        client_max_body_size       0;
+        proxy_buffering off; proxy_cache off; proxy_request_buffering off;
+        proxy_read_timeout 86400s; client_max_body_size 0;
     }
-    # Fallback: block all other plain-HTTP requests
-    location / {
-        return 444;
-    }
+    location / { return 444; }
 }
 EOF
+}
 
-    local files=(
-        "nginx.conf:/etc/nginx/nginx.conf"
-        "reverse-proxy.conf:/etc/nginx/conf.d/reverse-proxy.conf"
-        "real_ip_sources.conf:/etc/nginx/conf.d/real_ip_sources.conf"
-    )
-    for f in "${files[@]}"; do
-        local name path
-        name="${f%%:*}"
-        path="${f##*:}"
-        wget -qO "$path" "$BASE_URL/config/$name" || log_error "Failed to download $name."
+configure_nginx() {
+    log_info "Setting up Nginx..."
+    rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default \
+          /etc/nginx/conf.d/default.conf
+    mkdir -p /home/vps/public_html /etc/systemd/system/nginx.service.d
+    _write_xray_locations
+    _write_xhttp_port80 "$domain"
+
+    local f name path esc_dom
+    esc_dom="$(printf '%s' "$domain" | sed 's/[&/\]/\\&/g')"
+    for f in "nginx.conf:/etc/nginx/nginx.conf" \
+             "reverse-proxy.conf:/etc/nginx/conf.d/reverse-proxy.conf" \
+             "real_ip_sources.conf:/etc/nginx/conf.d/real_ip_sources.conf"; do
+        name="${f%%:*}"; path="${f##*:}"
+        fetch "$BASE_URL/config/$name" "$path" || die "Failed to download $name."
         sed -i '/listen \[::\]/d' "$path"
         if [[ "$name" == "reverse-proxy.conf" ]]; then
-            sed -i "s/server_name _;/server_name ${domain};/" "$path"
+            sed -i "s|server_name _;|server_name ${esc_dom};|" "$path"
             sed -i 's|location / {|include /etc/nginx/xray-locations.conf;\n    location / {|g' "$path"
         fi
     done
 
-    nginx -t > /dev/null 2>&1 || log_warning "Nginx config test failed — check /etc/nginx/ manually."
-    systemctl daemon-reload > /dev/null 2>&1
-    systemctl enable nginx  > /dev/null 2>&1
-    systemctl restart nginx > /dev/null 2>&1 || log_error "Failed to restart Nginx."
-    log_success "Nginx set up (WS TLS-443 + xHTTP TLS-443 + xHTTP Plain-80)."
+    if nginx -t >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable nginx  >/dev/null 2>&1 || true
+        systemctl restart nginx >/dev/null 2>&1 || die "Failed to restart Nginx."
+        log_success "Nginx set up (WS TLS-443 + xHTTP TLS-443 + xHTTP Plain-80)."
+    else
+        die "Nginx config test FAILED — not restarting. Inspect /etc/nginx/."
+    fi
 }
 
-# Setup BadVPN
 setup_badvpn() {
     log_info "Setting up BadVPN..."
-    for port in 7200 7300; do
-        systemctl stop badvpn-udpgw@${port}.service > /dev/null 2>&1 || true
-    done
-    pkill -f badvpn-udpgw || true
+    local port
+    for port in 7200 7300; do systemctl stop "badvpn-udpgw@${port}.service" >/dev/null 2>&1 || true; done
+    pkill -f badvpn-udpgw 2>/dev/null || true
     rm -f /usr/bin/badvpn-udpgw
-    wget -qO /usr/bin/badvpn-udpgw "$BASE_URL/bin/badvpn-udpgw" || log_error "Failed to download BadVPN."
+    fetch_verified "$BASE_URL/bin/badvpn-udpgw" /usr/bin/badvpn-udpgw "badvpn-udpgw"
     chmod +x /usr/bin/badvpn-udpgw
-    wget -qO /etc/systemd/system/badvpn-udpgw@.service "$BASE_URL/service/systemd/badvpn-udpgw@.service" || log_error "Failed to download badvpn-udpgw@.service."
+    fetch "$BASE_URL/service/systemd/badvpn-udpgw@.service" /etc/systemd/system/badvpn-udpgw@.service \
+        || die "Failed to download badvpn service unit."
     for port in 7200 7300; do
-        systemctl enable --now badvpn-udpgw@${port}.service > /dev/null 2>&1 || log_warning "Failed to start badvpn-udpgw@${port}.service."
+        systemctl enable --now "badvpn-udpgw@${port}.service" >/dev/null 2>&1 \
+            || log_warning "Failed to start badvpn-udpgw@${port}."
     done
     log_success "BadVPN set up."
 }
 
-# Configure Stunnel
 configure_stunnel() {
     log_info "Configuring Stunnel..."
-    wget -qO /etc/stunnel/stunnel.conf "$BASE_URL/config/stunnel.conf" || log_error "Failed to download stunnel.conf."
+    fetch "$BASE_URL/config/stunnel.conf" /etc/stunnel/stunnel.conf || die "Failed to download stunnel.conf."
     openssl req -x509 -nodes -days 1095 -newkey rsa:2048 \
-        -keyout /etc/stunnel/key.pem \
-        -out    /etc/stunnel/cert.pem \
-        -subj "/C=IN/ST=Maharashtra/L=Mumbai/O=none/OU=none/CN=none/emailAddress=none" \
-        > /dev/null 2>&1 || log_error "Failed to generate stunnel certificate."
-    cat /etc/stunnel/{key.pem,cert.pem} > /etc/stunnel/stunnel.pem
+        -keyout /etc/stunnel/key.pem -out /etc/stunnel/cert.pem \
+        -subj "/C=IN/ST=NA/L=NA/O=none/OU=none/CN=none" >/dev/null 2>&1 \
+        || die "Failed to generate stunnel certificate."
+    cat /etc/stunnel/key.pem /etc/stunnel/cert.pem > /etc/stunnel/stunnel.pem
+    chmod 600 /etc/stunnel/key.pem /etc/stunnel/stunnel.pem
     sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
-    systemctl enable stunnel4 > /dev/null 2>&1
-    systemctl restart stunnel4 > /dev/null 2>&1 || log_warning "Failed to restart stunnel4."
+    systemctl enable stunnel4  >/dev/null 2>&1 || true
+    systemctl restart stunnel4 >/dev/null 2>&1 || log_warning "Failed to restart stunnel4."
     log_success "Stunnel configured."
 }
 
-# Configure SSHGuard
 configure_fail2ban() {
     log_info "Configuring fail2ban..."
-
-    # ── Write jail.local ──────────────────────────────────────────────────────
-    cat > /etc/fail2ban/jail.local << 'F2B_JAIL'
+    cat > /etc/fail2ban/jail.local <<'F2B_JAIL'
 [DEFAULT]
-# ── CDN / trusted range whitelist ────────────────────────────────────────────
-# Prevents Cloudflare, CloudFront, and Fastly edge nodes from being banned
-# when their probes or health-checks produce auth/log noise.
 ignoreip = 127.0.0.1/8 ::1
-           # Cloudflare
-           103.21.244.0/22
-           103.22.200.0/22
-           103.31.4.0/22
-           104.16.0.0/13
-           104.24.0.0/14
-           108.162.192.0/18
-           131.0.72.0/22
-           141.101.64.0/18
-           162.158.0.0/15
-           172.64.0.0/13
-           173.245.48.0/20
-           188.114.96.0/20
-           190.93.240.0/20
-           197.234.240.0/22
-           198.41.128.0/17
-           # Fastly
-           151.101.0.0/16
-           199.232.0.0/16
-           23.235.32.0/20
-           23.235.39.0/24
-           185.31.16.0/22
-           199.27.72.0/21
-           # CloudFront (major ranges)
-           13.32.0.0/15
-           13.35.0.0/16
-           52.84.0.0/15
-           54.182.0.0/16
-           54.192.0.0/16
-           54.230.0.0/16
-           54.239.128.0/18
-           54.239.192.0/19
-           99.84.0.0/16
-           204.246.164.0/22
-           204.246.168.0/22
-           204.246.174.0/23
-           204.246.176.0/20
-           205.251.192.0/19
-
+           103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 104.16.0.0/13
+           104.24.0.0/14 108.162.192.0/18 131.0.72.0/22 141.101.64.0/18
+           162.158.0.0/15 172.64.0.0/13 173.245.48.0/20 188.114.96.0/20
+           190.93.240.0/20 197.234.240.0/22 198.41.128.0/17
+           151.101.0.0/16 199.232.0.0/16 23.235.32.0/20 185.31.16.0/22
+           13.32.0.0/15 13.35.0.0/16 52.84.0.0/15 54.182.0.0/16
+           54.192.0.0/16 54.230.0.0/16 54.239.128.0/18 99.84.0.0/16
 bantime   = 1h
 findtime  = 10m
 maxretry  = 5
 backend   = auto
 banaction = iptables-multiport
 
-# ── SSH ───────────────────────────────────────────────────────────────────────
 [sshd]
 enabled  = true
 port     = ssh,22,443
@@ -619,7 +607,6 @@ logpath  = /var/log/auth.log
 maxretry = 3
 bantime  = 2h
 
-# ── Nginx auth failures ───────────────────────────────────────────────────────
 [nginx-http-auth]
 enabled  = true
 port     = http,https
@@ -627,7 +614,6 @@ filter   = nginx-http-auth
 logpath  = /var/log/nginx/error.log
 maxretry = 5
 
-# ── Nginx bot scanning ────────────────────────────────────────────────────────
 [nginx-botsearch]
 enabled  = true
 port     = http,https
@@ -635,31 +621,19 @@ filter   = nginx-botsearch
 logpath  = /var/log/nginx/access.log
 maxretry = 2
 bantime  = 2h
-
-# ── Nginx 4xx flood (too many bad requests) ───────────────────────────────────
-[nginx-limit-req]
-enabled  = true
-port     = http,https
-filter   = nginx-limit-req
-logpath  = /var/log/nginx/error.log
-maxretry = 10
-bantime  = 30m
 F2B_JAIL
 
-    # ── Write custom Xray auth filter ────────────────────────────────────────
-    cat > /etc/fail2ban/filter.d/xray-auth.conf << 'F2B_XRAY'
+    cat > /etc/fail2ban/filter.d/xray-auth.conf <<'F2B_XRAY'
 [Definition]
-# Matches Xray rejection messages in its log (if loglevel = warning or info)
 failregex = .*rejected.*<HOST>.*
             .*failed.*<HOST>.*
 ignoreregex =
 F2B_XRAY
 
-    # ── Add Xray jail only if Xray log exists ────────────────────────────────
-    if [[ -f /var/log/xray/access.log ]]; then
-        cat >> /etc/fail2ban/jail.local << 'F2B_XRAY_JAIL'
+    # Xray access log now always exists (configured in configure_xray) → jail is live.
+    mkdir -p /var/log/xray; : > /var/log/xray/access.log
+    cat >> /etc/fail2ban/jail.local <<'F2B_XRAY_JAIL'
 
-# ── Xray auth failures ────────────────────────────────────────────────────────
 [xray-auth]
 enabled  = true
 port     = 443,80
@@ -668,70 +642,53 @@ logpath  = /var/log/xray/access.log
 maxretry = 5
 bantime  = 1h
 F2B_XRAY_JAIL
-    fi
 
-    systemctl enable fail2ban  > /dev/null 2>&1
-    systemctl restart fail2ban > /dev/null 2>&1 || log_warning "Failed to restart fail2ban."
-    log_success "fail2ban configured (SSH + Nginx jails active, CDN ranges whitelisted)."
+    systemctl enable fail2ban  >/dev/null 2>&1 || true
+    systemctl restart fail2ban >/dev/null 2>&1 || log_warning "Failed to restart fail2ban."
+    log_success "fail2ban configured (SSH + Nginx + Xray jails, CDN whitelisted)."
 }
 
-# Apply firewall rules safely with pre-execution sanitization
 apply_firewall_rules() {
     log_info "Applying firewall rules..."
+    local s port
     local iptables_rules=(
         "get_peers" "announce_peer" "find_node" "BitTorrent"
         "BitTorrent protocol" "peer_id=" ".torrent"
         "announce.php?passkey=" "torrent" "announce" "info_hash"
     )
     for s in "${iptables_rules[@]}"; do
-        iptables -D FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1 || true
-        iptables -A FORWARD -m string --string "$s" --algo bm -j DROP
+        iptables -C FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1 \
+            || iptables -A FORWARD -m string --string "$s" --algo bm -j DROP
     done
-    iptables-save > /etc/iptables.up.rules
-    netfilter-persistent save   > /dev/null 2>&1
-    netfilter-persistent reload > /dev/null 2>&1
-
-    iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -C INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-
-    # Idempotent rules.v4 writes — each port checked before appending,
-    # regardless of whether dport 22 was already present in the file.
-    local -A rv4_ports=(
-        [22]="22"
-        [80]="80"
-        [443]="443"
-        [8080]="8080"
-    )
     for port in 22 80 443 8080; do
-        grep -qE "\-\-dport ${port}[^0-9]" /etc/iptables/rules.v4 2>/dev/null || \
-            echo "-A INPUT -p tcp -m state --state NEW -m tcp --dport ${port} -j ACCEPT" \
-            >> /etc/iptables/rules.v4
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
     done
-    netfilter-persistent save > /dev/null 2>&1 || log_warning "Failed to save iptables rules."
+    # Persist ONLY via a full-table dump — never hand-append lines.
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    cp /etc/iptables/rules.v4 /etc/iptables.up.rules
+    netfilter-persistent save   >/dev/null 2>&1 || true
+    netfilter-persistent reload >/dev/null 2>&1 || true
     log_success "Firewall rules applied."
 }
 
-# Non-destructive update engine
+# ===========================================================================
+# NON-DESTRUCTIVE UPDATE
+# ===========================================================================
 update_script() {
     log_info "Starting non-destructive AutoScriptX update..."
+    load_manifest
     local -a PROTECTED=(
-        "${XRAY_DIR}/users.csv"
-        "${XRAY_DIR}/config.json"
-        "${XRAY_DIR}/credentials.env"
-        "/etc/AutoScriptX/cert.crt"
-        "/etc/AutoScriptX/cert.key"
-        "/etc/AutoScriptX/domain"
+        "${XRAY_DIR}/users.csv" "${XRAY_DIR}/config.json" "${XRAY_DIR}/credentials.env"
+        "${ASX_DIR}/cert.crt" "${ASX_DIR}/cert.key" "${ASX_DIR}/domain"
     )
-    local snap_dir
-    snap_dir=$(mktemp -d /tmp/autoscriptx_snap_XXXXXX)
-    log_info "Snapshotting protected files → ${snap_dir}"
+    local snap_dir; snap_dir="$(mktemp -d /root/.asx_snap.XXXXXX)"; chmod 700 "$snap_dir"
+    log_info "Snapshotting protected files -> ${snap_dir}"
+    local p
     for p in "${PROTECTED[@]}"; do
-        if [[ -f "$p" ]]; then
-            cp -p "$p" "${snap_dir}/$(basename "$p")"
-            log_info "  Snapshotted: $p"
-        else
-            log_warning "  Protected file not found (will not be restored): $p"
-        fi
+        [[ -f "$p" ]] && cp -p "$p" "${snap_dir}/$(basename "$p")" \
+            || log_warning "  Not found (won't restore): $p"
     done
 
     log_info "Re-downloading helper scripts..."
@@ -740,1239 +697,604 @@ update_script() {
         [ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
         [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
+    local dir sc base
     for dir in "${!script_dirs[@]}"; do
-        for s in ${script_dirs[$dir]}; do
-            local base="${s%.sh}"
-            wget -qO "/usr/bin/${base}" "$BASE_URL/scripts/$dir/$s" > /dev/null 2>&1 || log_warning "  Failed to update $s."
-            chmod +x "/usr/bin/${base}"
+        for sc in ${script_dirs[$dir]}; do
+            base="${sc%.sh}"
+            fetch "$BASE_URL/scripts/$dir/$sc" "/usr/bin/${base}" \
+                && chmod +x "/usr/bin/${base}" || log_warning "  Failed to update $sc."
         done
     done
 
-    # Patch manage-services if upstream download succeeded
     if [[ -s /usr/bin/manage-services ]]; then
-        sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
-        sed -i 's/x-ui/xray/g'                  /usr/bin/manage-services
-        sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
-        sed -i 's/XUI Watcher/Xray Watcher/g'   /usr/bin/manage-services
-        sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
+        sed -i -e 's/x-ui\.service/xray.service/g' -e 's/x-ui/xray/g' \
+               -e 's/X-UI/Xray/g' -e 's/XUI Watcher/Xray Watcher/g' -e 's/XUI/Xray/g' \
+               /usr/bin/manage-services
     fi
-
-    # Patch create-account if upstream download succeeded.
-    # The upstream script matches inbounds by .protocol which causes the xhttp
-    # inbound client list to diverge from vless-ws/vmess-ws after a second
-    # account is created, breaking xhttp for all subsequent users.
-    # We patch it to match by .tag instead — safe regardless of upstream version.
     if [[ -s /usr/bin/create-account ]]; then
-        # Replace protocol-based matching with tag-based matching
         sed -i \
-            's/\.protocol == "vless"/(.tag | test("vless"))/g;
-             s/\.protocol == "vmess"/(.tag | test("vmess"))/g;
-             s/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
+            -e 's/\.protocol == "vless"/(.tag | test("vless"))/g' \
+            -e 's/\.protocol == "vmess"/(.tag | test("vmess"))/g' \
+            -e 's/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
             /usr/bin/create-account
         log_success "create-account patched: xhttp tag-match fix applied."
     fi
 
-    log_info "Rebuilding /usr/bin/menu (unified main menu)..."
-    _write_main_menu
-    rm -f /usr/bin/xray-menu   # remove legacy binary if present
-    log_success "Main menu updated."
+    log_info "Rebuilding /usr/bin/menu..."; _write_main_menu; rm -f /usr/bin/xray-menu
+    log_info "Rebuilding limit monitor...";  _write_limit_monitor
+    log_info "Refreshing nginx fragments..."; _write_xray_locations
 
-    log_info "Rebuilding bandwidth limit monitor..."
-    _write_limit_monitor
-    log_success "Limit monitor updated."
+    local cur_domain; cur_domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo localhost)"
+    _write_xhttp_port80 "$cur_domain"
 
-    log_info "Refreshing nginx xray-locations.conf..."
-    cat > /etc/nginx/xray-locations.conf << 'NGINXLOC'
-# ── WebSocket (TLS) ──────────────────────────────────────────────────────────
-location /vless-ws {
-    proxy_pass         http://127.0.0.1:10001;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
-}
-location /vmess-ws {
-    proxy_pass         http://127.0.0.1:10002;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
-}
-location /trojan-ws {
-    proxy_pass         http://127.0.0.1:10003;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 86400s;
-}
-# ── xHTTP (TLS + Plain) ──────────────────────────────────────────────────────
-location /vless-xhttp {
-    proxy_pass                 http://127.0.0.1:10004;
-    proxy_http_version         1.1;
-    proxy_set_header           Host              $host;
-    proxy_set_header           X-Real-IP         $remote_addr;
-    proxy_set_header           X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_buffering            off;
-    proxy_cache                off;
-    proxy_request_buffering    off;
-    proxy_read_timeout         86400s;
-    client_max_body_size       0;
-}
-location /vmess-xhttp {
-    proxy_pass                 http://127.0.0.1:10005;
-    proxy_http_version         1.1;
-    proxy_set_header           Host              $host;
-    proxy_set_header           X-Real-IP         $remote_addr;
-    proxy_set_header           X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_buffering            off;
-    proxy_cache                off;
-    proxy_request_buffering    off;
-    proxy_read_timeout         86400s;
-    client_max_body_size       0;
-}
-NGINXLOC
-
-    local cur_domain
-    cur_domain=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
-    log_info "Refreshing xhttp-port80.conf for domain: ${cur_domain}"
-    cat > /etc/nginx/conf.d/xhttp-port80.conf << EOF
-# =============================================================================
-# AutoScriptX — xHTTP Plain Transport (Port 80, Non-TLS)
-# Updated by update_script  |  DO NOT EDIT MANUALLY
-# =============================================================================
-server {
-    listen      80;
-    server_name ${cur_domain};
-
-    location /vless-xhttp {
-        proxy_pass                 http://127.0.0.1:${PORT_VLESS_XHTTP};
-        proxy_http_version         1.1;
-        proxy_set_header           Host              \$host;
-        proxy_set_header           X-Real-IP         \$remote_addr;
-        proxy_set_header           X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_buffering            off;
-        proxy_cache                off;
-        proxy_request_buffering    off;
-        proxy_read_timeout         86400s;
-        client_max_body_size       0;
-    }
-    location /vmess-xhttp {
-        proxy_pass                 http://127.0.0.1:${PORT_VMESS_XHTTP};
-        proxy_http_version         1.1;
-        proxy_set_header           Host              \$host;
-        proxy_set_header           X-Real-IP         \$remote_addr;
-        proxy_set_header           X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_buffering            off;
-        proxy_cache                off;
-        proxy_request_buffering    off;
-        proxy_read_timeout         86400s;
-        client_max_body_size       0;
-    }
-    location / {
-        return 444;
-    }
-}
-EOF
-
+    # Additive inbound patch (locked/atomic)
     if [[ -f "${XRAY_DIR}/config.json" ]]; then
-        local ex_vless_uuid ex_vmess_uuid
-        ex_vless_uuid=$(jq -r '.inbounds[] | select(.tag == "vless-ws") | .settings.clients[0].id // empty' "${XRAY_DIR}/config.json" 2>/dev/null)
-        ex_vmess_uuid=$(jq -r '.inbounds[] | select(.tag == "vmess-ws") | .settings.clients[0].id // empty' "${XRAY_DIR}/config.json" 2>/dev/null)
-
-        if [[ -n "$ex_vless_uuid" ]] && ! jq -e '.inbounds[] | select(.tag == "vless-xhttp")' "${XRAY_DIR}/config.json" > /dev/null 2>&1; then
-            log_info "Appending vless-xhttp inbound to config.json..."
-            jq --arg uuid  "$ex_vless_uuid" \
-               --arg domain "$cur_domain" \
-               --argjson port "${PORT_VLESS_XHTTP}" \
-               '.inbounds += [{
-                 "tag": "vless-xhttp",
-                 "listen": "127.0.0.1",
-                 "port": $port,
-                 "protocol": "vless",
-                 "settings": {
-                   "clients": [{"id": $uuid, "flow": "", "email": "admin_vless"}],
-                   "decryption": "none"
-                 },
-                 "streamSettings": {
-                   "network": "xhttp",
-                   "xhttpSettings": {"path": "/vless-xhttp", "host": $domain}
-                 }
-               }]' "${XRAY_DIR}/config.json" > /tmp/xray_patch.json \
-            && mv /tmp/xray_patch.json "${XRAY_DIR}/config.json" \
-            && log_success "  vless-xhttp inbound added." || log_warning "  Failed to patch vless-xhttp inbound."
-        else
-            log_info "  vless-xhttp inbound already present — skipping."
+        local ex_vless ex_vmess
+        ex_vless="$(jq -r '.inbounds[]|select(.tag=="vless-ws")|.settings.clients[0].id // empty' "${XRAY_DIR}/config.json" 2>/dev/null || true)"
+        ex_vmess="$(jq -r '.inbounds[]|select(.tag=="vmess-ws")|.settings.clients[0].id // empty' "${XRAY_DIR}/config.json" 2>/dev/null || true)"
+        if [[ -n "$ex_vless" ]] && ! jq -e '.inbounds[]|select(.tag=="vless-xhttp")' "${XRAY_DIR}/config.json" >/dev/null 2>&1; then
+            json_edit "${XRAY_DIR}/config.json" "$CFG_LOCK" \
+              --arg uuid "$ex_vless" --arg domain "$cur_domain" --argjson port "$PORT_VLESS_XHTTP" \
+              '.inbounds += [{tag:"vless-xhttp",listen:"127.0.0.1",port:$port,protocol:"vless",
+                settings:{clients:[{id:$uuid,flow:"",email:"admin_vless"}],decryption:"none"},
+                streamSettings:{network:"xhttp",xhttpSettings:{path:"/vless-xhttp",host:$domain}}}]' \
+              && log_success "  vless-xhttp inbound added."
         fi
-
-        if [[ -n "$ex_vmess_uuid" ]] && ! jq -e '.inbounds[] | select(.tag == "vmess-xhttp")' "${XRAY_DIR}/config.json" > /dev/null 2>&1; then
-            log_info "Appending vmess-xhttp inbound to config.json..."
-            jq --arg uuid  "$ex_vmess_uuid" \
-               --arg domain "$cur_domain" \
-               --argjson port "${PORT_VMESS_XHTTP}" \
-               '.inbounds += [{
-                 "tag": "vmess-xhttp",
-                 "listen": "127.0.0.1",
-                 "port": $port,
-                 "protocol": "vmess",
-                 "settings": {
-                   "clients": [{"id": $uuid, "alterId": 0, "email": "admin_vmess"}]
-                 },
-                 "streamSettings": {
-                   "network": "xhttp",
-                   "xhttpSettings": {"path": "/vmess-xhttp", "host": $domain}
-                 }
-               }]' "${XRAY_DIR}/config.json" > /tmp/xray_patch.json \
-            && mv /tmp/xray_patch.json "${XRAY_DIR}/config.json" \
-            && log_success "  vmess-xhttp inbound added." || log_warning "  Failed to patch vmess-xhttp inbound."
-        else
-            log_info "  vmess-xhttp inbound already present — skipping."
+        if [[ -n "$ex_vmess" ]] && ! jq -e '.inbounds[]|select(.tag=="vmess-xhttp")' "${XRAY_DIR}/config.json" >/dev/null 2>&1; then
+            json_edit "${XRAY_DIR}/config.json" "$CFG_LOCK" \
+              --arg uuid "$ex_vmess" --arg domain "$cur_domain" --argjson port "$PORT_VMESS_XHTTP" \
+              '.inbounds += [{tag:"vmess-xhttp",listen:"127.0.0.1",port:$port,protocol:"vmess",
+                settings:{clients:[{id:$uuid,alterId:0,email:"admin_vmess"}]},
+                streamSettings:{network:"xhttp",xhttpSettings:{path:"/vmess-xhttp",host:$domain}}}]' \
+              && log_success "  vmess-xhttp inbound added."
         fi
-        chmod 600 "${XRAY_DIR}/config.json"
-    else
-        log_warning "config.json not found — skipping Xray inbound patch."
     fi
 
-    log_info "Restoring all protected files from snapshot..."
+    log_info "Restoring protected files..."
     for p in "${PROTECTED[@]}"; do
-        local fname
-        fname=$(basename "$p")
-        if [[ -f "${snap_dir}/${fname}" ]]; then
-            cp -p "${snap_dir}/${fname}" "$p"
-            log_success "  Restored: $p"
-        fi
+        local fn; fn="$(basename "$p")"
+        [[ -f "${snap_dir}/${fn}" ]] && { cp -p "${snap_dir}/${fn}" "$p"; log_success "  Restored: $p"; }
     done
 
-    # ── Additive config.json migration (runs AFTER restore to preserve UUIDs) ─
-    # Adds stats/api/policy blocks and API inbound if missing from existing config.
-    # This is safe — it only adds new keys, never modifies existing client entries.
+    # Additive stats/api migration (post-restore, preserves UUIDs)
     if [[ -f "${XRAY_DIR}/config.json" ]]; then
         local cfg="${XRAY_DIR}/config.json"
-
-        if ! jq -e '.stats' "$cfg" > /dev/null 2>&1; then
-            log_info "  Migrating config.json: adding stats block..."
-            jq '. + {"stats":{}}' "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
-        fi
-
-        if ! jq -e '.api' "$cfg" > /dev/null 2>&1; then
-            log_info "  Migrating config.json: adding api block..."
-            jq '. + {"api":{"tag":"api","services":["StatsService"]}}' \
-                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
-        fi
-
-        if ! jq -e '.policy' "$cfg" > /dev/null 2>&1; then
-            log_info "  Migrating config.json: adding policy block..."
-            jq '. + {"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":false,"statsInboundDownlink":false}}}' \
-                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+        jq -e '.stats'  "$cfg" >/dev/null 2>&1 || json_edit "$cfg" "$CFG_LOCK" '. + {stats:{}}'
+        jq -e '.api'    "$cfg" >/dev/null 2>&1 || json_edit "$cfg" "$CFG_LOCK" '. + {api:{tag:"api",services:["StatsService"]}}'
+        if jq -e '.policy' "$cfg" >/dev/null 2>&1; then
+            json_edit "$cfg" "$CFG_LOCK" '.policy.system.statsInboundUplink=false | .policy.system.statsInboundDownlink=false'
         else
-            # Disable statsInbound on existing configs — it doubles Xray's memory
-            # usage for stats with no benefit since the monitor only reads user stats.
-            jq '.policy.system.statsInboundUplink = false | .policy.system.statsInboundDownlink = false' \
-                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
+            json_edit "$cfg" "$CFG_LOCK" '. + {policy:{levels:{"0":{statsUserUplink:true,statsUserDownlink:true}},system:{statsInboundUplink:false,statsInboundDownlink:false}}}'
         fi
-
-        if ! jq -e '.inbounds[] | select(.tag == "api")' "$cfg" > /dev/null 2>&1; then
-            log_info "  Migrating config.json: adding API inbound (port 10085)..."
-            jq '.inbounds = [{"tag":"api","listen":"127.0.0.1","port":10085,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}] + .inbounds' \
-                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
-        fi
-
-        if ! jq -e '.routing.rules[] | select(.inboundTag and (.inboundTag | contains(["api"])))' \
-                "$cfg" > /dev/null 2>&1; then
-            log_info "  Migrating config.json: adding API routing rule..."
-            jq '.routing.rules = [{"type":"field","inboundTag":["api"],"outboundTag":"direct"}] + .routing.rules' \
-                "$cfg" > /tmp/xp.json && mv /tmp/xp.json "$cfg"
-        fi
-
-        chmod 600 "$cfg"
-        log_success "  config.json stats API migration complete."
+        jq -e '.inbounds[]|select(.tag=="api")' "$cfg" >/dev/null 2>&1 \
+            || json_edit "$cfg" "$CFG_LOCK" '.inbounds = [{tag:"api",listen:"127.0.0.1",port:10085,protocol:"dokodemo-door",settings:{address:"127.0.0.1"}}] + .inbounds'
+        jq -e '.routing.rules[]|select(.inboundTag and (.inboundTag|contains(["api"])))' "$cfg" >/dev/null 2>&1 \
+            || json_edit "$cfg" "$CFG_LOCK" '.routing.rules = [{type:"field",inboundTag:["api"],outboundTag:"direct"}] + .routing.rules'
+        jq -e '.log.access' "$cfg" >/dev/null 2>&1 \
+            || json_edit "$cfg" "$CFG_LOCK" '.log = ((.log // {}) + {access:"/var/log/xray/access.log",error:"/var/log/xray/error.log",loglevel:"warning"})'
+        log_success "  config.json migration complete."
     fi
 
     log_info "Reloading Xray and Nginx..."
-    systemctl restart xray  > /dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
-    nginx -t > /dev/null 2>&1 && systemctl reload nginx > /dev/null 2>&1 && log_success "Nginx reloaded." || log_warning "Nginx config test failed — nginx NOT reloaded."
+    systemctl restart xray >/dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 && log_success "Nginx reloaded."
+    else log_warning "Nginx config test failed — NOT reloaded."; fi
 
-    rm -rf "$snap_dir"
-    log_success "═══════════════════════════════════════════════════"
-    log_success " Update complete.  Version 4.2.0"
-    log_success " Users, UUIDs, certs, and domain: UNTOUCHED."
-    log_success "═══════════════════════════════════════════════════"
-    read -p "Press Enter to return..."
+    rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
+    log_success "Update complete. Version 4.2.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    read -rp "Press Enter to return..." _ || true
 }
 
-# Shared helper writing /usr/bin/menu (unified main menu)
-# ─── _write_main_menu ─────────────────────────────────────────────────────────
-# Writes /usr/bin/menu as a single self-contained script covering account
-# management (SSH + all Xray protocols), service control, and system tools.
-# Called from both install_scripts (fresh install) and update_script (update).
-# Single-quoted heredoc — variables expand at runtime when menu executes.
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# MAIN MENU (written to /usr/bin/menu)
+# ===========================================================================
 _write_main_menu() {
-    cat > /usr/bin/menu << 'MAINMENU'
-#!/bin/bash
-# =============================================================================
-# AutoScriptX — Unified Main Menu  v4.2.0
-# =============================================================================
+    cat > /usr/bin/menu <<'MAINMENU'
+#!/usr/bin/env bash
+set -uo pipefail
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_API="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
+ASX_DIR="/etc/AutoScriptX"
+CSV_LOCK="/run/lock/autoscriptx-csv.lock"
+CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 
-green="\033[0;32m"
-blue="\033[0;34m"
-yellow="\033[1;33m"
-red="\033[0;31m"
-cyan="\033[0;36m"
-nc="\033[0m"
+green="\033[0;32m"; blue="\033[0;34m"; yellow="\033[1;33m"
+red="\033[0;31m"; cyan="\033[0;36m"; nc="\033[0m"
 
-# ── Header ────────────────────────────────────────────────────────────────────
-# Cache the Xray version at startup — calling the binary on every menu refresh
-# adds ~150ms of latency each time and is completely unnecessary.
+validate_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+validate_domain()   { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$ && "$1" != *".."* ]]; }
+
+json_edit() {
+    local file="$1" lock="$2"; shift 2
+    local tmp; tmp="$(mktemp "$(dirname "$file")/.jq.XXXXXX")"
+    ( flock 9
+      if jq "$@" "$file" > "$tmp"; then mv -f "$tmp" "$file"; chmod 600 "$file"
+      else rm -f "$tmp"; return 1; fi
+    ) 9>"$lock"
+}
+csv_lock()   { exec 8>"$CSV_LOCK"; flock 8; }
+csv_unlock() { flock -u 8 2>/dev/null || true; }
+
 _XRAY_VER_CACHE=""
 _get_xray_ver() {
-    if [[ -z "$_XRAY_VER_CACHE" ]]; then
-        _XRAY_VER_CACHE=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}' || echo "?")
-    fi
+    [[ -z "$_XRAY_VER_CACHE" ]] && \
+        _XRAY_VER_CACHE="$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}' || echo '?')"
     echo "$_XRAY_VER_CACHE"
 }
-
 show_header() {
     clear
     local domain uptime_str
-    domain=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "not set")
-    uptime_str=$(uptime -p 2>/dev/null || echo "?")
-    echo -e "${cyan}╔══════════════════════════════════════════════╗${nc}"
-    echo -e "${cyan}║       AutoScriptX  v4.2.0  —  Main Menu     ║${nc}"
-    echo -e "${cyan}╠══════════════════════════════════════════════╣${nc}"
-    printf  "${cyan}║${nc}  Domain  : %-33s${cyan}║${nc}\n" "$domain"
-    printf  "${cyan}║${nc}  Xray    : %-33s${cyan}║${nc}\n" "$(_get_xray_ver)"
-    printf  "${cyan}║${nc}  Uptime  : %-33s${cyan}║${nc}\n" "$uptime_str"
-    echo -e "${cyan}╚══════════════════════════════════════════════╝${nc}"
+    domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
+    uptime_str="$(uptime -p 2>/dev/null || echo '?')"
+    echo -e "${cyan}================================================${nc}"
+    echo -e "${cyan}       AutoScriptX  v4.2.0  |  Main Menu       ${nc}"
+    echo -e "${cyan}------------------------------------------------${nc}"
+    printf  "  Domain  : %s\n" "$domain"
+    printf  "  Xray    : %s\n" "$(_get_xray_ver)"
+    printf  "  Uptime  : %s\n" "$uptime_str"
+    echo -e "${cyan}================================================${nc}"
 }
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-# Format bytes into human-readable string
 fmt_bytes() {
-    local b="${1:-0}"
-    b=$(echo "$b" | tr -dc '0-9'); b=${b:-0}
-    if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2; $b/1073741824" | bc)"
-    elif [[ $b -ge 1048576    ]]; then printf "%.2f MB" "$(echo "scale=2; $b/1048576"    | bc)"
-    elif [[ $b -ge 1024       ]]; then printf "%.2f KB" "$(echo "scale=2; $b/1024"       | bc)"
-    else echo "${b} B"
-    fi
+    local b="${1:-0}"; b="$(echo "$b" | tr -dc '0-9')"; b="${b:-0}"
+    if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2;$b/1073741824"|bc)"
+    elif [[ $b -ge 1048576    ]]; then printf "%.2f MB" "$(echo "scale=2;$b/1048576"|bc)"
+    elif [[ $b -ge 1024       ]]; then printf "%.2f KB" "$(echo "scale=2;$b/1024"|bc)"
+    else echo "${b} B"; fi
 }
-
-# Migrate old 5-column CSV rows to 7-column format in place
 migrate_csv() {
-    local tmp; tmp=$(mktemp)
+    csv_lock
+    local tmp; tmp="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
     while IFS=',' read -r f1 f2 f3 f4 f5 f6 f7; do
         if [[ "$f1" == "Username" ]]; then
             echo "Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes"
         else
-            # If columns 6 or 7 are missing, default to 0
-            f6=${f6:-0}; f7=${f7:-0}
+            f6="${f6:-0}"; f7="${f7:-0}"
             echo "${f1},${f2},${f3},${f4},${f5},${f6},${f7}"
         fi
     done < "$CSV_DB" > "$tmp"
-    mv "$tmp" "$CSV_DB"
-    chmod 600 "$CSV_DB"
+    mv -f "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    csv_unlock
 }
 
-# ── Create Account ────────────────────────────────────────────────────────────
+# Single source of truth: add a client to inbounds by TAG (never protocol).
+_add_client_by_tag() {
+    local user="$1" uuid="$2" tpw="$3"
+    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg user "$user" --arg uuid "$uuid" --arg tpw "$tpw" '
+      .inbounds |= map(
+        if   (.tag|test("vless"))  and .settings.clients then .settings.clients += [{id:$uuid,flow:"",email:$user}]
+        elif (.tag|test("vmess"))  and .settings.clients then .settings.clients += [{id:$uuid,alterId:0,email:$user}]
+        elif (.tag|test("trojan")) and .settings.clients then .settings.clients += [{password:$tpw,email:$user}]
+        else . end )'
+}
+repair_xhttp_clients() {
+    [[ -f "$XRAY_CONF" ]] || return
+    json_edit "$XRAY_CONF" "$CFG_LOCK" '
+      ( .inbounds[]|select(.tag=="vless-ws")|.settings.clients ) as $v |
+      ( .inbounds[]|select(.tag=="vmess-ws")|.settings.clients ) as $m |
+      .inbounds |= map(
+        if   .tag=="vless-xhttp" then .settings.clients=$v
+        elif .tag=="vmess-xhttp" then .settings.clients=$m
+        else . end )'
+}
+
 create_account() {
     show_header
     local DOMAIN PUBLIC_IP
-    DOMAIN=$(cat /etc/AutoScriptX/domain 2>/dev/null || echo "localhost")
-    # Use local IP to avoid a blocking external HTTP call on every account creation.
-    # The public IP display is cosmetic only — local IP is always correct and instant.
-    PUBLIC_IP=$(hostname -I | awk '{print $1}')
-
+    DOMAIN="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo localhost)"
+    PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+    local u_name u_pass days limit_gb
     if command -v gum &>/dev/null; then
-        echo -e "\n# 🧑 Create SSH Account\n"
-        u_name=$(gum input --placeholder "username"  --prompt "🔵 Username: ")
-        u_pass=$(gum input --placeholder "password"  --prompt "🔑 Password: ")
-        days=$(gum input   --placeholder "30"        --prompt "📅 Expired (days): ")
-        limit_gb=$(gum input --placeholder "0 = unlimited" --prompt "🌐 Limit (GB): ")
+        u_name="$(gum input --placeholder username --prompt 'Username: ')"
+        u_pass="$(gum input --placeholder password --prompt 'Password: ')"
+        days="$(gum input --placeholder 30 --prompt 'Expired (days): ')"
+        limit_gb="$(gum input --placeholder '0=unlimited' --prompt 'Limit (GB): ')"
     else
-        echo -e "${blue}── Create Account ──────────────────────────────────────${nc}\n"
-        read -rp "  🔵 Username          : " u_name
-        read -rp "  🔑 Password          : " u_pass
-        read -rp "  📅 Expired (days)    : " days
-        read -rp "  🌐 Limit GB (0=∞)    : " limit_gb
+        read -rp "  Username          : " u_name
+        read -rp "  Password          : " u_pass
+        read -rp "  Expired (days)    : " days
+        read -rp "  Limit GB (0=inf)  : " limit_gb
     fi
-
-    [[ -z "$u_name"   ]] && { echo -e "${red}Username cannot be empty.${nc}"; sleep 2; return; }
-    [[ -z "$u_pass"   ]] && u_pass=$(openssl rand -base64 10 | tr -d '/+=')
-    days=${days:-30}
-    limit_gb=$(echo "${limit_gb:-0}" | tr -dc '0-9'); limit_gb=${limit_gb:-0}
-
-    local u_exp u_exp_fmt u_uuid u_trojan
-    u_exp=$(date -d "+${days} days" +"%Y-%m-%d")
-    u_exp_fmt=$(date -d "+${days} days" +"%B %d, %Y")
-    u_uuid=$(cat /proc/sys/kernel/random/uuid)
-    u_trojan=$(openssl rand -hex 20)
+    if ! validate_username "$u_name"; then
+        echo -e "${red}Invalid username (a-z,0-9,_,- ; must start a-z/_).${nc}"; sleep 2; return
+    fi
+    [[ -z "$u_pass" ]] && u_pass="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
+    [[ "$days" =~ ^[0-9]+$ ]] || days=30
+    limit_gb="$(echo "${limit_gb:-0}" | tr -dc '0-9')"; limit_gb="${limit_gb:-0}"
 
     if id "$u_name" &>/dev/null; then
-        echo -e "${red}  User '$u_name' already exists.${nc}"
-        read -p "  Press Enter to return..."; return
+        echo -e "${red}  User '$u_name' already exists.${nc}"; read -rp "  Enter..." _; return
     fi
-    # Heal any xhttp client list divergence caused by the old protocol-match bug
     repair_xhttp_clients
-    useradd -M -s /bin/false -e "$u_exp" "$u_name"
-    echo "${u_name}:${u_pass}" | chpasswd
 
-    # Add the new user to every inbound by TAG so that:
-    #   • vless-ws and vless-xhttp each get the user's UUID independently
-    #   • vmess-ws and vmess-xhttp each get the user's UUID independently
-    #   • trojan-ws gets the trojan password
-    # Using .tag (not .protocol) prevents the filter from accidentally matching
-    # the wrong inbound type and keeps xhttp clients in sync with ws clients.
-    jq --arg user "$u_name" --arg uuid "$u_uuid" --arg tpw "$u_trojan" '
-      .inbounds |= map(
-        if   (.tag | test("vless"))  and .settings.clients
-          then .settings.clients += [{"id": $uuid, "flow": "", "email": $user}]
-        elif (.tag | test("vmess"))  and .settings.clients
-          then .settings.clients += [{"id": $uuid, "alterId": 0, "email": $user}]
-        elif (.tag | test("trojan")) and .settings.clients
-          then .settings.clients += [{"password": $tpw, "email": $user}]
-        else . end
-      )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-    systemctl restart xray > /dev/null 2>&1
+    local u_exp u_exp_fmt u_uuid u_trojan
+    u_exp="$(date -d "+${days} days" +%Y-%m-%d)"
+    u_exp_fmt="$(date -d "+${days} days" +'%B %d, %Y')"
+    u_uuid="$(cat /proc/sys/kernel/random/uuid)"
+    u_trojan="$(openssl rand -hex 20)"
+
+    useradd -M -s /bin/false -e "$u_exp" "$u_name"
+    printf '%s:%s\n' "$u_name" "$u_pass" | chpasswd
+    _add_client_by_tag "$u_name" "$u_uuid" "$u_trojan"
+    systemctl restart xray >/dev/null 2>&1 || true
 
     migrate_csv
-    echo "${u_name},${u_pass},${u_uuid},${u_trojan},${u_exp},${limit_gb},0" >> "$CSV_DB"
+    csv_lock
+    printf '%s,%s,%s,%s,%s,%s,0\n' "$u_name" "$u_pass" "$u_uuid" "$u_trojan" "$u_exp" "$limit_gb" >> "$CSV_DB"
+    chmod 600 "$CSV_DB"
+    csv_unlock
 
-    # Build vmess links
-    local v_json v_b64 vxt_json vxt_b64 vx_json vx_b64
-    v_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-WS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-ws\",\"tls\":\"tls\"}"
-    v_b64=$(echo -n "$v_json" | base64 -w0)
-    vxt_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP-TLS\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"tls\"}"
-    vxt_b64=$(echo -n "$vxt_json" | base64 -w0)
-    vx_json="{\"v\":\"2\",\"ps\":\"${u_name}-VMESS-XHTTP\",\"add\":\"${DOMAIN}\",\"port\":\"80\",\"id\":\"${u_uuid}\",\"aid\":\"0\",\"net\":\"xhttp\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess-xhttp\",\"tls\":\"\"}"
-    vx_b64=$(echo -n "$vx_json" | base64 -w0)
+    local v_b64 vxt_b64 vx_b64
+    v_b64="$(printf '{"v":"2","ps":"%s-VMESS-WS","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess-ws","tls":"tls"}' "$u_name" "$DOMAIN" "$u_uuid" "$DOMAIN" | base64 -w0)"
+    vxt_b64="$(printf '{"v":"2","ps":"%s-VMESS-XHTTP-TLS","add":"%s","port":"443","id":"%s","aid":"0","net":"xhttp","type":"none","host":"%s","path":"/vmess-xhttp","tls":"tls"}' "$u_name" "$DOMAIN" "$u_uuid" "$DOMAIN" | base64 -w0)"
+    vx_b64="$(printf '{"v":"2","ps":"%s-VMESS-XHTTP","add":"%s","port":"80","id":"%s","aid":"0","net":"xhttp","type":"none","host":"%s","path":"/vmess-xhttp","tls":""}' "$u_name" "$DOMAIN" "$u_uuid" "$DOMAIN" | base64 -w0)"
 
-    local limit_display
-    [[ "$limit_gb" -eq 0 ]] && limit_display="Unlimited" || limit_display="${limit_gb} GB"
-
+    local limit_display; [[ "$limit_gb" -eq 0 ]] && limit_display="Unlimited" || limit_display="${limit_gb} GB"
     clear
-    echo -e "# ✅ SSH Account Created\n"
-    echo -e "🔵 ${yellow}Username${nc}    : ${green}${u_name}${nc}"
-    echo -e "🔑 ${yellow}Password${nc}    : ${green}${u_pass}${nc}"
-    echo -e "📅 ${yellow}Expires On${nc}  : ${green}${u_exp_fmt}${nc}"
-    echo -e "🌐 ${yellow}Public IP${nc}   : ${green}${PUBLIC_IP}${nc}"
-    echo -e "🐳 ${yellow}Host${nc}        : ${green}${DOMAIN}${nc}"
-    echo -e "📊 ${yellow}BW Limit${nc}    : ${green}${limit_display}${nc}"
-
-    echo -e "\n# 📦 Ports\n"
-    echo -e "• SSH WS      : ${green}80${nc}"
-    echo -e "• SSH SSL WS  : ${green}443${nc}"
-    echo -e "• SSL/TLS     : ${green}443${nc}"
-    echo -e "• SQUID       : ${green}8080${nc}"
-    echo -e "• UDPGW       : ${green}7200,7300${nc}"
-
-    echo -e "\n# ✏️  Payloads\n"
-    echo -e "${yellow}WSS Payload${nc}\n"
-    echo -e "   GET wss://example.com HTTP/1.1[crlf]"
-    echo -e "   Host: ${DOMAIN}[crlf]"
-    echo -e "   Upgrade: websocket[crlf][crlf]"
-    echo -e "\n${yellow}WS Payload${nc}\n"
-    echo -e "   GET / HTTP/1.1[crlf]"
-    echo -e "   Host: ${DOMAIN}[crlf]"
-    echo -e "   Upgrade: websocket[crlf][crlf]"
-
-    echo -e "\n# 🔐 Xray Links\n"
-    echo -e "${blue}── TLS WebSocket (Port 443) ─────────────────────────────${nc}"
-    echo -e "${yellow}VLESS-WS:${nc}"
+    echo -e "# SSH Account Created\n"
+    echo -e "Username   : ${green}${u_name}${nc}"
+    echo -e "Password   : ${green}${u_pass}${nc}"
+    echo -e "Expires On : ${green}${u_exp_fmt}${nc}"
+    echo -e "Public IP  : ${green}${PUBLIC_IP}${nc}"
+    echo -e "Host       : ${green}${DOMAIN}${nc}"
+    echo -e "BW Limit   : ${green}${limit_display}${nc}"
+    echo -e "\nPorts: SSH-WS 80 | SSL-WS/TLS 443 | Squid 8080 | UDPGW 7200,7300"
+    echo -e "\n${blue}-- TLS WebSocket (443) --${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&flow=none&type=ws&host=${DOMAIN}&path=%2Fvless-ws&security=tls&sni=${DOMAIN}#${u_name}-VLESS-WS"
-    echo ""
-    echo -e "${yellow}VMESS-WS:${nc}"
     echo "vmess://${v_b64}"
-    echo ""
-    echo -e "${yellow}TROJAN-WS:${nc}"
     echo "trojan://${u_trojan}@${DOMAIN}:443?type=ws&host=${DOMAIN}&path=%2Ftrojan-ws&security=tls&sni=${DOMAIN}#${u_name}-TROJAN-WS"
-    echo -e "\n${blue}── TLS xHTTP (Port 443) ─────────────────────────────────${nc}"
-    echo -e "${yellow}VLESS-xHTTP (TLS):${nc}"
+    echo -e "\n${blue}-- TLS xHTTP (443) --${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:443?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=tls&sni=${DOMAIN}&host=${DOMAIN}#${u_name}-VLESS-XHTTP-TLS"
-    echo ""
-    echo -e "${yellow}VMESS-xHTTP (TLS):${nc}"
     echo "vmess://${vxt_b64}"
-    echo -e "\n${blue}── Plain xHTTP (Port 80, no TLS) ────────────────────────${nc}"
-    echo -e "${yellow}VLESS-xHTTP:${nc}"
+    echo -e "\n${blue}-- Plain xHTTP (80, NO TLS - traffic is cleartext) --${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
-    echo ""
-    echo -e "${yellow}VMESS-xHTTP:${nc}"
     echo "vmess://${vx_b64}"
     echo ""
-
-    if command -v gum &>/dev/null; then
-        gum confirm "Return to menu?" && return || return
-    else
-        read -p "Press Enter to return..."
-    fi
+    read -rp "Press Enter to return..." _ || true
 }
 
-# ── Delete Account ────────────────────────────────────────────────────────────
 delete_account() {
-    show_header
-    migrate_csv
-    echo -e "${blue}── Delete Account ──────────────────────────────────────${nc}\n"
-    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
-        echo -e "  ${yellow}No accounts found.${nc}"
-        read -p "  Press Enter to return..."; return
+    show_header; migrate_csv
+    echo -e "${blue}-- Delete Account --${nc}\n"
+    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
+        echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
     fi
-    printf "  %-20s %-12s %-10s %-10s\n" "USERNAME" "EXPIRY" "LIMIT" "USED"
-    printf "  %-20s %-12s %-10s %-10s\n" "────────────────────" "──────────" "──────────" "──────────"
+    printf "  %-20s %-12s %-10s %-10s\n" USERNAME EXPIRY LIMIT USED
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
         local lstr; [[ "${limit_gb:-0}" -eq 0 ]] && lstr="Unlimited" || lstr="${limit_gb}GB"
         printf "  %-20s %-12s %-10s %-10s\n" "$name" "$exp" "$lstr" "$(fmt_bytes "${used_bytes:-0}")"
     done < "$CSV_DB"
-    echo ""
-    read -rp "  Username to delete (Enter to cancel): " u_name
+    echo ""; read -rp "  Username to delete (Enter to cancel): " u_name
     [[ -z "$u_name" ]] && return
-    if ! grep -q "^${u_name}," "$CSV_DB" 2>/dev/null; then
-        echo -e "${red}  User '${u_name}' not found.${nc}"
-        read -p "  Press Enter to return..."; return
+    validate_username "$u_name" || { echo -e "${red}  Invalid username.${nc}"; sleep 2; return; }
+    if ! grep -q "^${u_name}," "$CSV_DB"; then
+        echo -e "${red}  Not found.${nc}"; read -rp "  Enter..." _; return
     fi
-    jq --arg user "$u_name" '
-      .inbounds |= map(
-        if .settings.clients
-          then .settings.clients |= map(select(.email != $user))
-        else . end
-      )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-    systemctl restart xray > /dev/null 2>&1
+    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg user "$u_name" \
+      '.inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $user)) else . end)'
+    systemctl restart xray >/dev/null 2>&1 || true
     userdel -r "$u_name" 2>/dev/null || true
-    sed -i "/^${u_name},/d" "$CSV_DB"
-    echo -e "${green}  Account '${u_name}' deleted successfully.${nc}"
-    read -p "  Press Enter to return..."
+    csv_lock
+    local tmp; tmp="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
+    grep -v "^${u_name}," "$CSV_DB" > "$tmp" || true
+    mv -f "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    csv_unlock
+    echo -e "${green}  Account '${u_name}' deleted.${nc}"; read -rp "  Enter..." _ || true
 }
 
-# ── Repair xHTTP inbound clients (fixes installs broken by the protocol-match bug)
-# Called automatically on first list/create after upgrade. Safe to run any time.
-repair_xhttp_clients() {
-    [[ ! -f "$XRAY_CONF" ]] && return
-    local _tmp; _tmp=$(mktemp)
-
-    # For each user in the CSV, ensure their UUID exists in BOTH vless-ws AND
-    # vless-xhttp, and their vmess UUID exists in BOTH vmess-ws AND vmess-xhttp.
-    # Strategy: rebuild the clients list in xhttp inbounds from scratch using
-    # the clients already present in the corresponding ws inbound (source of truth).
-    jq '
-      # Collect all clients from vless-ws and vmess-ws — these are the ground truth
-      ( .inbounds[] | select(.tag == "vless-ws")  | .settings.clients ) as $vless_clients |
-      ( .inbounds[] | select(.tag == "vmess-ws")  | .settings.clients ) as $vmess_clients |
-      ( .inbounds[] | select(.tag == "trojan-ws") | .settings.clients ) as $trojan_clients |
-      .inbounds |= map(
-        if   .tag == "vless-xhttp"  then .settings.clients = $vless_clients
-        elif .tag == "vmess-xhttp"  then .settings.clients = $vmess_clients
-        else . end
-      )
-    ' "$XRAY_CONF" > "$_tmp" \
-    && mv "$_tmp" "$XRAY_CONF" \
-    && chmod 600 "$XRAY_CONF" \
-    || rm -f "$_tmp"
-}
-
-# ── List Accounts ─────────────────────────────────────────────────────────────
 list_accounts() {
-    show_header
-    migrate_csv
-    echo -e "${blue}── Active Accounts ─────────────────────────────────────${nc}\n"
-    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
-        echo -e "  ${yellow}No accounts found.${nc}"
-        read -p "  Press Enter to return..."; return
+    show_header; migrate_csv
+    echo -e "${blue}-- Active Accounts --${nc}\n"
+    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
+        echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
     fi
-    local today; today=$(date +%Y-%m-%d)
-    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" "USERNAME" "EXPIRY" "USED" "LIMIT" "%" "STATUS"
-    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" "────────────────" "──────────" "──────────" "──────────" "─────" "──────────"
+    local today; today="$(date +%Y-%m-%d)"
+    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" USERNAME EXPIRY USED LIMIT % STATUS
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
-        limit_gb=${limit_gb:-0}; used_bytes=${used_bytes:-0}
-        used_bytes=$(echo "$used_bytes" | tr -dc '0-9'); used_bytes=${used_bytes:-0}
-        local lstr pct_str status_str
-        if [[ "$limit_gb" -eq 0 ]]; then
-            lstr="Unlimited"; pct_str="—"
-        else
-            lstr="${limit_gb} GB"
-            local limit_bytes=$(( limit_gb * 1024 * 1024 * 1024 ))
-            if [[ $limit_bytes -gt 0 ]]; then
-                pct_str="$(( used_bytes * 100 / limit_bytes ))%"
-            else
-                pct_str="—"
-            fi
-        fi
-        if [[ "$exp" < "$today" ]]; then
-            status_str="${red}Expired${nc}"
-        elif [[ "$limit_gb" -gt 0 ]] && [[ "$used_bytes" -ge $(( limit_gb * 1024 * 1024 * 1024 )) ]]; then
-            status_str="${red}CAPPED${nc}"
-        else
-            status_str="${green}Active${nc}"
-        fi
-        printf "  %-16s %-12s %-10s %-10s %-5s " "$name" "$exp" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct_str"
-        echo -e "$status_str"
+        limit_gb="${limit_gb:-0}"; used_bytes="$(echo "${used_bytes:-0}"|tr -dc '0-9')"; used_bytes="${used_bytes:-0}"
+        local lstr pct status
+        if [[ "$limit_gb" -eq 0 ]]; then lstr="Unlimited"; pct="-"
+        else lstr="${limit_gb} GB"; local lb=$(( limit_gb*1024*1024*1024 ))
+             [[ $lb -gt 0 ]] && pct="$(( used_bytes*100/lb ))%" || pct="-"; fi
+        if [[ "$exp" < "$today" ]]; then status="${red}Expired${nc}"
+        elif [[ "$limit_gb" -gt 0 && "$used_bytes" -ge $(( limit_gb*1024*1024*1024 )) ]]; then status="${red}CAPPED${nc}"
+        else status="${green}Active${nc}"; fi
+        printf "  %-16s %-12s %-10s %-10s %-5s " "$name" "$exp" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct"
+        echo -e "$status"
     done < "$CSV_DB"
-    echo ""
-    read -p "Press Enter to return..."
-}
-
-# ── Bandwidth Monitor ─────────────────────────────────────────────────────────
-bandwidth_monitor() {
-    while true; do
-        show_header
-        migrate_csv
-        echo -e "${blue}── Bandwidth Monitor ───────────────────────────────────${nc}\n"
-
-        if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{found=1;exit} END{exit !found}' "$CSV_DB"; then
-            echo -e "  ${yellow}No accounts found.${nc}"
-            read -p "  Press Enter to return..."; return
-        fi
-
-        printf "  %-16s %-10s %-10s %-6s %-10s\n" "USERNAME" "USED" "LIMIT" "%" "STATUS"
-        printf "  %-16s %-10s %-10s %-6s %-10s\n" "────────────────" "──────────" "──────────" "──────" "──────────"
-
-        while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
-            [[ "$name" == "Username" ]] && continue
-            limit_gb=${limit_gb:-0}
-            used_bytes=$(echo "${used_bytes:-0}" | tr -dc '0-9'); used_bytes=${used_bytes:-0}
-            local lstr pct_str status_str
-            if [[ "$limit_gb" -eq 0 ]]; then
-                lstr="Unlimited"; pct_str="—"; status_str="${green}Active${nc}"
-            else
-                lstr="${limit_gb} GB"
-                local lb=$(( limit_gb * 1024 * 1024 * 1024 ))
-                local pct=0
-                [[ $lb -gt 0 ]] && pct=$(( used_bytes * 100 / lb ))
-                pct_str="${pct}%"
-                if   [[ $used_bytes -ge $lb ]]; then status_str="${red}CAPPED${nc}"
-                elif [[ $pct -ge 80            ]]; then status_str="${yellow}Warning${nc}"
-                else                                    status_str="${green}Active${nc}"
-                fi
-            fi
-            printf "  %-16s %-10s %-10s %-6s " "$name" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct_str"
-            echo -e "$status_str"
-        done < "$CSV_DB"
-
-        echo ""
-        echo -e "  ${green}r)${nc} Reset usage for a user"
-        echo -e "  ${green}s)${nc} Set/change limit for a user"
-        echo -e "  ${green}0)${nc} Return to main menu"
-        echo ""
-        read -rp "  Select: " bw_opt
-        case $bw_opt in
-            r|R) _bw_reset_user     ;;
-            s|S) _bw_set_limit      ;;
-            0)   return             ;;
-            *)   sleep 1            ;;
-        esac
-    done
+    echo ""; read -rp "Press Enter to return..." _ || true
 }
 
 _bw_reset_user() {
-    read -rp "  Username to reset: " reset_user
-    [[ -z "$reset_user" ]] && return
-    if ! grep -q "^${reset_user}," "$CSV_DB" 2>/dev/null; then
-        echo -e "${red}  User not found.${nc}"; sleep 2; return
+    read -rp "  Username to reset: " ru; [[ -z "$ru" ]] && return
+    validate_username "$ru" || { echo -e "${red}  Invalid.${nc}"; sleep 2; return; }
+    grep -q "^${ru}," "$CSV_DB" || { echo -e "${red}  Not found.${nc}"; sleep 2; return; }
+    csv_lock
+    local tmp; tmp="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
+    awk -F',' -v u="$ru" 'BEGIN{OFS=","} NR>1&&$1==u{$7=0}{print}' "$CSV_DB" > "$tmp"
+    mv -f "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    csv_unlock
+    local r_uuid r_trojan active
+    r_uuid="$(awk -F',' -v u="$ru" 'NR>1&&$1==u{print $3}' "$CSV_DB")"
+    r_trojan="$(awk -F',' -v u="$ru" 'NR>1&&$1==u{print $4}' "$CSV_DB")"
+    active="$(jq -r --arg u "$ru" '[.inbounds[].settings.clients[]?|select(.email==$u)]|length' "$XRAY_CONF" 2>/dev/null || echo 0)"
+    if [[ "${active:-0}" -eq 0 ]]; then
+        # FIX (D1): re-add by TAG (matches create_account), not by protocol.
+        _add_client_by_tag "$ru" "$r_uuid" "$r_trojan"
+        systemctl restart xray >/dev/null 2>&1 || true
+        passwd -u "$ru" >/dev/null 2>&1 || true
     fi
-    # Zero out UsedBytes in CSV
-    local tmp; tmp=$(mktemp)
-    awk -F',' -v u="$reset_user" 'BEGIN{OFS=","} NR>1&&$1==u{$7=0} {print}' "$CSV_DB" > "$tmp"
-    mv "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
-    # Re-add user to Xray inbounds if they were capped
-    local r_uuid r_trojan
-    r_uuid=$(awk  -F',' -v u="$reset_user" 'NR>1&&$1==u{print $3}' "$CSV_DB")
-    r_trojan=$(awk -F',' -v u="$reset_user" 'NR>1&&$1==u{print $4}' "$CSV_DB")
-    local already_active
-    already_active=$(jq -r --arg u "$reset_user" \
-        '[.inbounds[].settings.clients[]? | select(.email==$u)] | length' \
-        "$XRAY_CONF" 2>/dev/null)
-    if [[ "${already_active:-0}" -eq 0 ]]; then
-        jq --arg user "$reset_user" --arg uuid "$r_uuid" --arg tpw "$r_trojan" '
-          .inbounds |= map(
-            if   .protocol=="vless"  and .settings.clients
-              then .settings.clients += [{"id":$uuid,"flow":"","email":$user}]
-            elif .protocol=="vmess"  and .settings.clients
-              then .settings.clients += [{"id":$uuid,"alterId":0,"email":$user}]
-            elif .protocol=="trojan" and .settings.clients
-              then .settings.clients += [{"password":$tpw,"email":$user}]
-            else . end
-          )' "$XRAY_CONF" > /tmp/x.json && mv /tmp/x.json "$XRAY_CONF"
-        systemctl restart xray > /dev/null 2>&1
-        passwd -u "$reset_user" > /dev/null 2>&1
-    fi
-    echo -e "${green}  Usage reset for '${reset_user}'. Account reactivated.${nc}"
-    sleep 2
+    echo -e "${green}  Usage reset; '${ru}' reactivated.${nc}"; sleep 2
 }
-
 _bw_set_limit() {
-    read -rp "  Username: " tgt_user
-    [[ -z "$tgt_user" ]] && return
-    if ! grep -q "^${tgt_user}," "$CSV_DB" 2>/dev/null; then
-        echo -e "${red}  User not found.${nc}"; sleep 2; return
-    fi
-    read -rp "  New limit in GB (0 = unlimited): " new_limit
-    new_limit=$(echo "${new_limit:-0}" | tr -dc '0-9'); new_limit=${new_limit:-0}
-    local tmp; tmp=$(mktemp)
-    awk -F',' -v u="$tgt_user" -v l="$new_limit" \
-        'BEGIN{OFS=","} NR>1&&$1==u{$6=l} {print}' "$CSV_DB" > "$tmp"
-    mv "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
-    echo -e "${green}  Limit for '${tgt_user}' set to ${new_limit} GB.${nc}"
-    sleep 2
+    read -rp "  Username: " tu; [[ -z "$tu" ]] && return
+    validate_username "$tu" || { echo -e "${red}  Invalid.${nc}"; sleep 2; return; }
+    grep -q "^${tu}," "$CSV_DB" || { echo -e "${red}  Not found.${nc}"; sleep 2; return; }
+    read -rp "  New limit GB (0=unlimited): " nl
+    nl="$(echo "${nl:-0}"|tr -dc '0-9')"; nl="${nl:-0}"
+    csv_lock
+    local tmp; tmp="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
+    awk -F',' -v u="$tu" -v l="$nl" 'BEGIN{OFS=","} NR>1&&$1==u{$6=l}{print}' "$CSV_DB" > "$tmp"
+    mv -f "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
+    csv_unlock
+    echo -e "${green}  Limit for '${tu}' = ${nl} GB.${nc}"; sleep 2
+}
+bandwidth_monitor() {
+    while true; do
+        show_header; migrate_csv
+        echo -e "${blue}-- Bandwidth Monitor --${nc}\n"
+        if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
+            echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
+        fi
+        printf "  %-16s %-10s %-10s %-6s %-10s\n" USERNAME USED LIMIT % STATUS
+        while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
+            [[ "$name" == "Username" ]] && continue
+            limit_gb="${limit_gb:-0}"; used_bytes="$(echo "${used_bytes:-0}"|tr -dc '0-9')"; used_bytes="${used_bytes:-0}"
+            local lstr pct status
+            if [[ "$limit_gb" -eq 0 ]]; then lstr="Unlimited"; pct="-"; status="${green}Active${nc}"
+            else lstr="${limit_gb} GB"; local lb=$(( limit_gb*1024*1024*1024 )) p=0
+                 [[ $lb -gt 0 ]] && p=$(( used_bytes*100/lb )); pct="${p}%"
+                 if   [[ $used_bytes -ge $lb ]]; then status="${red}CAPPED${nc}"
+                 elif [[ $p -ge 80 ]]; then status="${yellow}Warning${nc}"
+                 else status="${green}Active${nc}"; fi; fi
+            printf "  %-16s %-10s %-10s %-6s " "$name" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct"
+            echo -e "$status"
+        done < "$CSV_DB"
+        echo -e "\n  ${green}r)${nc} Reset  ${green}s)${nc} Set limit  ${green}0)${nc} Back\n"
+        read -rp "  Select: " o
+        case "$o" in r|R) _bw_reset_user;; s|S) _bw_set_limit;; 0) return;; *) sleep 1;; esac
+    done
 }
 
-# ── Service Status ────────────────────────────────────────────────────────────
 service_status() {
-    show_header
-    echo -e "${blue}── Service Status ──────────────────────────────────────${nc}\n"
+    show_header; echo -e "${blue}-- Service Status --${nc}\n"
+    local svc
     for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            echo -e "  ${green}●${nc} $svc — running"
-        else
-            echo -e "  ${red}●${nc} $svc — stopped / not installed"
-        fi
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then echo -e "  ${green}[on ]${nc} $svc"
+        else echo -e "  ${red}[off]${nc} $svc"; fi
     done
-    echo ""
-    read -p "Press Enter to return..."
+    echo ""; read -rp "Press Enter to return..." _ || true
 }
-
-# ── Restart Services ──────────────────────────────────────────────────────────
 restart_services() {
-    show_header
-    echo -e "${blue}Restarting services...${nc}\n"
+    show_header; echo -e "${blue}Restarting services...${nc}\n"
+    local svc
     for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor; do
-        systemctl restart "$svc" > /dev/null 2>&1 \
-            && echo -e "  ${green}✔${nc} $svc restarted" \
-            || echo -e "  ${yellow}✘${nc} $svc — could not restart"
+        systemctl restart "$svc" >/dev/null 2>&1 && echo -e "  ${green}[ok]${nc} $svc" \
+            || echo -e "  ${yellow}[!!]${nc} $svc"
     done
-    echo ""
-    read -p "Press Enter to return..."
+    echo ""; read -rp "Press Enter to return..." _ || true
 }
-
-# ── System Info ───────────────────────────────────────────────────────────────
 system_info() {
-    show_header
-    echo -e "${blue}── System Info ─────────────────────────────────────────${nc}\n"
-    echo -e "  OS      : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
-    echo -e "  Kernel  : $(uname -r)"
-    echo -e "  CPU     : $(nproc) core(s)"
-    echo -e "  RAM     : $(free -h | awk '/^Mem/{print $3 " used / " $2 " total"}')"
-    echo -e "  Disk    : $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
-    # Use local IP immediately; attempt public IP lookup in background with short timeout
-    local local_ip pub_ip
-    local_ip=$(hostname -I | awk '{print $1}')
-    pub_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "$local_ip")
-    echo -e "  IP      : $pub_ip"
-    echo -e "  Domain  : $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
-    echo -e "  Uptime  : $(uptime -p 2>/dev/null)"
-    echo ""
-    read -p "Press Enter to return..."
+    show_header; echo -e "${blue}-- System Info --${nc}\n"
+    echo -e "  OS     : $(grep PRETTY_NAME /etc/os-release 2>/dev/null|cut -d= -f2|tr -d '\"')"
+    echo -e "  Kernel : $(uname -r)"
+    echo -e "  CPU    : $(nproc) core(s)"
+    echo -e "  RAM    : $(free -h|awk '/^Mem/{print $3" used / "$2" total"}')"
+    echo -e "  Disk   : $(df -h /|awk 'NR==2{print $3" used / "$2" ("$5")"}')"
+    local lip pip; lip="$(hostname -I|awk '{print $1}')"
+    pip="$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "$lip")"
+    echo -e "  IP     : $pip"
+    echo -e "  Domain : $(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
+    echo -e "  Uptime : $(uptime -p 2>/dev/null)"
+    echo ""; read -rp "Press Enter to return..." _ || true
 }
-
-# ── Change Domain ─────────────────────────────────────────────────────────────
 change_domain() {
-    show_header
-    echo -e "${blue}── Change Domain ───────────────────────────────────────${nc}\n"
-    echo -e "  ${yellow}Current:${nc} $(cat /etc/AutoScriptX/domain 2>/dev/null || echo 'not set')"
-    echo ""
-    read -rp "  New domain (Enter to cancel): " new_domain
-    new_domain=$(echo "$new_domain" | tr -d ' ')
-    if [[ -n "$new_domain" ]]; then
-        echo "$new_domain" > /etc/AutoScriptX/domain
-        sed -i "s/server_name .*;/server_name ${new_domain};/g" \
-            /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
-        sed -i "s/server_name .*;/server_name ${new_domain};/g" \
-            /etc/nginx/conf.d/xhttp-port80.conf  2>/dev/null || true
-        systemctl reload nginx > /dev/null 2>&1 || true
-        echo -e "\n  ${green}Domain updated to: ${new_domain}${nc}"
-    else
-        echo -e "  ${yellow}Cancelled.${nc}"
-    fi
-    read -p "  Press Enter to return..."
+    show_header; echo -e "${blue}-- Change Domain --${nc}\n"
+    echo -e "  Current: $(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')\n"
+    read -rp "  New domain (Enter to cancel): " nd
+    nd="$(printf '%s' "$nd" | tr -d '[:space:]')"
+    [[ -z "$nd" ]] && { echo -e "  ${yellow}Cancelled.${nc}"; read -rp "  Enter..." _; return; }
+    validate_domain "$nd" || { echo -e "${red}  Invalid domain.${nc}"; read -rp "  Enter..." _; return; }
+    printf '%s\n' "$nd" > "${ASX_DIR}/domain"
+    local esc; esc="$(printf '%s' "$nd" | sed 's/[&/\]/\\&/g')"
+    sed -i "s|server_name .*;|server_name ${esc};|g" /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
+    sed -i "s|server_name .*;|server_name ${esc};|g" /etc/nginx/conf.d/xhttp-port80.conf  2>/dev/null || true
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    echo -e "\n  ${green}Domain updated to ${nd}.${nc}"; read -rp "  Enter..." _ || true
 }
-
-# ── Edit Banner ───────────────────────────────────────────────────────────────
 edit_banner() {
-    show_header
-    local banner_file="/etc/AutoScriptX/banner"
-    echo -e "${blue}── Edit SSH Banner ──────────────────────────────────────${nc}\n"
-    echo -e "  ${yellow}Current banner:${nc}"
-    echo -e "  ─────────────────────────────────────────────────────"
-    cat "$banner_file" 2>/dev/null || echo -e "  ${yellow}(empty)${nc}"
-    echo -e "  ─────────────────────────────────────────────────────\n"
-    echo -e "  ${green}1)${nc} Edit with nano"
-    echo -e "  ${green}2)${nc} Clear banner"
-    echo -e "  ${green}0)${nc} Cancel"
-    echo ""; read -rp "  Select: " choice
-    case $choice in
-        1) nano "$banner_file"
-           systemctl restart dropbear > /dev/null 2>&1
-           echo -e "\n  ${green}Banner updated.${nc}" ;;
-        2) > "$banner_file"
-           systemctl restart dropbear > /dev/null 2>&1
-           echo -e "\n  ${green}Banner cleared.${nc}" ;;
-        *) echo -e "  ${yellow}Cancelled.${nc}" ;;
+    show_header; local bf="${ASX_DIR}/banner"
+    echo -e "${blue}-- Edit SSH Banner --${nc}\n"; cat "$bf" 2>/dev/null || echo "(empty)"
+    echo -e "\n  ${green}1)${nc} Edit  ${green}2)${nc} Clear  ${green}0)${nc} Cancel"
+    read -rp "  Select: " c
+    case "$c" in
+        1) nano "$bf"; systemctl restart dropbear >/dev/null 2>&1 || true; echo -e "${green}Updated.${nc}";;
+        2) : > "$bf"; systemctl restart dropbear >/dev/null 2>&1 || true; echo -e "${green}Cleared.${nc}";;
+        *) echo -e "${yellow}Cancelled.${nc}";;
     esac
-    read -p "  Press Enter to return..."
+    read -rp "  Enter..." _ || true
 }
-
-# ── Edit 101 Response ─────────────────────────────────────────────────────────
 edit_response() {
-    # Delegate to the upstream edit-response script which was written alongside
-    # the ws-proxy binary and knows exactly which file/env-var it reads.
-    # Priority: 1) fresh download  2) local /usr/bin/edit-response  3) inline fallback
-
-    local _BASE="https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master"
-    local _tmp
-    _tmp=$(mktemp /tmp/asx_er_XXXXXX.sh)
-
-    if curl -fsSL --max-time 10 "${_BASE}/scripts/ssh/edit-response.sh" \
-            -o "$_tmp" 2>/dev/null && [[ -s "$_tmp" ]]; then
-        chmod +x "$_tmp"
-        bash "$_tmp"
-        rm -f "$_tmp"
-        return
-    fi
-    rm -f "$_tmp"
-
-    if [[ -x /usr/bin/edit-response ]]; then
-        bash /usr/bin/edit-response
-        return
-    fi
-
-    # ── Inline fallback ───────────────────────────────────────────────────────
-    show_header
-    echo -e "${blue}── Edit 101 WebSocket Response ─────────────────────────${nc}\n"
-
-    # Dump the full service unit so the admin can see exactly what ws-proxy reads
-    local _svc
-    _svc=$(systemctl cat ws-proxy.service 2>/dev/null)
-
-    echo -e "  ${yellow}ws-proxy.service (full unit):${nc}"
-    echo -e "  ─────────────────────────────────────────────"
-    echo "$_svc"
-    echo -e "  ─────────────────────────────────────────────\n"
-
-    # Extract the response-file path from ExecStart flags or Environment= lines
-    local _exec _rfile=""
-    _exec=$(echo "$_svc" | grep -i '^ExecStart' | head -1)
-
-    for _f in "--response" "--banner" "--file" "--resp" "--res"; do
-        if echo "$_exec" | grep -q "$_f"; then
-            _rfile=$(echo "$_exec" | grep -oP "(?<=${_f}[= ])\S+" | head -1)
-            break
-        fi
-    done
-    [[ -z "$_rfile" ]] && _rfile=$(echo "$_svc" | \
-        grep -oP '(?<=RESPONSE_FILE=|BANNER_FILE=|RESP_FILE=)\S+' | head -1)
-    [[ -z "$_rfile" ]] && _rfile="/etc/AutoScriptX/response"
-
-    echo -e "  ${yellow}Using response file:${nc} ${green}${_rfile}${nc}\n"
-
-    mkdir -p "$(dirname "$_rfile")"
-    [[ ! -s "$_rfile" ]] && {
-        printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
-            > "$_rfile"
-        chmod 644 "$_rfile"
-        echo -e "  ${yellow}Created default response file.${nc}\n"
-    }
-
-    echo -e "  ${yellow}Current content (^M = CRLF):${nc}"
-    echo -e "  ─────────────────────────────────────────────"
-    cat -A "$_rfile" 2>/dev/null
-    echo -e "  ─────────────────────────────────────────────\n"
-    cat -A "$_rfile" 2>/dev/null | grep -q '\^M' \
-        || echo -e "  ${red}⚠  No CRLF — use option 2 to fix.${nc}\n"
-
-    echo -e "  ${green}1)${nc} Edit with nano"
-    echo -e "  ${green}2)${nc} Reset to correct CRLF default"
-    echo -e "  ${green}3)${nc} Show ws-proxy status"
-    echo -e "  ${green}0)${nc} Cancel"
-    echo ""; read -rp "  Select: " _c
-    case $_c in
-        1)
-            local _b _a
-            _b=$(md5sum "$_rfile" 2>/dev/null)
-            nano "$_rfile"
-            _a=$(md5sum "$_rfile" 2>/dev/null)
-            [[ "$_b" != "$_a" ]] && {
-                systemctl restart ws-proxy.service 2>/dev/null \
-                    && echo -e "\n  ${green}Saved and ws-proxy restarted.${nc}" \
-                    || { echo -e "\n  ${red}Restart failed:${nc}";
-                         systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -8; }
-            } || echo -e "\n  ${yellow}No changes.${nc}"
-            ;;
-        2)
-            printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' \
-                > "$_rfile"
-            chmod 644 "$_rfile"
-            cat -A "$_rfile"
-            systemctl restart ws-proxy.service 2>/dev/null \
-                && echo -e "\n  ${green}Reset and ws-proxy restarted.${nc}" \
-                || { echo -e "\n  ${red}Restart failed:${nc}";
-                     systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -8; }
-            ;;
-        3)
-            echo ""; systemctl status ws-proxy.service --no-pager -l 2>/dev/null ;;
-        *) echo -e "  ${yellow}Cancelled.${nc}" ;;
+    show_header; local rf="${ASX_DIR}/response"
+    echo -e "${blue}-- Edit 101 WebSocket Response --${nc}\n"
+    [[ -s "$rf" ]] || printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' > "$rf"
+    echo -e "  Current (^M = CRLF):"; cat -A "$rf" 2>/dev/null
+    echo -e "\n  ${green}1)${nc} Edit  ${green}2)${nc} Reset default  ${green}3)${nc} ws-proxy status  ${green}0)${nc} Cancel"
+    read -rp "  Select: " c
+    case "$c" in
+        1) local b a; b="$(md5sum "$rf")"; nano "$rf"; a="$(md5sum "$rf")"
+           [[ "$b" != "$a" ]] && { systemctl restart ws-proxy.service 2>/dev/null && echo -e "${green}Saved.${nc}"; } || echo "No change.";;
+        2) printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' > "$rf"
+           chmod 644 "$rf"; systemctl restart ws-proxy.service 2>/dev/null && echo -e "${green}Reset.${nc}";;
+        3) systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -12;;
+        *) echo -e "${yellow}Cancelled.${nc}";;
     esac
-    read -p "  Press Enter to return..."
+    read -rp "  Enter..." _ || true
 }
 do_update() {
     show_header
-    echo -e "${blue}Fetching latest update engine from repo...${nc}\n"
-    local menu_updater
-    menu_updater=$(mktemp /tmp/asx_updater_XXXXXX.sh)
-    if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 \
-           "https://raw.githubusercontent.com/BlackBat21/trial/main/install.sh" \
-           -o "$menu_updater"; then
-        chmod +x "$menu_updater"
-        bash "$menu_updater" --update-only
-        rm -f "$menu_updater"
-    else
-        echo -e "${red}Failed to fetch update. Check your internet connection.${nc}"
-    fi
-    read -p "Press Enter to return..."
+    echo -e "${blue}Self-update from the SAME repository as this install.${nc}"
+    echo -e "Source: ${yellow}__SELF_UPDATE_URL__${nc}\n"
+    read -rp "Type UPDATE to proceed: " c
+    [[ "$c" == "UPDATE" ]] || { echo "Cancelled."; read -rp "Enter..." _; return; }
+    local up; up="$(mktemp /root/.asx_upd.XXXXXX.sh)"
+    if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 "__SELF_UPDATE_URL__" -o "$up"; then
+        chmod +x "$up"; bash "$up" --update-only; rm -f "$up"
+    else echo -e "${red}Fetch failed.${nc}"; rm -f "$up"; fi
+    read -rp "Press Enter to return..." _ || true
 }
-
-# ── Full Uninstall ────────────────────────────────────────────────────────────
 full_uninstall() {
+    [[ -t 0 ]] || { echo "Uninstall requires an interactive TTY."; return 1; }
     clear
-    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
-    echo -e "${red}║          ⚠  AutoScriptX — FULL UNINSTALL  ⚠                ║${nc}"
-    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
-    echo -e "${red}║  This will PERMANENTLY remove:                               ║${nc}"
-    echo -e "${red}║   • Xray-core binary, config, and ALL user accounts          ║${nc}"
-    echo -e "${red}║   • Nginx, Dropbear, Squid, Stunnel4, Fail2ban configs       ║${nc}"
-    echo -e "${red}║   • BadVPN, ws-proxy, gum binaries                           ║${nc}"
-    echo -e "${red}║   • xray-limit-monitor daemon                                ║${nc}"
-    echo -e "${red}║   • All cron jobs added by this script                       ║${nc}"
-    echo -e "${red}║   • Custom iptables / BitTorrent FORWARD rules               ║${nc}"
-    echo -e "${red}║   • /etc/AutoScriptX  /usr/local/etc/xray  directories       ║${nc}"
-    echo -e "${red}║   • /home/vps/public_html  web root                          ║${nc}"
-    echo -e "${red}║   • All menu / helper scripts placed in /usr/bin             ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${red}║  Core OS utilities (curl, jq, screen, etc.) are NOT removed. ║${nc}"
-    echo -e "${red}║  SSL certificates and SSH host keys are NOT removed.         ║${nc}"
-    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
-    echo ""
-    echo -e "${yellow}  STEP 1 of 2 — Are you absolutely sure you want to continue?${nc}"
-    echo -e "  Type  ${red}UNINSTALL${nc}  (all caps) to proceed, or anything else to abort."
-    echo ""
-    read -rp "  Confirmation: " _confirm1
-    if [[ "$_confirm1" != "UNINSTALL" ]]; then
-        echo -e "\n${green}  Aborted. No changes were made.${nc}"
-        read -p "  Press Enter to return..."
-        return 0
-    fi
+    echo -e "${red}=== AutoScriptX FULL UNINSTALL ===${nc}"
+    echo -e "Removes Xray, all accounts, nginx/dropbear/squid/stunnel/fail2ban configs,"
+    echo -e "badvpn, ws-proxy, gum, monitor, cron jobs, iptables rules, and script dirs."
+    echo -e "Core OS tools, SSH host keys, and SSL certs are kept.\n"
+    read -rp "  STEP 1/2 - type UNINSTALL to continue: " c1
+    [[ "$c1" == "UNINSTALL" ]] || { echo -e "${green}Aborted.${nc}"; read -rp "Enter..." _; return 0; }
+    read -rp "  STEP 2/2 - type YES to begin: " c2
+    [[ "$c2" == "YES" ]] || { echo -e "${green}Aborted.${nc}"; read -rp "Enter..." _; return 0; }
 
-    echo ""
-    echo -e "${yellow}  STEP 2 of 2 — Final confirmation.${nc}"
-    echo -e "  Type  ${red}YES${nc}  to begin the uninstall, or anything else to abort."
-    echo ""
-    read -rp "  Final confirmation: " _confirm2
-    if [[ "$_confirm2" != "YES" ]]; then
-        echo -e "\n${green}  Aborted. No changes were made.${nc}"
-        read -p "  Press Enter to return..."
-        return 0
-    fi
-
-    echo ""
-    echo -e "${blue}[ Info    ]${nc} Starting full uninstall of AutoScriptX..."
-    echo ""
-
-    # ── 1. Stop and disable all services ──────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Stopping and disabling services..."
-    local _services=(
-        xray xray-limit-monitor ws-proxy nginx dropbear
-        stunnel4 squid fail2ban "badvpn-udpgw@7200" "badvpn-udpgw@7300"
-        netfilter-persistent
-    )
-    for _svc in "${_services[@]}"; do
-        systemctl stop    "$_svc" > /dev/null 2>&1 || true
-        systemctl disable "$_svc" > /dev/null 2>&1 || true
+    local svc
+    for svc in xray xray-limit-monitor ws-proxy nginx dropbear stunnel4 squid fail2ban \
+               badvpn-udpgw@7200 badvpn-udpgw@7300 netfilter-persistent; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
     done
-    echo -e "${green}[ Success ]${nc} Services stopped and disabled."
-
-    # ── 2. Remove custom systemd unit files ───────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing custom systemd unit files..."
-    rm -rf /etc/systemd/system/xray.service \
-           /etc/systemd/system/xray-limit-monitor.service \
-           /etc/systemd/system/ws-proxy.service \
-           /etc/systemd/system/badvpn-udpgw@.service \
+    rm -rf /etc/systemd/system/xray.service /etc/systemd/system/xray-limit-monitor.service \
+           /etc/systemd/system/ws-proxy.service /etc/systemd/system/badvpn-udpgw@.service \
            /etc/systemd/system/nginx.service.d
-    systemctl daemon-reload > /dev/null 2>&1
-    echo -e "${green}[ Success ]${nc} Custom systemd unit files removed."
-
-    # ── 3. Purge script-installed packages ────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Purging AutoScriptX-installed packages..."
+    systemctl daemon-reload >/dev/null 2>&1 || true
     apt-get purge -y stunnel4 dropbear squid fail2ban nginx \
-        netfilter-persistent iptables-persistent vnstat > /dev/null 2>&1 \
-        || echo -e "${yellow}[ Warning ]${nc} Some packages may not be installed via apt — continuing."
-    apt-get autoremove -y > /dev/null 2>&1
-    apt-get autoclean  -y > /dev/null 2>&1
-    echo -e "${green}[ Success ]${nc} Packages purged."
-
-    # ── 4. Remove Xray-core binary, configs, logs ─────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing Xray-core..."
-    rm -f  /usr/local/bin/xray /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
-    rm -rf /usr/local/etc/xray /var/log/xray
-    echo -e "${green}[ Success ]${nc} Xray-core removed."
-
-    # ── 5. Remove AutoScriptX configuration directory ─────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing /etc/AutoScriptX..."
-    rm -rf /etc/AutoScriptX
-    echo -e "${green}[ Success ]${nc} /etc/AutoScriptX removed."
-
-    # ── 6. Remove web root ────────────────────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing /home/vps web root..."
-    rm -rf /home/vps/public_html
-    rmdir  /home/vps 2>/dev/null || true
-    echo -e "${green}[ Success ]${nc} Web root removed."
-
-    # ── 7. Remove Nginx config fragments ──────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing Nginx configuration fragments..."
-    rm -f /etc/nginx/xray-locations.conf \
-          /etc/nginx/conf.d/xhttp-port80.conf \
-          /etc/nginx/conf.d/reverse-proxy.conf \
-          /etc/nginx/conf.d/real_ip_sources.conf
-    echo -e "${green}[ Success ]${nc} Nginx fragments removed."
-
-    # ── 8. Remove acme.sh ────────────────────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing acme.sh..."
-    rm -rf /root/.acme.sh
-    echo -e "${green}[ Success ]${nc} acme.sh removed."
-
-    # ── 9. Remove auxiliary binaries ─────────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing auxiliary binaries..."
-    rm -f /usr/local/bin/ws-proxy \
-          /usr/local/bin/xray-limit-monitor \
-          /usr/local/bin/gum \
-          /usr/bin/badvpn-udpgw
-    echo -e "${green}[ Success ]${nc} Auxiliary binaries removed."
-
-    # ── 10. Remove menu / helper scripts ──────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing menu and helper scripts..."
-    rm -f /usr/bin/menu /usr/bin/autoscriptx /usr/bin/asx /usr/bin/xray-menu \
-          /usr/bin/slowdns-menu /usr/bin/create-account /usr/bin/delete-account \
-          /usr/bin/edit-banner /usr/bin/edit-response /usr/bin/lock-unlock \
-          /usr/bin/renew-account /usr/bin/change-domain /usr/bin/manage-services \
-          /usr/bin/system-info /usr/bin/clean-expired-accounts \
-          /usr/bin/setup-slowdns /usr/bin/slowdns-status
-    echo -e "${green}[ Success ]${nc} Helper scripts removed."
-
-    # ── 11. Remove cron jobs ──────────────────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing AutoScriptX cron jobs..."
+        netfilter-persistent iptables-persistent vnstat >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    rm -f /usr/local/bin/xray /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
+    rm -rf /usr/local/etc/xray /var/log/xray /etc/AutoScriptX /home/vps/public_html /root/.acme.sh
+    rmdir /home/vps 2>/dev/null || true
+    rm -f /etc/nginx/xray-locations.conf /etc/nginx/conf.d/xhttp-port80.conf \
+          /etc/nginx/conf.d/reverse-proxy.conf /etc/nginx/conf.d/real_ip_sources.conf
+    rm -f /usr/local/bin/ws-proxy /usr/local/bin/xray-limit-monitor /usr/local/bin/gum /usr/bin/badvpn-udpgw
+    rm -f /usr/bin/menu /usr/bin/autoscriptx /usr/bin/asx /usr/bin/xray-menu /usr/bin/slowdns-menu \
+          /usr/bin/create-account /usr/bin/delete-account /usr/bin/edit-banner /usr/bin/edit-response \
+          /usr/bin/lock-unlock /usr/bin/renew-account /usr/bin/change-domain /usr/bin/manage-services \
+          /usr/bin/system-info /usr/bin/clean-expired-accounts /usr/bin/setup-slowdns /usr/bin/slowdns-status
     rm -f /etc/cron.d/auto-reboot /etc/cron.d/clean-expired-accounts
-    service cron restart > /dev/null 2>&1 || true
-    echo -e "${green}[ Success ]${nc} Cron jobs removed."
-
-    # ── 12. Flush custom iptables rules ───────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Flushing custom iptables rules..."
-    local _bt_strings=(
-        "get_peers" "announce_peer" "find_node" "BitTorrent"
-        "BitTorrent protocol" "peer_id=" ".torrent"
-        "announce.php?passkey=" "torrent" "announce" "info_hash"
-    )
-    for _s in "${_bt_strings[@]}"; do
-        while iptables -D FORWARD -m string --string "$_s" --algo bm -j DROP > /dev/null 2>&1; do
-            true
-        done
+    service cron restart >/dev/null 2>&1 || true
+    local s
+    for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
+             ".torrent" "announce.php?passkey=" torrent announce info_hash; do
+        while iptables -D FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
     done
-    iptables -D INPUT -p tcp --dport 80  -j ACCEPT > /dev/null 2>&1 || true
-    iptables -D INPUT -p tcp --dport 443 -j ACCEPT > /dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 80  -j ACCEPT >/dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
     rm -f /etc/iptables.up.rules
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    echo -e "${green}[ Success ]${nc} Custom iptables rules flushed."
-
-    # ── 13. Remove IPv6 sysctl config ─────────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing IPv6 sysctl config..."
-    rm -f /etc/sysctl.d/99-disable-ipv6.conf
-    sysctl --system > /dev/null 2>&1 || true
-    echo -e "${green}[ Success ]${nc} IPv6 sysctl config removed."
-
-    # ── 14. Remove Stunnel certificates ───────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing Stunnel self-signed certificates..."
+    rm -f /etc/sysctl.d/99-disable-ipv6.conf; sysctl --system >/dev/null 2>&1 || true
     rm -f /etc/stunnel/key.pem /etc/stunnel/cert.pem /etc/stunnel/stunnel.pem
-    echo -e "${green}[ Success ]${nc} Stunnel certificates removed."
-
-    # ── 15. Remove Fail2ban customisations ────────────────────────────────────
-    echo -e "${blue}[ Info    ]${nc} Removing Fail2ban customisations..."
     rm -f /etc/fail2ban/filter.d/xray-auth.conf /etc/fail2ban/jail.local
-    echo -e "${green}[ Success ]${nc} Fail2ban customisations removed."
-
-    echo ""
-    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
-    echo -e "${red}║           AutoScriptX Uninstall Complete                     ║${nc}"
-    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
-    echo -e "${red}║  All AutoScriptX services, configs, binaries, cron jobs,     ║${nc}"
-    echo -e "${red}║  and firewall rules have been removed.                       ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${red}║  Core OS packages (curl, jq, screen, etc.) were kept.        ║${nc}"
-    echo -e "${red}║  SSH host keys and existing SSL certificates were kept.      ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${yellow}║  ▶  A reboot is strongly recommended.                        ║${nc}"
-    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
-    echo ""
-    read -rp "  Reboot now? (y/N): " _do_reboot
-    if [[ "$_do_reboot" =~ ^[Yy]$ ]]; then
-        echo -e "${blue}[ Info    ]${nc} Rebooting..."
-        reboot
-    else
-        echo -e "${blue}[ Info    ]${nc} Reboot skipped. Please reboot manually when convenient."
-    fi
+    echo -e "\n${red}Uninstall complete. Reboot recommended.${nc}"
+    read -rp "  Reboot now? (y/N): " r
+    [[ "$r" =~ ^[Yy]$ ]] && reboot || echo "Reboot skipped."
 }
 
-# ── Main Loop ─────────────────────────────────────────────────────────────────
 while true; do
     show_header
-    echo ""
-    echo -e "  ${green}1)${nc} Create Account"
-    echo -e "  ${green}2)${nc} Delete Account"
-    echo -e "  ${green}3)${nc} List Accounts"
-    echo -e "  ${green}4)${nc} Service Status"
-    echo -e "  ${green}5)${nc} Restart Services"
-    echo -e "  ${green}6)${nc} System Info"
-    echo -e "  ${green}7)${nc} Change Domain"
-    echo -e "  ${green}8)${nc} Edit Banner"
-    echo -e "  ${green}9)${nc} Edit 101 Response"
-    echo -e "  ${cyan}b)${nc} Bandwidth Monitor"
-    echo -e "  ${yellow}u)${nc} Update AutoScriptX"
-    echo -e "  ${red}x)${nc} Uninstall AutoScriptX"
-    echo -e "  ${red}0)${nc} Exit"
-    echo ""
+    echo -e "\n  ${green}1)${nc} Create Account   ${green}2)${nc} Delete Account   ${green}3)${nc} List Accounts"
+    echo -e "  ${green}4)${nc} Service Status   ${green}5)${nc} Restart Services ${green}6)${nc} System Info"
+    echo -e "  ${green}7)${nc} Change Domain    ${green}8)${nc} Edit Banner      ${green}9)${nc} Edit 101 Response"
+    echo -e "  ${cyan}b)${nc} Bandwidth Monitor ${yellow}u)${nc} Update  ${red}x)${nc} Uninstall  ${red}0)${nc} Exit\n"
     read -rp "Select option: " opt
-    case $opt in
-        1) create_account   ;;
-        2) delete_account   ;;
-        3) list_accounts    ;;
-        4) service_status   ;;
-        5) restart_services ;;
-        6) system_info      ;;
-        7) change_domain    ;;
-        8) edit_banner      ;;
-        9) edit_response    ;;
-        b|B) bandwidth_monitor ;;
-        u|U) do_update      ;;
-        x|X) full_uninstall ;;
-        0) exit 0           ;;
-        *) echo -e "${red}Invalid option.${nc}"; sleep 1 ;;
+    case "$opt" in
+        1) create_account;; 2) delete_account;; 3) list_accounts;;
+        4) service_status;; 5) restart_services;; 6) system_info;;
+        7) change_domain;; 8) edit_banner;; 9) edit_response;;
+        b|B) bandwidth_monitor;; u|U) do_update;; x|X) full_uninstall;;
+        0) exit 0;; *) echo -e "${red}Invalid.${nc}"; sleep 1;;
     esac
 done
 MAINMENU
-    chmod +x /usr/bin/menu
+    # Inject the trusted self-update URL (same repo as install) into the menu.
+    sed -i "s|__SELF_UPDATE_URL__|${SELF_UPDATE_URL//|/\\|}|g" /usr/bin/menu
+    chmod 0755 /usr/bin/menu
 }
 
-# Install FreeNetLabs scripts helper
-# ─── _write_limit_monitor ─────────────────────────────────────────────────────
-# Writes the bandwidth enforcement daemon and its systemd unit.
-# The daemon polls Xray's stats API every 60 s, updates UsedBytes in users.csv,
-# and suspends any account that has exceeded its LimitGB quota.
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# LIMIT MONITOR DAEMON
+# ===========================================================================
 _write_limit_monitor() {
-    # ── Daemon script ─────────────────────────────────────────────────────────
-    cat > /usr/local/bin/xray-limit-monitor << 'MONITOR_SCRIPT'
-#!/bin/bash
-# =============================================================================
-# AutoScriptX — Bandwidth Limit Monitor Daemon
-# Polls Xray Stats API every 60 s. Suspends accounts that exceed their quota.
-# Performance notes:
-#   • --reset clears per-user counters after each read so the gRPC payload
-#     stays small and Xray's in-memory stats map never grows unboundedly.
-#   • A single jq invocation extracts both uplink and downlink in one pass
-#     instead of spawning two jq processes per user per poll cycle.
-# =============================================================================
+    cat > /usr/local/bin/xray-limit-monitor <<'MONITOR_SCRIPT'
+#!/usr/bin/env bash
+set -uo pipefail
 CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_API="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
+CSV_LOCK="/run/lock/autoscriptx-csv.lock"
+CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 
-# Query Xray stats API for a single user; returns total bytes (up + down).
-# --reset clears the counter after reading so values stay small and the gRPC
-# response payload never grows as traffic accumulates over weeks/months.
 query_user_bytes() {
-    local username="$1"
-    local stats total
-    stats=$("$XRAY_BIN" api statsquery \
-        --server="$XRAY_API" \
-        --reset \
-        -pattern "user>>>${username}>>>traffic" 2>/dev/null)
-    # Single jq call — sum all numeric .value fields (both uplink and downlink)
-    total=$(echo "$stats" | jq -r '[.stat[]? | .value // "0" | tonumber] | add // 0' 2>/dev/null)
+    local u="$1" stats total
+    stats="$("$XRAY_BIN" api statsquery --server="$XRAY_API" --reset \
+        -pattern "user>>>${u}>>>traffic" 2>/dev/null || true)"
+    total="$(echo "$stats" | jq -r '[.stat[]?|.value // "0"|tonumber]|add // 0' 2>/dev/null || echo 0)"
     echo "${total:-0}"
 }
-
-# Check whether a user still has an active client entry in any inbound
 user_is_active() {
-    local username="$1"
-    jq -e --arg u "$username" \
-        '[.inbounds[].settings.clients[]? | select(.email == $u)] | length > 0' \
-        "$XRAY_CONF" > /dev/null 2>&1
+    jq -e --arg u "$1" '[.inbounds[].settings.clients[]?|select(.email==$u)]|length>0' \
+        "$XRAY_CONF" >/dev/null 2>&1
 }
-
-# Remove user from all Xray inbounds and lock SSH
 suspend_user() {
-    local username="$1" limit_gb="$2"
-    jq --arg user "$username" '
-      .inbounds |= map(
-        if .settings.clients
-          then .settings.clients |= map(select(.email != $user))
-        else . end
-      )' "$XRAY_CONF" > /tmp/xlm_suspend.json \
-        && mv /tmp/xlm_suspend.json "$XRAY_CONF"
-    systemctl restart xray > /dev/null 2>&1
-    passwd -l "$username" > /dev/null 2>&1
-    logger "xray-limit-monitor: ${username} suspended — limit ${limit_gb}GB reached."
+    local u="$1" lim="$2" tmp
+    tmp="$(mktemp "$(dirname "$XRAY_CONF")/.jq.XXXXXX")"
+    ( flock 9
+      if jq --arg user "$u" '.inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $user)) else . end)' \
+           "$XRAY_CONF" > "$tmp"; then mv -f "$tmp" "$XRAY_CONF"; chmod 600 "$XRAY_CONF"
+      else rm -f "$tmp"; fi
+    ) 9>"$CFG_LOCK"
+    systemctl restart xray >/dev/null 2>&1 || true
+    passwd -l "$u" >/dev/null 2>&1 || true
+    logger "xray-limit-monitor: ${u} suspended - ${lim}GB reached."
 }
 
-# ── Main polling loop ─────────────────────────────────────────────────────────
 while true; do
-    if [[ ! -f "$CSV_DB" ]]; then
-        sleep 60; continue
-    fi
-
-    # Build a temp file to safely rewrite CSV
-    tmp_csv=$(mktemp /tmp/xlm_csv_XXXXXX)
-    head -1 "$CSV_DB" > "$tmp_csv"   # preserve header
-
+    [[ -f "$CSV_DB" ]] || { sleep 60; continue; }
+    exec 8>"$CSV_LOCK"; flock 8            # exclusive across whole rewrite
+    tmp_csv="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
+    head -1 "$CSV_DB" > "$tmp_csv"
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
-
-        limit_gb=${limit_gb:-0}
-        used_bytes=${used_bytes:-0}
-
-        if [[ "$limit_gb" -gt 0 ]] 2>/dev/null; then
-            # Fetch fresh byte count from Xray stats API (resets counter after read)
-            fresh_bytes=$(query_user_bytes "$name")
-            # Accumulate into used_bytes — because --reset clears the Xray counter
-            # each cycle, fresh_bytes is the delta since last poll, not the total.
-            if [[ "$fresh_bytes" -gt 0 ]] 2>/dev/null; then
-                used_bytes=$(( used_bytes + fresh_bytes ))
-            fi
-
-            limit_bytes=$(( limit_gb * 1024 * 1024 * 1024 ))
-
-            if [[ "$used_bytes" -ge "$limit_bytes" ]]; then
-                if user_is_active "$name"; then
-                    suspend_user "$name" "$limit_gb"
-                fi
+        limit_gb="${limit_gb:-0}"; used_bytes="${used_bytes:-0}"
+        if [[ "$limit_gb" =~ ^[0-9]+$ && "$limit_gb" -gt 0 ]]; then
+            fresh="$(query_user_bytes "$name")"
+            [[ "$fresh" =~ ^[0-9]+$ && "$fresh" -gt 0 ]] && used_bytes=$(( used_bytes + fresh ))
+            limit_bytes=$(( limit_gb*1024*1024*1024 ))
+            if [[ "$used_bytes" -ge "$limit_bytes" ]] && user_is_active "$name"; then
+                suspend_user "$name" "$limit_gb"
             fi
         fi
-
         echo "${name},${pass},${uuid},${trojan},${exp},${limit_gb},${used_bytes}" >> "$tmp_csv"
     done < "$CSV_DB"
-
-    mv "$tmp_csv" "$CSV_DB"
-    chmod 600 "$CSV_DB"
-
+    mv -f "$tmp_csv" "$CSV_DB"; chmod 600 "$CSV_DB"
+    flock -u 8; exec 8>&-
     sleep 60
 done
 MONITOR_SCRIPT
-    chmod +x /usr/local/bin/xray-limit-monitor
+    chmod 0755 /usr/local/bin/xray-limit-monitor
 
-    # ── Systemd unit ──────────────────────────────────────────────────────────
-    cat > /etc/systemd/system/xray-limit-monitor.service << 'MONITOR_SVC'
+    cat > /etc/systemd/system/xray-limit-monitor.service <<'MONITOR_SVC'
 [Unit]
 Description=AutoScriptX Bandwidth Limit Monitor
 After=xray.service
@@ -1983,8 +1305,6 @@ Type=simple
 ExecStart=/usr/local/bin/xray-limit-monitor
 Restart=always
 RestartSec=10
-# Resource caps — this daemon only does lightweight CSV + gRPC polling.
-# These limits prevent a runaway loop from degrading the VPS.
 CPUQuota=10%
 MemoryMax=64M
 Nice=10
@@ -1993,339 +1313,87 @@ Nice=10
 WantedBy=multi-user.target
 MONITOR_SVC
 
-    systemctl daemon-reload                    > /dev/null 2>&1
-    systemctl enable xray-limit-monitor        > /dev/null 2>&1
-    systemctl restart xray-limit-monitor       > /dev/null 2>&1
-}
-
-# =============================================================================
-# Full Uninstall — removes every component installed by AutoScriptX
-# Two-step confirmation required before any destructive action is taken.
-# =============================================================================
-full_uninstall() {
-    clear
-    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
-    echo -e "${red}║          ⚠  AutoScriptX — FULL UNINSTALL  ⚠                ║${nc}"
-    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
-    echo -e "${red}║  This will PERMANENTLY remove:                               ║${nc}"
-    echo -e "${red}║   • Xray-core binary, config, and ALL user accounts          ║${nc}"
-    echo -e "${red}║   • Nginx, Dropbear, Squid, Stunnel4, Fail2ban configs       ║${nc}"
-    echo -e "${red}║   • BadVPN, ws-proxy, gum binaries                           ║${nc}"
-    echo -e "${red}║   • xray-limit-monitor daemon                                ║${nc}"
-    echo -e "${red}║   • All cron jobs added by this script                       ║${nc}"
-    echo -e "${red}║   • Custom iptables / BitTorrent FORWARD rules               ║${nc}"
-    echo -e "${red}║   • /etc/AutoScriptX  /usr/local/etc/xray  directories       ║${nc}"
-    echo -e "${red}║   • /home/vps/public_html  web root                          ║${nc}"
-    echo -e "${red}║   • All menu / helper scripts placed in /usr/bin             ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${red}║  Core OS utilities (curl, jq, screen, etc.) are NOT removed. ║${nc}"
-    echo -e "${red}║  SSL certificates and SSH host keys are NOT removed.         ║${nc}"
-    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
-    echo ""
-    echo -e "${yellow}  STEP 1 of 2 — Are you absolutely sure you want to continue?${nc}"
-    echo -e "  Type  ${red}UNINSTALL${nc}  (all caps) to proceed, or anything else to abort."
-    echo ""
-    read -rp "  Confirmation: " _confirm1
-    if [[ "$_confirm1" != "UNINSTALL" ]]; then
-        echo -e "\n${green}  Aborted. No changes were made.${nc}"
-        read -p "  Press Enter to return..."
-        return 0
-    fi
-
-    echo ""
-    echo -e "${yellow}  STEP 2 of 2 — Final confirmation.${nc}"
-    echo -e "  Type  ${red}YES${nc}  to begin the uninstall, or anything else to abort."
-    echo ""
-    read -rp "  Final confirmation: " _confirm2
-    if [[ "$_confirm2" != "YES" ]]; then
-        echo -e "\n${green}  Aborted. No changes were made.${nc}"
-        read -p "  Press Enter to return..."
-        return 0
-    fi
-
-    echo ""
-    log_info "Starting full uninstall of AutoScriptX..."
-    echo ""
-
-    # ── 1. Stop and disable all AutoScriptX-managed systemd services ──────────
-    log_info "Stopping and disabling services..."
-    local _services=(
-        xray
-        xray-limit-monitor
-        ws-proxy
-        nginx
-        dropbear
-        stunnel4
-        squid
-        fail2ban
-        "badvpn-udpgw@7200"
-        "badvpn-udpgw@7300"
-        netfilter-persistent
-    )
-    for _svc in "${_services[@]}"; do
-        systemctl stop    "$_svc" > /dev/null 2>&1 || true
-        systemctl disable "$_svc" > /dev/null 2>&1 || true
-    done
-    log_success "Services stopped and disabled."
-
-    # ── 2. Remove custom systemd unit files ───────────────────────────────────
-    log_info "Removing custom systemd unit files..."
-    local _units=(
-        /etc/systemd/system/xray.service
-        /etc/systemd/system/xray-limit-monitor.service
-        /etc/systemd/system/ws-proxy.service
-        /etc/systemd/system/badvpn-udpgw@.service
-        /etc/systemd/system/nginx.service.d
-    )
-    for _u in "${_units[@]}"; do
-        rm -rf "$_u"
-    done
-    systemctl daemon-reload > /dev/null 2>&1
-    log_success "Custom systemd unit files removed."
-
-    # ── 3. Purge script-installed packages ────────────────────────────────────
-    log_info "Purging AutoScriptX-installed packages..."
-    # We purge only the packages that are exclusive to AutoScriptX and not
-    # commonly required by the base OS (curl, jq, screen, etc. are left alone).
-    local _pkgs=(
-        stunnel4
-        dropbear
-        squid
-        fail2ban
-        badvpn
-        nginx
-        netfilter-persistent
-        iptables-persistent
-        vnstat
-    )
-    apt-get purge -y "${_pkgs[@]}" > /dev/null 2>&1 || log_warning "Some packages may not have been installed via apt — skipping those."
-    apt-get autoremove -y > /dev/null 2>&1
-    apt-get autoclean  -y > /dev/null 2>&1
-    log_success "Packages purged."
-
-    # ── 4. Remove Xray-core binary and data files ─────────────────────────────
-    log_info "Removing Xray-core binaries and configuration..."
-    rm -f  /usr/local/bin/xray
-    rm -f  /usr/local/bin/geoip.dat
-    rm -f  /usr/local/bin/geosite.dat
-    rm -rf /usr/local/etc/xray
-    rm -rf /var/log/xray
-    log_success "Xray-core removed."
-
-    # ── 5. Remove AutoScriptX configuration directory ─────────────────────────
-    log_info "Removing /etc/AutoScriptX directory..."
-    rm -rf /etc/AutoScriptX
-    log_success "/etc/AutoScriptX removed."
-
-    # ── 6. Remove web root ────────────────────────────────────────────────────
-    log_info "Removing /home/vps web root..."
-    rm -rf /home/vps/public_html
-    rmdir  /home/vps 2>/dev/null || true
-    log_success "Web root removed."
-
-    # ── 7. Remove Nginx config fragments written by this script ───────────────
-    log_info "Removing Nginx configuration fragments..."
-    rm -f /etc/nginx/xray-locations.conf
-    rm -f /etc/nginx/conf.d/xhttp-port80.conf
-    rm -f /etc/nginx/conf.d/reverse-proxy.conf
-    rm -f /etc/nginx/conf.d/real_ip_sources.conf
-    log_success "Nginx fragments removed."
-
-    # ── 8. Remove acme.sh and SSL cert directory ──────────────────────────────
-    log_info "Removing acme.sh certificate tooling..."
-    rm -rf /root/.acme.sh
-    # Note: cert.crt / cert.key were already removed with /etc/AutoScriptX above.
-    log_success "acme.sh removed."
-
-    # ── 9. Remove auxiliary binaries ─────────────────────────────────────────
-    log_info "Removing auxiliary binaries..."
-    local _bins=(
-        /usr/local/bin/ws-proxy
-        /usr/local/bin/xray-limit-monitor
-        /usr/local/bin/gum
-        /usr/bin/badvpn-udpgw
-    )
-    for _b in "${_bins[@]}"; do
-        rm -f "$_b"
-    done
-    log_success "Auxiliary binaries removed."
-
-    # ── 10. Remove menu / helper scripts placed in /usr/bin ───────────────────
-    log_info "Removing menu and helper scripts..."
-    local _scripts=(
-        /usr/bin/menu
-        /usr/bin/autoscriptx
-        /usr/bin/asx
-        /usr/bin/xray-menu
-        /usr/bin/slowdns-menu
-        /usr/bin/create-account
-        /usr/bin/delete-account
-        /usr/bin/edit-banner
-        /usr/bin/edit-response
-        /usr/bin/lock-unlock
-        /usr/bin/renew-account
-        /usr/bin/change-domain
-        /usr/bin/manage-services
-        /usr/bin/system-info
-        /usr/bin/clean-expired-accounts
-        /usr/bin/setup-slowdns
-        /usr/bin/slowdns-status
-    )
-    for _s in "${_scripts[@]}"; do
-        rm -f "$_s"
-    done
-    log_success "Helper scripts removed."
-
-    # ── 11. Remove cron jobs added by setup_cron_jobs() ──────────────────────
-    log_info "Removing AutoScriptX cron jobs..."
-    rm -f /etc/cron.d/auto-reboot
-    rm -f /etc/cron.d/clean-expired-accounts
-    service cron restart > /dev/null 2>&1 || true
-    log_success "Cron jobs removed."
-
-    # ── 12. Flush custom iptables FORWARD rules (BitTorrent blocking) ─────────
-    log_info "Flushing custom iptables FORWARD rules..."
-    local _bt_strings=(
-        "get_peers" "announce_peer" "find_node" "BitTorrent"
-        "BitTorrent protocol" "peer_id=" ".torrent"
-        "announce.php?passkey=" "torrent" "announce" "info_hash"
-    )
-    for _s in "${_bt_strings[@]}"; do
-        while iptables -D FORWARD -m string --string "$_s" --algo bm -j DROP > /dev/null 2>&1; do
-            true  # keep deleting until the rule no longer exists
-        done
-    done
-    # Remove the INPUT accept rules added for ports 80 and 443
-    iptables -D INPUT -p tcp --dport 80  -j ACCEPT > /dev/null 2>&1 || true
-    iptables -D INPUT -p tcp --dport 443 -j ACCEPT > /dev/null 2>&1 || true
-    # Remove the saved rules file written by this script
-    rm -f /etc/iptables.up.rules
-    # Persist the cleaned state
-    netfilter-persistent save > /dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    log_success "Custom iptables rules flushed."
-
-    # ── 13. Remove sysctl IPv6-disable config ─────────────────────────────────
-    log_info "Removing IPv6 disable sysctl config..."
-    rm -f /etc/sysctl.d/99-disable-ipv6.conf
-    sysctl --system > /dev/null 2>&1 || true
-    log_success "IPv6 sysctl config removed (IPv6 may re-enable after reboot)."
-
-    # ── 14. Remove Stunnel certificates written by this script ────────────────
-    log_info "Removing Stunnel self-signed certificate files..."
-    rm -f /etc/stunnel/key.pem
-    rm -f /etc/stunnel/cert.pem
-    rm -f /etc/stunnel/stunnel.pem
-    log_success "Stunnel certificates removed."
-
-    # ── 15. Remove Fail2ban custom filter written by this script ──────────────
-    log_info "Removing custom Fail2ban filter..."
-    rm -f /etc/fail2ban/filter.d/xray-auth.conf
-    rm -f /etc/fail2ban/jail.local
-    log_success "Fail2ban customisation removed."
-
-    echo ""
-    echo -e "${red}╔══════════════════════════════════════════════════════════════╗${nc}"
-    echo -e "${red}║           AutoScriptX Uninstall Complete                     ║${nc}"
-    echo -e "${red}╠══════════════════════════════════════════════════════════════╣${nc}"
-    echo -e "${red}║  All AutoScriptX services, configs, binaries, cron jobs,     ║${nc}"
-    echo -e "${red}║  and firewall rules have been removed.                       ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${red}║  Core OS packages (curl, jq, screen, etc.) were kept.        ║${nc}"
-    echo -e "${red}║  SSH host keys and existing SSL certificates were kept.      ║${nc}"
-    echo -e "${red}║                                                              ║${nc}"
-    echo -e "${yellow}║  ▶  A reboot is strongly recommended.                        ║${nc}"
-    echo -e "${red}╚══════════════════════════════════════════════════════════════╝${nc}"
-    echo ""
-    read -rp "  Reboot now? (y/N): " _do_reboot
-    if [[ "$_do_reboot" =~ ^[Yy]$ ]]; then
-        log_info "Rebooting..."
-        reboot
-    else
-        log_info "Reboot skipped. Please reboot manually when convenient."
-    fi
+    systemctl daemon-reload              >/dev/null 2>&1 || true
+    systemctl enable xray-limit-monitor  >/dev/null 2>&1 || true
+    systemctl restart xray-limit-monitor >/dev/null 2>&1 || true
 }
 
 install_scripts() {
     log_info "Installing scripts..."
-
-    # ── Attempt optional upstream downloads (best-effort, non-fatal) ─────────
-    # These augment the inline scripts below. If the upstream paths change or
-    # the repo is unavailable, every critical function still works because the
-    # core scripts are written inline further down.
+    load_manifest
     declare -A script_dirs=(
         [menu]="slowdns-menu.sh"
         [ssh]="create-account.sh delete-account.sh edit-banner.sh edit-response.sh lock-unlock.sh renew-account.sh"
         [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
+    local dir sc base
     for dir in "${!script_dirs[@]}"; do
-        for s in ${script_dirs[$dir]}; do
-            local base="${s%.sh}"
-            wget -qO "/usr/bin/${base}" "$BASE_URL/scripts/$dir/$s" > /dev/null 2>&1 \
-                && chmod +x "/usr/bin/${base}" \
-                || log_warning "Optional script unavailable (non-fatal): $s"
+        for sc in ${script_dirs[$dir]}; do
+            base="${sc%.sh}"
+            fetch "$BASE_URL/scripts/$dir/$sc" "/usr/bin/${base}" \
+                && chmod +x "/usr/bin/${base}" || log_warning "Optional script unavailable: $sc"
         done
     done
-
-    # Patch manage-services if the upstream download succeeded
     if [[ -s /usr/bin/manage-services ]]; then
-        sed -i 's/x-ui\.service/xray.service/g' /usr/bin/manage-services
-        sed -i 's/x-ui/xray/g'                  /usr/bin/manage-services
-        sed -i 's/X-UI/Xray/g'                  /usr/bin/manage-services
-        sed -i 's/XUI Watcher/Xray Watcher/g'   /usr/bin/manage-services
-        sed -i 's/XUI/Xray/g'                   /usr/bin/manage-services
+        sed -i -e 's/x-ui\.service/xray.service/g' -e 's/x-ui/xray/g' \
+               -e 's/X-UI/Xray/g' -e 's/XUI Watcher/Xray Watcher/g' -e 's/XUI/Xray/g' \
+               /usr/bin/manage-services
     fi
-
-    # Patch create-account: fix the xhttp protocol-match bug in the upstream script
     if [[ -s /usr/bin/create-account ]]; then
-        sed -i \
-            's/\.protocol == "vless"/(.tag | test("vless"))/g;
-             s/\.protocol == "vmess"/(.tag | test("vmess"))/g;
-             s/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
-            /usr/bin/create-account
+        sed -i -e 's/\.protocol == "vless"/(.tag | test("vless"))/g' \
+               -e 's/\.protocol == "vmess"/(.tag | test("vmess"))/g' \
+               -e 's/\.protocol == "trojan"/(.tag | test("trojan"))/g' \
+               /usr/bin/create-account
         log_success "create-account patched: xhttp tag-match fix applied."
     fi
-
-
-    # ── Write unified main menu (always inline, never depends on downloads) ───
-    _write_main_menu
-    rm -f /usr/bin/xray-menu   # clean up legacy binary if present from old installs
-
-    # ── Write bandwidth limit monitor daemon + systemd unit ───────────────────
+    _write_main_menu; rm -f /usr/bin/xray-menu
     _write_limit_monitor
-
-
-    # Optional: attempt uninstall.sh download (non-fatal)
-    wget -qO /etc/AutoScriptX/uninstall.sh "$BASE_URL/uninstall.sh" > /dev/null 2>&1 \
-        && chmod +x /etc/AutoScriptX/uninstall.sh \
-        || log_warning "Optional script unavailable (non-fatal): uninstall.sh"
-
+    fetch "$BASE_URL/uninstall.sh" "${ASX_DIR}/uninstall.sh" \
+        && chmod +x "${ASX_DIR}/uninstall.sh" || log_warning "Optional uninstall.sh unavailable."
+    [[ -n "$_manifest" ]] && rm -f "$_manifest" || true
     log_success "Scripts installed."
 }
 
-# Setup cron jobs
 setup_cron_jobs() {
     log_info "Setting up cron jobs..."
-    wget -qO /etc/cron.d/auto-reboot            "$BASE_URL/service/cron/auto-reboot"            || log_error "Failed to download auto-reboot."
-    wget -qO /etc/cron.d/clean-expired-accounts "$BASE_URL/service/cron/clean-expired-accounts" || log_error "Failed to download clean-expired-accounts."
-    service cron restart > /dev/null 2>&1
+    fetch "$BASE_URL/service/cron/auto-reboot"            /etc/cron.d/auto-reboot            || log_error "Failed: auto-reboot."
+    fetch "$BASE_URL/service/cron/clean-expired-accounts" /etc/cron.d/clean-expired-accounts || log_error "Failed: clean-expired-accounts."
+    chmod 644 /etc/cron.d/auto-reboot /etc/cron.d/clean-expired-accounts 2>/dev/null || true
+    service cron restart >/dev/null 2>&1 || true
     log_success "Cron jobs set up."
 }
 
-# Final cleanup and execution configuration
 final_cleanup() {
     log_info "Final cleanup..."
-    chown -R www-data:www-data /home/vps/public_html
-    history -c && echo "unset HISTFILE" >> /etc/profile
-    for link in autoscriptx asx; do
-        ln -sf /usr/bin/menu /usr/bin/$link
-        chmod +x /usr/bin/$link
-    done
+    chown -R www-data:www-data /home/vps/public_html 2>/dev/null || true
+    grep -qxF 'unset HISTFILE' /etc/profile || echo 'unset HISTFILE' >> /etc/profile
+    local link
+    for link in autoscriptx asx; do ln -sf /usr/bin/menu "/usr/bin/$link"; done
     log_success "Final cleanup done."
 }
 
-# Main Entry-point
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
+usage() {
+    cat <<USAGE
+AutoScriptX installer (hardened)
+  (no args)        Full install
+  --update-only    Non-destructive update of scripts/config (preserves users)
+  --verify-only    Check the live repo against SHA256SUMS (pre-release; no root)
+  --help           This message
+USAGE
+}
+
 main() {
+    case "${1:-}" in
+        --help|-h) usage; return 0 ;;
+        --verify-only) verify_release; return 0 ;;
+    esac
+
     check_root
+    mkdir -p /run/lock
+
     if [[ "${1:-}" == "--update-only" ]]; then
         log_info "Running in UPDATE-ONLY mode."
         update_script
@@ -2352,10 +1420,8 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "═══════════════════════════════════════════════════"
-    log_success " Installation complete!  AutoScriptX v4.1.0"
-    log_success " Run '${green}autoscriptx${nc}' or '${green}asx${nc}' to start."
-    log_success "═══════════════════════════════════════════════════"
+    log_success "Installation complete! AutoScriptX v4.2.0-hardened."
+    log_success "Run 'autoscriptx' or 'asx' to start."
 }
 
 main "$@"
