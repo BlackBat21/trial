@@ -2,7 +2,11 @@
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
 # Version : 4.2.0-hardened (xHTTP + WS, integrity-checked, injection-safe)
-# Repo    : BlackBat21/trial (single trust boundary for code + self-update)
+# Trust model (option B / split):
+#   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
+#   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
+# To go fully self-hosted later: mirror the asset tree into your repo and set
+#   BASE_URL="$REPO_RAW"  (one line) — nothing else changes.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -15,17 +19,16 @@ green="\033[0;32m"; blue="\033[0;34m"; red="\033[0;31m"
 yellow="\033[1;33m"; cyan="\033[0;36m"; nc="\033[0m"
 
 # ---------------------------------------------------------------------------
-# Configuration — ONE repository, ONE trust boundary.
-#   REPO_RAW      : source of truth for install.sh, configs, binaries,
-#                   helper scripts, AND self-update. Override at runtime with
-#                   AUTOSCRIPTX_REPO=... if you fork.
-#   MANIFEST_URL  : "sha256  path" list. When reachable, every fetched binary
-#                   is verified against it. Publish SHA256SUMS in the repo.
+# Configuration
+#   REPO_RAW  : YOUR repo — hosts install.sh (self-update) and SHA256SUMS.
+#   ASSET_URL : upstream — hosts config/, bin/, scripts/, service/, uninstall.sh.
+#               Override either with env vars if you fork or self-host.
 #   REQUIRE_INTEGRITY=1 aborts on any unverifiable binary (recommended prod).
 # ---------------------------------------------------------------------------
 REPO_RAW="${AUTOSCRIPTX_REPO:-https://raw.githubusercontent.com/BlackBat21/trial/main}"
-BASE_URL="$REPO_RAW"
-SELF_UPDATE_URL="${REPO_RAW}/install.sh"
+ASSET_URL="${AUTOSCRIPTX_ASSETS:-https://raw.githubusercontent.com/ayanrajpoot10/AutoScriptX/master}"
+BASE_URL="$ASSET_URL"                                    # configs / binaries / helper scripts
+SELF_UPDATE_URL="${REPO_RAW}/install.sh"                 # self-update from YOUR repo
 MANIFEST_URL="${AUTOSCRIPTX_MANIFEST:-${REPO_RAW}/SHA256SUMS}"
 REQUIRE_INTEGRITY="${REQUIRE_INTEGRITY:-0}"
 UA="AutoScriptX-Deployment"
@@ -151,32 +154,29 @@ json_edit() {
 
 # ---------------------------------------------------------------------------
 # --verify-only : check that every artifact referenced by the manifest is
-# actually reachable in the live repo and matches its published checksum.
-# Run this BEFORE cutting a release. Requires no root, makes no changes.
+# reachable in the live repo and matches its published checksum. Pre-release,
+# no root, no changes.
 # ---------------------------------------------------------------------------
 verify_release() {
     log_info "Verifying live repo against manifest: ${MANIFEST_URL}"
     load_manifest
     [[ -n "$_manifest" ]] || die "No manifest found at ${MANIFEST_URL}."
-    local fail=0 line sum key url tmp got
+    local fail=0 sum key url tmp got
     while read -r sum key; do
         [[ -z "$sum" || "$sum" == \#* ]] && continue
-        # Binaries live under bin/, release archives at repo root — try both.
-        for url in "${REPO_RAW}/${key}" "${REPO_RAW}/bin/${key}"; do
+        for url in "${REPO_RAW}/${key}" "${ASSET_URL}/${key}" "${ASSET_URL}/bin/${key}"; do
             tmp="$(mktemp)"
             if curl -fsSL -H "User-Agent: ${UA}" --max-time 30 -o "$tmp" "$url" 2>/dev/null && [[ -s "$tmp" ]]; then
                 got="$(sha256sum "$tmp" | awk '{print $1}')"
                 if [[ "$got" == "$sum" ]]; then
-                    log_success "OK   $key"
-                    rm -f "$tmp"; url=""; break
+                    log_success "OK   $key"; rm -f "$tmp"; url=""; break
                 else
-                    log_error "HASH $key (got $got want $sum) at $url"
-                    fail=1; rm -f "$tmp"; url=""; break
+                    log_error "HASH $key (got $got want $sum) at $url"; fail=1; rm -f "$tmp"; url=""; break
                 fi
             fi
             rm -f "$tmp"
         done
-        [[ -n "$url" ]] && { log_error "MISS $key (not reachable in repo)"; fail=1; }
+        [[ -n "$url" ]] && { log_error "MISS $key (not reachable)"; fail=1; }
     done < "$_manifest"
     rm -f "$_manifest"; _manifest=""
     [[ "$fail" -eq 0 ]] && log_success "Release verification PASSED." \
@@ -384,8 +384,6 @@ configure_xray() {
         | atomic_write "$CSV_DB"
     chmod 600 "${XRAY_DIR}/credentials.env" "$CSV_DB"
 
-    # config.json built with jq → $domain/uuids inserted as JSON DATA
-    # (no heredoc interpolation → no JSON-injection through the domain).
     jq -n \
       --arg vless "$uuid_vless" --arg vmess "$uuid_vmess" --arg trojan "$trojan_pass" \
       --arg domain "$domain" \
@@ -527,9 +525,13 @@ configure_nginx() {
 
     local f name path esc_dom
     esc_dom="$(printf '%s' "$domain" | sed 's/[&/\]/\\&/g')"
-    for f in "nginx.conf:/etc/nginx/nginx.conf" \
-             "reverse-proxy.conf:/etc/nginx/conf.d/reverse-proxy.conf" \
-             "real_ip_sources.conf:/etc/nginx/conf.d/real_ip_sources.conf"; do
+    # Split on spaces explicitly — global IFS=$'\n\t' would keep this as one token.
+    local -a nginx_files=(
+        "nginx.conf:/etc/nginx/nginx.conf"
+        "reverse-proxy.conf:/etc/nginx/conf.d/reverse-proxy.conf"
+        "real_ip_sources.conf:/etc/nginx/conf.d/real_ip_sources.conf"
+    )
+    for f in "${nginx_files[@]}"; do
         name="${f%%:*}"; path="${f##*:}"
         fetch "$BASE_URL/config/$name" "$path" || die "Failed to download $name."
         sed -i '/listen \[::\]/d' "$path"
@@ -630,7 +632,6 @@ failregex = .*rejected.*<HOST>.*
 ignoreregex =
 F2B_XRAY
 
-    # Xray access log now always exists (configured in configure_xray) → jail is live.
     mkdir -p /var/log/xray; : > /var/log/xray/access.log
     cat >> /etc/fail2ban/jail.local <<'F2B_XRAY_JAIL'
 
@@ -664,7 +665,6 @@ apply_firewall_rules() {
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
             || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
     done
-    # Persist ONLY via a full-table dump — never hand-append lines.
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
     cp /etc/iptables/rules.v4 /etc/iptables.up.rules
@@ -698,8 +698,11 @@ update_script() {
         [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
     local dir sc base
+    local -a _sc_list
     for dir in "${!script_dirs[@]}"; do
-        for sc in ${script_dirs[$dir]}; do
+        # FIX: split on whitespace regardless of global IFS=$'\n\t'.
+        read -r -a _sc_list <<< "${script_dirs[$dir]}"
+        for sc in "${_sc_list[@]}"; do
             base="${sc%.sh}"
             fetch "$BASE_URL/scripts/$dir/$sc" "/usr/bin/${base}" \
                 && chmod +x "/usr/bin/${base}" || log_warning "  Failed to update $sc."
@@ -727,7 +730,6 @@ update_script() {
     local cur_domain; cur_domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo localhost)"
     _write_xhttp_port80 "$cur_domain"
 
-    # Additive inbound patch (locked/atomic)
     if [[ -f "${XRAY_DIR}/config.json" ]]; then
         local ex_vless ex_vmess
         ex_vless="$(jq -r '.inbounds[]|select(.tag=="vless-ws")|.settings.clients[0].id // empty' "${XRAY_DIR}/config.json" 2>/dev/null || true)"
@@ -756,7 +758,6 @@ update_script() {
         [[ -f "${snap_dir}/${fn}" ]] && { cp -p "${snap_dir}/${fn}" "$p"; log_success "  Restored: $p"; }
     done
 
-    # Additive stats/api migration (post-restore, preserves UUIDs)
     if [[ -f "${XRAY_DIR}/config.json" ]]; then
         local cfg="${XRAY_DIR}/config.json"
         jq -e '.stats'  "$cfg" >/dev/null 2>&1 || json_edit "$cfg" "$CFG_LOCK" '. + {stats:{}}'
@@ -858,7 +859,6 @@ migrate_csv() {
     csv_unlock
 }
 
-# Single source of truth: add a client to inbounds by TAG (never protocol).
 _add_client_by_tag() {
     local user="$1" uuid="$2" tpw="$3"
     json_edit "$XRAY_CONF" "$CFG_LOCK" --arg user "$user" --arg uuid "$uuid" --arg tpw "$tpw" '
@@ -1226,7 +1226,6 @@ while true; do
     esac
 done
 MAINMENU
-    # Inject the trusted self-update URL (same repo as install) into the menu.
     sed -i "s|__SELF_UPDATE_URL__|${SELF_UPDATE_URL//|/\\|}|g" /usr/bin/menu
     chmod 0755 /usr/bin/menu
 }
@@ -1271,7 +1270,7 @@ suspend_user() {
 
 while true; do
     [[ -f "$CSV_DB" ]] || { sleep 60; continue; }
-    exec 8>"$CSV_LOCK"; flock 8            # exclusive across whole rewrite
+    exec 8>"$CSV_LOCK"; flock 8
     tmp_csv="$(mktemp "$(dirname "$CSV_DB")/.csv.XXXXXX")"
     head -1 "$CSV_DB" > "$tmp_csv"
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
@@ -1327,8 +1326,11 @@ install_scripts() {
         [system]="change-domain.sh manage-services.sh system-info.sh clean-expired-accounts.sh setup-slowdns.sh slowdns-status.sh"
     )
     local dir sc base
+    local -a _sc_list
     for dir in "${!script_dirs[@]}"; do
-        for sc in ${script_dirs[$dir]}; do
+        # FIX: split on whitespace regardless of global IFS=$'\n\t'.
+        read -r -a _sc_list <<< "${script_dirs[$dir]}"
+        for sc in "${_sc_list[@]}"; do
             base="${sc%.sh}"
             fetch "$BASE_URL/scripts/$dir/$sc" "/usr/bin/${base}" \
                 && chmod +x "/usr/bin/${base}" || log_warning "Optional script unavailable: $sc"
