@@ -254,11 +254,19 @@ configure_squid() {
 
 install_gum() {
     log_info "Installing gum..."
-    local ver="0.16.2" tgz
+    local ver="0.16.2" tgz gum_arch asset
+    # Match the CPU arch (install_xray already supports aarch64); otherwise an
+    # ARM VPS would silently pull an x86_64 binary that cannot execute.
+    case "$(uname -m)" in
+        x86_64)  gum_arch="x86_64" ;;
+        aarch64) gum_arch="arm64" ;;
+        *)       die "Unsupported arch for gum: $(uname -m)" ;;
+    esac
+    asset="gum_${ver}_Linux_${gum_arch}.tar.gz"
     tgz="$(mktemp)"
-    fetch "https://github.com/charmbracelet/gum/releases/download/v${ver}/gum_${ver}_Linux_x86_64.tar.gz" "$tgz" \
+    fetch "https://github.com/charmbracelet/gum/releases/download/v${ver}/${asset}" "$tgz" \
         || die "Failed to download gum."
-    verify_file "$tgz" "gum_${ver}_Linux_x86_64.tar.gz"
+    verify_file "$tgz" "$asset"
     tar -xzf "$tgz" -C /usr/local/bin --strip-components=1 --wildcards '*/gum'
     rm -f "$tgz"
     [[ -f /usr/local/bin/gum ]] || die "Failed to install gum."
@@ -408,19 +416,24 @@ configure_xray() {
           settings:{ address:"127.0.0.1" } },
         { tag:"vless-ws", listen:"127.0.0.1", port:$p_vw, protocol:"vless",
           settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/vless-ws" } } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vless-ws" } },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
         { tag:"vmess-ws", listen:"127.0.0.1", port:$p_mw, protocol:"vmess",
           settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/vmess-ws" } } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vmess-ws" } },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
         { tag:"trojan-ws", listen:"127.0.0.1", port:$p_tw, protocol:"trojan",
           settings:{ clients:[{password:$trojan,email:"admin_trojan"}] },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/trojan-ws" } } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/trojan-ws" } },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
         { tag:"vless-xhttp", listen:"127.0.0.1", port:$p_vx, protocol:"vless",
           settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
-          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } } },
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
         { tag:"vmess-xhttp", listen:"127.0.0.1", port:$p_mx, protocol:"vmess",
           settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
-          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } } }
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } }
       ],
       outbounds: [ { tag:"direct", protocol:"freedom" }, { tag:"blocked", protocol:"blackhole" } ]
     }' | atomic_write "${XRAY_DIR}/config.json"
@@ -650,16 +663,29 @@ F2B_XRAY_JAIL
 }
 
 apply_firewall_rules() {
-    log_info "Applying firewall rules..."
-    local s port
-    local iptables_rules=(
-        "get_peers" "announce_peer" "find_node" "BitTorrent"
-        "BitTorrent protocol" "peer_id=" ".torrent"
-        "announce.php?passkey=" "torrent" "announce" "info_hash"
+    log_info "Applying firewall rules (anti-torrent)..."
+    local s port chain
+    # Torrent payload signatures. Deliberately specific to minimise false
+    # positives now that we also filter the OUTPUT chain (see below):
+    #   - "BitTorrent protocol" : the classic peer handshake (pstr).
+    #   - get_peers/announce_peer/find_node : KRPC (DHT) query names.
+    #   - "d1:ad2:id20:"        : the bencoded prefix of a DHT query packet.
+    #   - info_hash/peer_id=/announce.php?passkey= : HTTP tracker announces.
+    #   - ".torrent"            : metainfo fetches over cleartext HTTP.
+    local -a torrent_sigs=(
+        "BitTorrent protocol" "get_peers" "announce_peer" "find_node"
+        "d1:ad2:id20:" "info_hash" "peer_id=" "announce.php?passkey=" ".torrent"
     )
-    for s in "${iptables_rules[@]}"; do
-        iptables -C FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1 \
-            || iptables -A FORWARD -m string --string "$s" --algo bm -j DROP
+    # Proxied traffic is *locally generated* by the xray process, so it leaves
+    # via OUTPUT — not FORWARD. Filter both so signatures are actually hit:
+    #   FORWARD : any routed/NAT'd traffic (e.g. badvpn/tun paths).
+    #   OUTPUT  : the proxy's own upstream connections (the real torrent path).
+    # -m string with no -p also inspects UDP payloads, covering uTP/DHT.
+    for chain in FORWARD OUTPUT; do
+        for s in "${torrent_sigs[@]}"; do
+            iptables -C "$chain" -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1 \
+                || iptables -A "$chain" -m string --string "$s" --algo bm -j DROP
+        done
     done
     for port in 22 80 443 8080; do
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
@@ -670,7 +696,7 @@ apply_firewall_rules() {
     cp /etc/iptables/rules.v4 /etc/iptables.up.rules
     netfilter-persistent save   >/dev/null 2>&1 || true
     netfilter-persistent reload >/dev/null 2>&1 || true
-    log_success "Firewall rules applied."
+    log_success "Firewall rules applied (torrent signatures dropped on FORWARD + OUTPUT)."
 }
 
 # ===========================================================================
@@ -773,6 +799,24 @@ update_script() {
             || json_edit "$cfg" "$CFG_LOCK" '.routing.rules = [{type:"field",inboundTag:["api"],outboundTag:"direct"}] + .routing.rules'
         jq -e '.log.access' "$cfg" >/dev/null 2>&1 \
             || json_edit "$cfg" "$CFG_LOCK" '.log = ((.log // {}) + {access:"/var/log/xray/access.log",error:"/var/log/xray/error.log",loglevel:"warning"})'
+
+        # --- Anti-torrent migration (idempotent) ---
+        # 1) Enable sniffing on every proxy inbound. The bittorrent protocol
+        #    matcher (below) is a silent no-op unless sniffing is enabled, so
+        #    older configs were never actually blocking torrents at L7.
+        json_edit "$cfg" "$CFG_LOCK" '
+          .inbounds |= map(
+            if (.protocol=="vless" or .protocol=="vmess" or .protocol=="trojan")
+            then .sniffing = {enabled:true,destOverride:["http","tls","quic"],routeOnly:true}
+            else . end )' \
+            && log_success "  sniffing enabled on proxy inbounds."
+        # 2) Ensure a blackhole outbound named "blocked" exists.
+        jq -e '.outbounds[]?|select(.tag=="blocked")' "$cfg" >/dev/null 2>&1 \
+            || json_edit "$cfg" "$CFG_LOCK" '.outbounds = ((.outbounds // []) + [{tag:"blocked",protocol:"blackhole"}])'
+        # 3) Ensure the bittorrent -> blocked routing rule exists.
+        jq -e '.routing.rules[]?|select(.protocol and (.protocol|index("bittorrent")))' "$cfg" >/dev/null 2>&1 \
+            || json_edit "$cfg" "$CFG_LOCK" '.routing = (.routing // {domainStrategy:"AsIs"}) | .routing.rules = ((.routing.rules // []) + [{type:"field",protocol:["bittorrent"],outboundTag:"blocked"}])' \
+            && log_success "  bittorrent routing rule ensured."
         log_success "  config.json migration complete."
     fi
 
@@ -1193,13 +1237,18 @@ full_uninstall() {
           /usr/bin/system-info /usr/bin/clean-expired-accounts /usr/bin/setup-slowdns /usr/bin/slowdns-status
     rm -f /etc/cron.d/auto-reboot /etc/cron.d/clean-expired-accounts
     service cron restart >/dev/null 2>&1 || true
-    local s
-    for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
-             ".torrent" "announce.php?passkey=" torrent announce info_hash; do
-        while iptables -D FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
+    local s chain
+    # Union of legacy + current signatures, cleared from BOTH chains, so an
+    # uninstall fully reverts firewall state regardless of installer version.
+    for chain in FORWARD OUTPUT; do
+        for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
+                 ".torrent" "announce.php?passkey=" torrent announce info_hash "d1:ad2:id20:"; do
+            while iptables -D "$chain" -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
+        done
     done
-    iptables -D INPUT -p tcp --dport 80  -j ACCEPT >/dev/null 2>&1 || true
-    iptables -D INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+    for port in 22 80 443 8080; do
+        while iptables -D INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do :; done
+    done
     rm -f /etc/iptables.up.rules
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     rm -f /etc/sysctl.d/99-disable-ipv6.conf; sysctl --system >/dev/null 2>&1 || true
