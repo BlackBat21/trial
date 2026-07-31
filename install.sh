@@ -15,8 +15,30 @@ umask 077
 # ---------------------------------------------------------------------------
 # Colors
 # ---------------------------------------------------------------------------
-green="\033[0;32m"; blue="\033[0;34m"; red="\033[0;31m"
-yellow="\033[1;33m"; cyan="\033[0;36m"; nc="\033[0m"
+# Capability-tiered theme. Collapses to plain text on dumb terminals, pipes,
+# or when NO_COLOR is set, so install logs stay readable over bad SSH links.
+_asx_theme_init() {
+    local tiers=0
+    if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+        tiers="$(tput colors 2>/dev/null || echo 8)"
+        [[ "$tiers" =~ ^[0-9]+$ ]] || tiers=8
+    fi
+    if (( tiers >= 8 )); then
+        g0=$'\033[2;32m'; g1=$'\033[0;32m'; g2=$'\033[1;32m'
+        gy=$'\033[1;33m'; gr=$'\033[1;31m'; gw=$'\033[1;37m'; nc=$'\033[0m'
+        if (( tiers >= 256 )); then
+            g0=$'\033[38;5;22m'; g1=$'\033[38;5;40m'; g2=$'\033[38;5;46m'
+        fi
+    else
+        g0=""; g1=""; g2=""; gy=""; gr=""; gw=""; nc=""
+    fi
+}
+g0=""; g1=""; g2=""; gy=""; gr=""; gw=""; nc=""
+GL_OK="OK"; GL_INFO="::"; GL_WARN="!!"; GL_ERR="xx"; GL_STEP=">>"
+_asx_theme_init
+
+# Legacy aliases: every pre-existing echo in this script still resolves.
+green="$g1"; blue="$g0"; red="$gr"; yellow="$gy"; cyan="$g2"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,10 +79,11 @@ localip="" ; public_ip="" ; hostname_v="" ; domain=""
 # ---------------------------------------------------------------------------
 # Logging + error trap
 # ---------------------------------------------------------------------------
-log_info()    { echo -e "${blue}[ Info    ]${nc} $1"; }
-log_success() { echo -e "${green}[ Success ]${nc} $1"; }
-log_error()   { echo -e "${red}[ Error   ]${nc} $1" >&2; }
-log_warning() { echo -e "${yellow}[ Warning ]${nc} $1" >&2; }
+log_info()    { printf '%s\n' "${g0}[${GL_INFO}]${nc} $1"; }
+log_success() { printf '%s\n' "${g2}[${GL_OK}]${nc} ${g1}$1${nc}"; }
+log_error()   { printf '%s\n' "${gr}[${GL_ERR}]${nc} $1" >&2; }
+log_warning() { printf '%s\n' "${gy}[${GL_WARN}]${nc} $1" >&2; }
+log_step()    { printf '%s\n' "" "${g2}${GL_STEP}${nc} ${gw}$1${nc}"; }
 die() { log_error "$1"; exit "${2:-1}"; }
 on_err() { log_error "Failed at line ${1} (exit ${2}). Aborting."; }
 trap 'on_err "$LINENO" "$?"' ERR
@@ -282,13 +305,75 @@ EOF
     log_success "IPv6 disabled."
 }
 
+# ---------------------------------------------------------------------------
+# Themed SSH login banner (dropbear + OpenSSH). Generated locally so the node
+# still gets a banner when the remote asset fetch fails.
+# ---------------------------------------------------------------------------
+_write_ssh_banner() {
+    mkdir -p "$ASX_DIR"
+    local host bf tmp
+    host="${domain:-}"
+    [[ -z "$host" ]] && host="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo "")"
+    [[ -z "$host" ]] && host="${public_ip:-unknown}"
+    bf="${ASX_DIR}/banner"
+    tmp="$(mktemp "${ASX_DIR}/.banner.XXXXXX")"
+    # Quoted heredoc: no expansion, no backslash mangling. Host is injected after.
+    cat > "$tmp" <<'BANNEREOF'
++==============================================================+
+|            A U T O S C R I P T X   //   N O D E              |
+|                 secure access gateway                        |
++==============================================================+
+|  HOST    : __HOST__
+|  LINK    : SECURE CHANNEL ESTABLISHED
++--------------------------------------------------------------+
+|  >>  ALL SESSIONS ARE MONITORED AND LOGGED                   |
+|  >>  UNAUTHORIZED ACCESS IS PROHIBITED                       |
+|  >>  P2P / BITTORRENT TRAFFIC IS BLOCKED AND REPORTED        |
+|  >>  ACCOUNT SHARING MAY RESULT IN SUSPENSION                |
++==============================================================+
+BANNEREOF
+    sed -i "s|__HOST__|${host}|" "$tmp"
+    if [[ -s "$tmp" ]]; then
+        chmod 644 "$tmp"; mv -f "$tmp" "$bf"
+    else
+        rm -f "$tmp"; log_warning "Failed to generate SSH banner."; return 1
+    fi
+
+    # Wire into dropbear without clobbering the rest of its config.
+    if [[ -f /etc/default/dropbear ]]; then
+        if grep -q '^DROPBEAR_BANNER=' /etc/default/dropbear; then
+            sed -i "s|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=\"${bf}\"|" /etc/default/dropbear
+        else
+            printf 'DROPBEAR_BANNER="%s"\n' "$bf" >> /etc/default/dropbear
+        fi
+    fi
+
+    # Wire into OpenSSH via issue.net, reverting if sshd rejects the config.
+    cp -f "$bf" /etc/issue.net 2>/dev/null || true
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.asx.bak 2>/dev/null || true
+        if grep -qE '^[[:space:]]*Banner[[:space:]]' /etc/ssh/sshd_config; then
+            sed -i 's|^[[:space:]]*Banner[[:space:]].*|Banner /etc/issue.net|' /etc/ssh/sshd_config
+        else
+            echo 'Banner /etc/issue.net' >> /etc/ssh/sshd_config
+        fi
+        if sshd -t >/dev/null 2>&1; then
+            systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+        else
+            log_warning "sshd_config rejected the banner directive; reverting."
+            mv -f /etc/ssh/sshd_config.asx.bak /etc/ssh/sshd_config 2>/dev/null || true
+        fi
+        rm -f /etc/ssh/sshd_config.asx.bak
+    fi
+    log_success "SSH login banner installed."
+}
+
 configure_dropbear() {
     log_info "Configuring Dropbear..."
     fetch "$BASE_URL/config/dropbear.conf" /etc/default/dropbear || die "Failed to download dropbear.conf."
     chmod 644 /etc/default/dropbear
     mkdir -p "$ASX_DIR"
-    fetch "$BASE_URL/config/banner.conf" "${ASX_DIR}/banner" || log_warning "Failed to download banner."
-    chmod 644 "${ASX_DIR}/banner" 2>/dev/null || true
+    _write_ssh_banner || log_warning "Continuing without a custom banner."
     grep -qxF '/bin/false'        /etc/shells || echo '/bin/false'        >> /etc/shells
     grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -955,7 +1040,7 @@ update_script() {
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
     log_success "Update complete. Version 4.3.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
-    read -rp "Press Enter to return..." _ || true
+    ui_pause
 }
 
 # ===========================================================================
@@ -973,8 +1058,133 @@ ASX_DIR="/etc/AutoScriptX"
 CSV_LOCK="/run/lock/autoscriptx-csv.lock"
 CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 
-green="\033[0;32m"; blue="\033[0;34m"; yellow="\033[1;33m"
-red="\033[0;31m"; cyan="\033[0;36m"; nc="\033[0m"
+# ---------------------------------------------------------------------------
+# UI render layer. Presentation only - no business logic lives below.
+# Degrades cleanly: no colour on dumb terminals / pipes / NO_COLOR, and ASCII
+# frames when the locale cannot measure multibyte glyphs.
+# ---------------------------------------------------------------------------
+UI_W=64
+_ui_init() {
+    local tiers=0
+    if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+        tiers="$(tput colors 2>/dev/null || echo 8)"
+        [[ "$tiers" =~ ^[0-9]+$ ]] || tiers=8
+    fi
+    if (( tiers >= 8 )); then
+        g0=$'\033[2;32m'; g1=$'\033[0;32m'; g2=$'\033[1;32m'
+        gy=$'\033[1;33m'; gr=$'\033[1;31m'; gw=$'\033[1;37m'
+        gb=$'\033[7;32m'; nc=$'\033[0m'
+        if (( tiers >= 256 )); then
+            g0=$'\033[38;5;22m'; g1=$'\033[38;5;40m'; g2=$'\033[38;5;46m'
+        fi
+    else
+        g0=""; g1=""; g2=""; gy=""; gr=""; gw=""; gb=""; nc=""
+    fi
+    # A box glyph must measure as exactly one character, otherwise ${#str}
+    # counts bytes and every frame comes out ragged.
+    local _probe=$'\u2500'
+    if [[ "${LC_ALL:-}${LC_CTYPE:-}${LANG:-}" == *[Uu][Tt][Ff]* && ${#_probe} -eq 1 ]]; then
+        BX_H=$'\u2500'; BX_V=$'\u2502'; BX_TL=$'\u250c'; BX_TR=$'\u2510'
+        BX_BL=$'\u2514'; BX_BR=$'\u2518'; BX_ML=$'\u251c'; BX_MR=$'\u2524'
+        GL_ARROW=$'\u25b8'; GL_DOT=$'\u2022'; GL_FULL=$'\u2588'; GL_EMPTY=$'\u2591'
+    else
+        BX_H="-"; BX_V="|"; BX_TL="+"; BX_TR="+"
+        BX_BL="+"; BX_BR="+"; BX_ML="+"; BX_MR="+"
+        GL_ARROW=">"; GL_DOT="*"; GL_FULL="#"; GL_EMPTY="."
+    fi
+    # Adapt to the real terminal, clamped so frames never wrap on mobile SSH.
+    local cols; cols="$(tput cols 2>/dev/null || echo 80)"
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    UI_W=$(( cols - 6 )); (( UI_W > 72 )) && UI_W=72; (( UI_W < 56 )) && UI_W=56
+}
+g0=""; g1=""; g2=""; gy=""; gr=""; gw=""; gb=""; nc=""
+BX_H="-"; BX_V="|"; BX_TL="+"; BX_TR="+"; BX_BL="+"; BX_BR="+"; BX_ML="+"; BX_MR="+"
+GL_ARROW=">"; GL_DOT="*"; GL_FULL="#"; GL_EMPTY="."
+_ui_init
+
+# Legacy aliases so every pre-existing echo in this script still resolves.
+green="$g1"; blue="$g0"; yellow="$gy"; red="$gr"; cyan="$g2"
+
+# Visible length, ignoring ANSI escapes, so frames stay aligned even when the
+# caller embeds colour mid-string. Quoting "${esc}[" keeps the bracket literal
+# instead of starting a bracket expression.
+ui_vlen() {
+    local s="$1" out="" esc=$'\033'
+    while [[ "$s" == *"${esc}["* ]]; do
+        out+="${s%%"${esc}["*}"
+        s="${s#*"${esc}["}"
+        s="${s#*m}"
+    done
+    out+="$s"
+    printf '%s' "${#out}"
+}
+ui_pad() { local n="${1:-0}"; (( n > 0 )) && printf '%*s' "$n" '' || true; }
+ui_rule() {
+    local w="${1:-$UI_W}" i out=""
+    for (( i = 0; i < w; i++ )); do out+="$BX_H"; done
+    printf '%s' "$out"
+}
+ui_top() { printf '%s\n' "${g1}${BX_TL}$(ui_rule "$(( UI_W + 2 ))")${BX_TR}${nc}"; }
+ui_mid() { printf '%s\n' "${g1}${BX_ML}$(ui_rule "$(( UI_W + 2 ))")${BX_MR}${nc}"; }
+ui_bot() { printf '%s\n' "${g1}${BX_BL}$(ui_rule "$(( UI_W + 2 ))")${BX_BR}${nc}"; }
+ui_line() {
+    local txt="${1:-}" vis pad
+    vis="$(ui_vlen "$txt")"; pad=$(( UI_W - vis )); (( pad < 0 )) && pad=0
+    printf '%s\n' "${g1}${BX_V}${nc} ${txt}$(ui_pad "$pad") ${g1}${BX_V}${nc}"
+}
+# Pad to an exact column width, truncating overlong values with a tilde so a
+# 32-character username can never break the frame.
+ui_fit() {
+    local w="${1:-10}" s="${2:-}"
+    if (( ${#s} > w )); then printf '%s~' "${s:0:$(( w - 1 ))}"
+    else printf '%-*s' "$w" "$s"; fi
+}
+ui_kv() { ui_line "${g0}$(printf '%-9s' "${1}")${nc} ${g1}${GL_DOT}${nc} ${gw}${2}${nc}"; }
+ui_item() {
+    local a="${g2}${1}${nc}${g0})${nc} ${gw}$(printf '%-24s' "${2}")${nc}"
+    if [[ -n "${3:-}" ]]; then
+        ui_line "${a} ${g2}${3}${nc}${g0})${nc} ${gw}${4}${nc}"
+    else
+        ui_line "$a"
+    fi
+}
+ui_sector() { ui_line "${g0}${GL_ARROW} ${1}${nc}"; }
+ui_pill() {
+    case "${1:-}" in
+        on|ok|up)  printf '%s' "${g2}[ ONLINE  ]${nc}" ;;
+        off|down)  printf '%s' "${gr}[ OFFLINE ]${nc}" ;;
+        warn)      printf '%s' "${gy}[ DEGRADED]${nc}" ;;
+        armed)     printf '%s' "${g2}[ ARMED   ]${nc}" ;;
+        unarmed)   printf '%s' "${gr}[ UNARMED ]${nc}" ;;
+        *)         printf '%s' "${g0}[ UNKNOWN ]${nc}" ;;
+    esac
+}
+ui_bar() {
+    local p="${1:-0}" w="${2:-20}" f i out=""
+    [[ "$p" =~ ^[0-9]+$ ]] || p=0; (( p > 100 )) && p=100
+    f=$(( p * w / 100 ))
+    for (( i = 0; i < w; i++ )); do
+        if (( i < f )); then out+="$GL_FULL"; else out+="$GL_EMPTY"; fi
+    done
+    if   (( p >= 90 )); then printf '%s' "${gr}${out}${nc}"
+    elif (( p >= 70 )); then printf '%s' "${gy}${out}${nc}"
+    else                     printf '%s' "${g2}${out}${nc}"; fi
+}
+ui_ok()   { printf '%s\n' "  ${g2}[OK]${nc} ${1}"; }
+ui_warn() { printf '%s\n' "  ${gy}[!!]${nc} ${1}"; }
+ui_err()  { printf '%s\n' "  ${gr}[xx]${nc} ${1}"; }
+ui_info() { printf '%s\n' "  ${g0}[::]${nc} ${1}"; }
+ui_title()  { ui_mid; ui_line "${gb} ${1} ${nc}"; ui_mid; }
+ui_banner() { ui_top; ui_line "${gb} ${1} ${nc}"; ui_bot; }
+ui_screen() { ui_top; ui_line "${gb} ${1} ${nc}"; ui_mid; }
+ui_head()   { ui_line "${g0}${1}${nc}"; ui_line "${g0}$(ui_rule "$UI_W")${nc}"; }
+ui_pause()  { printf '%s' "  ${g0}${GL_ARROW}${nc} press ${g2}ENTER${nc} to return "; read -r _ || true; }
+ui_prompt() {
+    local __l="$1" __v="$2" __r=""
+    printf '%s' "  ${g2}${GL_ARROW}${nc} ${gw}${__l}${nc} "
+    read -r __r || true
+    printf -v "$__v" '%s' "$__r"
+}
 
 validate_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
 validate_domain()   { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$ && "$1" != *".."* ]]; }
@@ -999,16 +1209,24 @@ _get_xray_ver() {
 }
 show_header() {
     clear
-    local domain uptime_str
+    # Data gathering is unchanged; only the rendering below is new.
+    local domain uptime_str accounts core guard
     domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
     uptime_str="$(uptime -p 2>/dev/null || echo '?')"
-    echo -e "${cyan}================================================${nc}"
-    echo -e "${cyan}       AutoScriptX  v4.3.0  |  Main Menu       ${nc}"
-    echo -e "${cyan}------------------------------------------------${nc}"
-    printf  "  Domain  : %s\n" "$domain"
-    printf  "  Xray    : %s\n" "$(_get_xray_ver)"
-    printf  "  Uptime  : %s\n" "$uptime_str"
-    echo -e "${cyan}================================================${nc}"
+    accounts="$(awk -F',' 'NR>1 && $1 != "" {c++} END{print c+0}' "$CSV_DB" 2>/dev/null || echo 0)"
+    if systemctl is-active --quiet xray 2>/dev/null; then core="on"; else core="off"; fi
+    if iptables -nL ASX-TORRENT-IN >/dev/null 2>&1; then guard="armed"; else guard="unarmed"; fi
+
+    ui_top
+    ui_line "${g2}   A U T O S C R I P T X${nc}  ${g0}//${nc}  ${gw}CONTROL CONSOLE${nc}"
+    ui_line "${g0}   secure access gateway ${GL_DOT} v4.3.0-hardened${nc}"
+    ui_mid
+    ui_kv "NODE"     "$domain"
+    ui_kv "XRAY"     "$(_get_xray_ver)"
+    ui_kv "UPTIME"   "$uptime_str"
+    ui_kv "ACCOUNTS" "$accounts provisioned"
+    ui_line "${g0}$(printf '%-9s' CORE)${nc} ${g1}${GL_DOT}${nc} $(ui_pill "$core")   ${g0}GUARD${nc} $(ui_pill "$guard")"
+    ui_bot
 }
 fmt_bytes() {
     local b="${1:-0}"; b="$(echo "$b" | tr -dc '0-9')"; b="${b:-0}"
@@ -1079,7 +1297,7 @@ create_account() {
     limit_gb="$(echo "${limit_gb:-0}" | tr -dc '0-9')"; limit_gb="${limit_gb:-0}"
 
     if id "$u_name" &>/dev/null; then
-        echo -e "${red}  User '$u_name' already exists.${nc}"; read -rp "  Enter..." _; return
+        echo -e "${red}  User '$u_name' already exists.${nc}"; ui_pause; return
     fi
     repair_xhttp_clients
 
@@ -1126,14 +1344,14 @@ create_account() {
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
     echo "vmess://${vx_b64}"
     echo ""
-    read -rp "Press Enter to return..." _ || true
+    ui_pause
 }
 
 delete_account() {
     show_header; migrate_csv
-    echo -e "${blue}-- Delete Account --${nc}\n"
+    ui_banner "DELETE ACCOUNT"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
-        echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
+        echo -e "  ${yellow}No accounts.${nc}"; ui_pause; return
     fi
     printf "  %-20s %-12s %-10s %-10s\n" USERNAME EXPIRY LIMIT USED
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
@@ -1145,7 +1363,7 @@ delete_account() {
     [[ -z "$u_name" ]] && return
     validate_username "$u_name" || { echo -e "${red}  Invalid username.${nc}"; sleep 2; return; }
     if ! grep -q "^${u_name}," "$CSV_DB"; then
-        echo -e "${red}  Not found.${nc}"; read -rp "  Enter..." _; return
+        echo -e "${red}  Not found.${nc}"; ui_pause; return
     fi
     json_edit "$XRAY_CONF" "$CFG_LOCK" --arg user "$u_name" \
       '.inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $user)) else . end)'
@@ -1156,17 +1374,17 @@ delete_account() {
     grep -v "^${u_name}," "$CSV_DB" > "$tmp" || true
     mv -f "$tmp" "$CSV_DB"; chmod 600 "$CSV_DB"
     csv_unlock
-    echo -e "${green}  Account '${u_name}' deleted.${nc}"; read -rp "  Enter..." _ || true
+    echo -e "${green}  Account '${u_name}' deleted.${nc}"; ui_pause
 }
 
 list_accounts() {
     show_header; migrate_csv
-    echo -e "${blue}-- Active Accounts --${nc}\n"
+    ui_screen "ACTIVE ACCOUNTS"
     if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
-        echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
+        ui_line "${gy}no accounts provisioned${nc}"; ui_bot; ui_pause; return
     fi
     local today; today="$(date +%Y-%m-%d)"
-    printf "  %-16s %-12s %-10s %-10s %-5s %-8s\n" USERNAME EXPIRY USED LIMIT % STATUS
+    ui_head "$(printf '%-13s %-10s %-10s %-9s %-4s %s' USER EXPIRY USED LIMIT PCT STATE)"
     while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
         [[ "$name" == "Username" ]] && continue
         limit_gb="${limit_gb:-0}"; used_bytes="$(echo "${used_bytes:-0}"|tr -dc '0-9')"; used_bytes="${used_bytes:-0}"
@@ -1174,13 +1392,14 @@ list_accounts() {
         if [[ "$limit_gb" -eq 0 ]]; then lstr="Unlimited"; pct="-"
         else lstr="${limit_gb} GB"; local lb=$(( limit_gb*1024*1024*1024 ))
              [[ $lb -gt 0 ]] && pct="$(( used_bytes*100/lb ))%" || pct="-"; fi
-        if [[ "$exp" < "$today" ]]; then status="${red}Expired${nc}"
-        elif [[ "$limit_gb" -gt 0 && "$used_bytes" -ge $(( limit_gb*1024*1024*1024 )) ]]; then status="${red}CAPPED${nc}"
-        else status="${green}Active${nc}"; fi
-        printf "  %-16s %-12s %-10s %-10s %-5s " "$name" "$exp" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct"
-        echo -e "$status"
+        if [[ "$exp" < "$today" ]]; then status="${gr}EXPIRED${nc}"
+        elif [[ "$limit_gb" -gt 0 && "$used_bytes" -ge $(( limit_gb*1024*1024*1024 )) ]]; then status="${gr}CAPPED${nc}"
+        else status="${g2}ACTIVE${nc}"; fi
+        # Padding is applied to uncoloured text, then colour is wrapped around
+        # it, so the frame stays aligned.
+        ui_line "${gw}$(ui_fit 13 "$name")${nc} ${g0}$(ui_fit 10 "$exp")${nc} $(ui_fit 10 "$(fmt_bytes "$used_bytes")") $(printf '%-9s %-4s' "$lstr" "$pct") ${status}"
     done < "$CSV_DB"
-    echo ""; read -rp "Press Enter to return..." _ || true
+    ui_bot; ui_pause
 }
 
 _bw_reset_user() {
@@ -1220,79 +1439,96 @@ _bw_set_limit() {
 bandwidth_monitor() {
     while true; do
         show_header; migrate_csv
-        echo -e "${blue}-- Bandwidth Monitor --${nc}\n"
+        ui_screen "BANDWIDTH TELEMETRY"
         if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
-            echo -e "  ${yellow}No accounts.${nc}"; read -rp "  Enter..." _; return
+            ui_line "${gy}no accounts provisioned${nc}"; ui_bot; ui_pause; return
         fi
-        printf "  %-16s %-10s %-10s %-6s %-10s\n" USERNAME USED LIMIT % STATUS
+        local mw=20; (( UI_W < 68 )) && mw=10
+        ui_head "$(printf '%-13s %-10s %-9s %-*s %s' USER USED LIMIT "$(( mw + 6 ))" METER STATE)"
         while IFS=',' read -r name pass uuid trojan exp limit_gb used_bytes; do
             [[ "$name" == "Username" ]] && continue
             limit_gb="${limit_gb:-0}"; used_bytes="$(echo "${used_bytes:-0}"|tr -dc '0-9')"; used_bytes="${used_bytes:-0}"
-            local lstr pct status
-            if [[ "$limit_gb" -eq 0 ]]; then lstr="Unlimited"; pct="-"; status="${green}Active${nc}"
-            else lstr="${limit_gb} GB"; local lb=$(( limit_gb*1024*1024*1024 )) p=0
-                 [[ $lb -gt 0 ]] && p=$(( used_bytes*100/lb )); pct="${p}%"
-                 if   [[ $used_bytes -ge $lb ]]; then status="${red}CAPPED${nc}"
-                 elif [[ $p -ge 80 ]]; then status="${yellow}Warning${nc}"
-                 else status="${green}Active${nc}"; fi; fi
-            printf "  %-16s %-10s %-10s %-6s " "$name" "$(fmt_bytes "$used_bytes")" "$lstr" "$pct"
-            echo -e "$status"
+            local lstr pct status meter p=0
+            if [[ "$limit_gb" -eq 0 ]]; then
+                lstr="Unlimited"; pct="-"; status="${g2}ACTIVE${nc}"
+                meter="${g0}$(ui_pad "$mw")${nc}"
+            else
+                lstr="${limit_gb} GB"; local lb=$(( limit_gb*1024*1024*1024 ))
+                [[ $lb -gt 0 ]] && p=$(( used_bytes*100/lb )); pct="${p}%"
+                meter="$(ui_bar "$p" "$mw")"
+                if   [[ $used_bytes -ge $lb ]]; then status="${gr}CAPPED${nc}"
+                elif [[ $p -ge 80 ]]; then status="${gy}WARNING${nc}"
+                else status="${g2}ACTIVE${nc}"; fi
+            fi
+            ui_line "${gw}$(ui_fit 13 "$name")${nc} $(ui_fit 10 "$(fmt_bytes "$used_bytes")") $(printf '%-9s' "$lstr") ${meter} $(printf '%-5s' "$pct") ${status}"
         done < "$CSV_DB"
-        echo -e "\n  ${green}r)${nc} Reset  ${green}s)${nc} Set limit  ${green}0)${nc} Back\n"
-        read -rp "  Select: " o
+        ui_mid
+        ui_line "${g2}r${nc}${g0})${nc} ${gw}Reset counter${nc}   ${g2}s${nc}${g0})${nc} ${gw}Set limit${nc}   ${gr}0${nc}${g0})${nc} ${gw}Back${nc}"
+        ui_bot
+        local o; ui_prompt "select" o
         case "$o" in r|R) _bw_reset_user;; s|S) _bw_set_limit;; 0) return;; *) sleep 1;; esac
     done
 }
 
 service_status() {
-    show_header; echo -e "${blue}-- Service Status --${nc}\n"
+    show_header
+    ui_screen "SERVICE MATRIX"
     local svc
     for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor asx-torrent-watch; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then echo -e "  ${green}[on ]${nc} $svc"
-        else echo -e "  ${red}[off]${nc} $svc"; fi
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            ui_line "$(ui_pill on)  ${gw}${svc}${nc}"
+        else
+            ui_line "$(ui_pill off)  ${g0}${svc}${nc}"
+        fi
     done
-    echo ""; read -rp "Press Enter to return..." _ || true
+    ui_bot; ui_pause
 }
 restart_services() {
-    show_header; echo -e "${blue}Restarting services...${nc}\n"
+    show_header
+    ui_screen "SERVICE RESTART SEQUENCE"
     local svc
     for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor asx-torrent-watch; do
-        systemctl restart "$svc" >/dev/null 2>&1 && echo -e "  ${green}[ok]${nc} $svc" \
-            || echo -e "  ${yellow}[!!]${nc} $svc"
+        if systemctl restart "$svc" >/dev/null 2>&1; then
+            ui_line "${g2}[ RESTARTED ]${nc}  ${gw}${svc}${nc}"
+        else
+            ui_line "${gy}[  FAILED   ]${nc}  ${g0}${svc}${nc}"
+        fi
     done
-    echo ""; read -rp "Press Enter to return..." _ || true
+    ui_bot; ui_pause
 }
 system_info() {
-    show_header; echo -e "${blue}-- System Info --${nc}\n"
-    echo -e "  OS     : $(grep PRETTY_NAME /etc/os-release 2>/dev/null|cut -d= -f2|tr -d '\"')"
-    echo -e "  Kernel : $(uname -r)"
-    echo -e "  CPU    : $(nproc) core(s)"
-    echo -e "  RAM    : $(free -h|awk '/^Mem/{print $3" used / "$2" total"}')"
-    echo -e "  Disk   : $(df -h /|awk 'NR==2{print $3" used / "$2" ("$5")"}')"
-    local lip pip; lip="$(hostname -I|awk '{print $1}')"
+    show_header
+    ui_screen "HOST DIAGNOSTICS"
+    local lip pip
+    ui_kv "OS"     "$(grep PRETTY_NAME /etc/os-release 2>/dev/null|cut -d= -f2|tr -d '\"')"
+    ui_kv "KERNEL" "$(uname -r)"
+    ui_kv "CPU"    "$(nproc) core(s)"
+    ui_kv "RAM"    "$(free -h|awk '/^Mem/{print $3" used / "$2" total"}')"
+    ui_kv "DISK"   "$(df -h /|awk 'NR==2{print $3" used / "$2" ("$5")"}')"
+    lip="$(hostname -I|awk '{print $1}')"
     pip="$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "$lip")"
-    echo -e "  IP     : $pip"
-    echo -e "  Domain : $(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
-    echo -e "  Uptime : $(uptime -p 2>/dev/null)"
-    echo ""; read -rp "Press Enter to return..." _ || true
+    ui_kv "IP"     "$pip"
+    ui_kv "DOMAIN" "$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
+    ui_kv "UPTIME" "$(uptime -p 2>/dev/null)"
+    ui_bot; ui_pause
 }
 change_domain() {
-    show_header; echo -e "${blue}-- Change Domain --${nc}\n"
+    show_header; ui_banner "CHANGE DOMAIN"
     echo -e "  Current: $(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')\n"
     read -rp "  New domain (Enter to cancel): " nd
     nd="$(printf '%s' "$nd" | tr -d '[:space:]')"
-    [[ -z "$nd" ]] && { echo -e "  ${yellow}Cancelled.${nc}"; read -rp "  Enter..." _; return; }
-    validate_domain "$nd" || { echo -e "${red}  Invalid domain.${nc}"; read -rp "  Enter..." _; return; }
+    [[ -z "$nd" ]] && { echo -e "  ${yellow}Cancelled.${nc}"; ui_pause; return; }
+    validate_domain "$nd" || { echo -e "${red}  Invalid domain.${nc}"; ui_pause; return; }
     printf '%s\n' "$nd" > "${ASX_DIR}/domain"
     local esc; esc="$(printf '%s' "$nd" | sed 's/[&/\]/\\&/g')"
     sed -i "s|server_name .*;|server_name ${esc};|g" /etc/nginx/conf.d/reverse-proxy.conf 2>/dev/null || true
     sed -i "s|server_name .*;|server_name ${esc};|g" /etc/nginx/conf.d/xhttp-port80.conf  2>/dev/null || true
     nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-    echo -e "\n  ${green}Domain updated to ${nd}.${nc}"; read -rp "  Enter..." _ || true
+    echo -e "\n  ${green}Domain updated to ${nd}.${nc}"; ui_pause
 }
 edit_banner() {
     show_header; local bf="${ASX_DIR}/banner"
-    echo -e "${blue}-- Edit SSH Banner --${nc}\n"; cat "$bf" 2>/dev/null || echo "(empty)"
+    ui_banner "EDIT SSH BANNER"; cat "$bf" 2>/dev/null || echo "(empty)"
     echo -e "\n  ${green}1)${nc} Edit  ${green}2)${nc} Clear  ${green}0)${nc} Cancel"
     read -rp "  Select: " c
     case "$c" in
@@ -1300,11 +1536,11 @@ edit_banner() {
         2) : > "$bf"; systemctl restart dropbear >/dev/null 2>&1 || true; echo -e "${green}Cleared.${nc}";;
         *) echo -e "${yellow}Cancelled.${nc}";;
     esac
-    read -rp "  Enter..." _ || true
+    ui_pause
 }
 edit_response() {
     show_header; local rf="${ASX_DIR}/response"
-    echo -e "${blue}-- Edit 101 WebSocket Response --${nc}\n"
+    ui_banner "EDIT 101 WEBSOCKET RESPONSE"
     [[ -s "$rf" ]] || printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' > "$rf"
     echo -e "  Current (^M = CRLF):"; cat -A "$rf" 2>/dev/null
     echo -e "\n  ${green}1)${nc} Edit  ${green}2)${nc} Reset default  ${green}3)${nc} ws-proxy status  ${green}0)${nc} Cancel"
@@ -1317,66 +1553,92 @@ edit_response() {
         3) systemctl status ws-proxy.service --no-pager -l 2>/dev/null | tail -12;;
         *) echo -e "${yellow}Cancelled.${nc}";;
     esac
-    read -rp "  Enter..." _ || true
+    ui_pause
 }
 do_update() {
     show_header
     echo -e "${blue}Self-update from the SAME repository as this install.${nc}"
     echo -e "Source: ${yellow}__SELF_UPDATE_URL__${nc}\n"
     read -rp "Type UPDATE to proceed: " c
-    [[ "$c" == "UPDATE" ]] || { echo "Cancelled."; read -rp "Enter..." _; return; }
+    [[ "$c" == "UPDATE" ]] || { echo "Cancelled."; ui_pause; return; }
     local up; up="$(mktemp /root/.asx_upd.XXXXXX.sh)"
     if curl -fsSL -H "User-Agent: AutoScriptX-Deployment" --max-time 30 "__SELF_UPDATE_URL__" -o "$up"; then
         chmod +x "$up"; bash "$up" --update-only; rm -f "$up"
     else echo -e "${red}Fetch failed.${nc}"; rm -f "$up"; fi
-    read -rp "Press Enter to return..." _ || true
+    ui_pause
 }
 torrent_guard() {
-    show_header; echo -e "${blue}-- Torrent Guard --${nc}\n"
+    show_header
+    ui_screen "TORRENT GUARD // THREAT CONSOLE"
     local conf="${ASX_DIR}/antitorrent.conf" autos
     autos="$(awk -F= '/^AUTOSUSPEND=/{print $2}' "$conf" 2>/dev/null | tail -1)"; autos="${autos:-0}"
+
     if systemctl is-active --quiet asx-torrent-watch 2>/dev/null; then
-        echo -e "  Watchdog     : ${green}running${nc}"
+        ui_line "${g0}$(printf '%-14s' WATCHDOG)${nc} $(ui_pill on)"
     else
-        echo -e "  Watchdog     : ${red}stopped${nc}"
+        ui_line "${g0}$(printf '%-14s' WATCHDOG)${nc} $(ui_pill off)"
     fi
     if iptables -nL ASX-TORRENT-IN >/dev/null 2>&1; then
-        echo -e "  Packet filter: ${green}loaded${nc}"
+        ui_line "${g0}$(printf '%-14s' 'PACKET FILTER')${nc} $(ui_pill armed)"
     else
-        echo -e "  Packet filter: ${red}missing${nc}  (run: install.sh --antitorrent-only)"
+        ui_line "${g0}$(printf '%-14s' 'PACKET FILTER')${nc} $(ui_pill unarmed)"
+        ui_line "${g0}   run: install.sh --antitorrent-only${nc}"
     fi
     if jq -e '[.routing.rules[]?|select((.protocol//[])|index("bittorrent"))]|length>0' "$XRAY_CONF" >/dev/null 2>&1 \
        && jq -e '[.inbounds[]?|select(.tag!="api" and (.sniffing.enabled//false))]|length>0' "$XRAY_CONF" >/dev/null 2>&1; then
-        echo -e "  Xray policy  : ${green}active (sniffing on)${nc}"
+        ui_line "${g0}$(printf '%-14s' 'XRAY POLICY')${nc} $(ui_pill armed)  ${g0}sniffing on${nc}"
     else
-        echo -e "  Xray policy  : ${red}incomplete${nc}"
+        ui_line "${g0}$(printf '%-14s' 'XRAY POLICY')${nc} $(ui_pill warn)  ${g0}incomplete${nc}"
     fi
-    echo -e "  Auto-suspend : ${autos} (1 = suspend offenders, 0 = log only)"
+    if [[ "$autos" == "1" ]]; then
+        ui_line "${g0}$(printf '%-14s' 'AUTO-SUSPEND')${nc} ${g2}ENABLED${nc}  ${g0}offenders cut off${nc}"
+    else
+        ui_line "${g0}$(printf '%-14s' 'AUTO-SUSPEND')${nc} ${gy}LOG ONLY${nc}"
+    fi
 
-    echo -e "\n  ${blue}Kernel drops (non-zero counters):${nc}"
-    { iptables -nvL ASX-TORRENT-IN  2>/dev/null | awk 'NR>2 && $1+0>0 {print "   IN  "$1" pkts  "$3" "$4}';
-      iptables -nvL ASX-TORRENT-OUT 2>/dev/null | awk 'NR>2 && $1+0>0 {print "   OUT "$1" pkts  "$3" "$4}'; } | head -14
-    echo -e "\n  ${blue}Xray P2P blocks per account (current window):${nc}"
-    if [[ -s /var/lib/AutoScriptX/torrent-hits.csv ]]; then
-        awk -F',' '{printf "   %-20s %s hits\n", $1, $3}' /var/lib/AutoScriptX/torrent-hits.csv | head -15
+    ui_title "KERNEL INTERCEPTS"
+    # Here-strings instead of process substitution: no /dev/fd dependency.
+    local ln taps hits
+    taps="$( { iptables -nvL ASX-TORRENT-IN  2>/dev/null | awk 'NR>2 && $1+0>0 {printf "  IN   %-10s pkts  %s %s\n", $1, $3, $4}';
+               iptables -nvL ASX-TORRENT-OUT 2>/dev/null | awk 'NR>2 && $1+0>0 {printf "  OUT  %-10s pkts  %s %s\n", $1, $3, $4}'; } | head -12 )"
+    if [[ -n "$taps" ]]; then
+        while IFS= read -r ln; do
+            [[ -z "$ln" ]] && continue
+            ui_line "${g1}$(ui_fit "$(( UI_W - 1 ))" "$ln")${nc}"
+        done <<< "$taps"
     else
-        echo "   (none recorded)"
+        ui_line "${g0}no intercepts recorded${nc}"
     fi
-    echo -e "\n  ${green}1)${nc} Toggle auto-suspend  ${green}2)${nc} Zero kernel counters  ${green}3)${nc} Clear hit records  ${green}0)${nc} Back"
-    read -rp "  Select: " c
+
+    ui_title "P2P ATTEMPTS PER ACCOUNT"
+    hits="$(awk -F',' 'NF>=3 {printf "  %-22s %s hits\n", $1, $3}' /var/lib/AutoScriptX/torrent-hits.csv 2>/dev/null | head -12)"
+    if [[ -n "$hits" ]]; then
+        while IFS= read -r ln; do
+            [[ -z "$ln" ]] && continue
+            ui_line "${gw}$(ui_fit "$(( UI_W - 1 ))" "$ln")${nc}"
+        done <<< "$hits"
+    else
+        ui_line "${g0}no attempts recorded${nc}"
+    fi
+
+    ui_mid
+    ui_line "${g2}1${nc}${g0})${nc} ${gw}Toggle auto-suspend${nc}   ${g2}2${nc}${g0})${nc} ${gw}Zero counters${nc}"
+    ui_line "${g2}3${nc}${g0})${nc} ${gw}Clear hit records${nc}     ${gr}0${nc}${g0})${nc} ${gw}Back${nc}"
+    ui_bot
+    local c; ui_prompt "select" c
     case "$c" in
         1) if [[ "$autos" == "1" ]]; then sed -i 's/^AUTOSUSPEND=.*/AUTOSUSPEND=0/' "$conf"
            else sed -i 's/^AUTOSUSPEND=.*/AUTOSUSPEND=1/' "$conf"; fi
            systemctl restart asx-torrent-watch >/dev/null 2>&1 || true
-           echo -e "  ${green}Policy updated.${nc}";;
+           ui_ok "Policy updated.";;
         2) iptables -Z ASX-TORRENT-IN >/dev/null 2>&1 || true
            iptables -Z ASX-TORRENT-OUT >/dev/null 2>&1 || true
-           echo -e "  ${green}Counters zeroed.${nc}";;
+           ui_ok "Counters zeroed.";;
         3) : > /var/lib/AutoScriptX/torrent-hits.csv 2>/dev/null || true
-           echo -e "  ${green}Hit records cleared.${nc}";;
+           ui_ok "Hit records cleared.";;
         *) ;;
     esac
-    read -rp "  Enter..." _ || true
+    ui_pause
 }
 full_uninstall() {
     [[ -t 0 ]] || { echo "Uninstall requires an interactive TTY."; return 1; }
@@ -1386,9 +1648,9 @@ full_uninstall() {
     echo -e "badvpn, ws-proxy, gum, monitor, cron jobs, iptables rules, and script dirs."
     echo -e "Core OS tools, SSH host keys, and SSL certs are kept.\n"
     read -rp "  STEP 1/2 - type UNINSTALL to continue: " c1
-    [[ "$c1" == "UNINSTALL" ]] || { echo -e "${green}Aborted.${nc}"; read -rp "Enter..." _; return 0; }
+    [[ "$c1" == "UNINSTALL" ]] || { echo -e "${green}Aborted.${nc}"; ui_pause; return 0; }
     read -rp "  STEP 2/2 - type YES to begin: " c2
-    [[ "$c2" == "YES" ]] || { echo -e "${green}Aborted.${nc}"; read -rp "Enter..." _; return 0; }
+    [[ "$c2" == "YES" ]] || { echo -e "${green}Aborted.${nc}"; ui_pause; return 0; }
 
     local svc
     for svc in xray xray-limit-monitor asx-torrent-watch ws-proxy nginx dropbear stunnel4 squid fail2ban \
@@ -1449,12 +1711,28 @@ full_uninstall() {
 
 while true; do
     show_header
-    echo -e "\n  ${green}1)${nc} Create Account   ${green}2)${nc} Delete Account   ${green}3)${nc} List Accounts"
-    echo -e "  ${green}4)${nc} Service Status   ${green}5)${nc} Restart Services ${green}6)${nc} System Info"
-    echo -e "  ${green}7)${nc} Change Domain    ${green}8)${nc} Edit Banner      ${green}9)${nc} Edit 101 Response"
-    echo -e "  ${cyan}b)${nc} Bandwidth Monitor ${cyan}t)${nc} Torrent Guard"
-    echo -e "  ${yellow}u)${nc} Update           ${red}x)${nc} Uninstall        ${red}0)${nc} Exit\n"
-    read -rp "Select option: " opt
+    ui_top
+    ui_sector "IDENTITY"
+    ui_item "1" "Create Account"     "2" "Delete Account"
+    ui_item "3" "List Accounts"
+    ui_mid
+    ui_sector "INFRASTRUCTURE"
+    ui_item "4" "Service Status"     "5" "Restart Services"
+    ui_item "6" "System Info"
+    ui_mid
+    ui_sector "CONFIGURATION"
+    ui_item "7" "Change Domain"      "8" "Edit SSH Banner"
+    ui_item "9" "Edit 101 Response"
+    ui_mid
+    ui_sector "DEFENSE"
+    ui_item "b" "Bandwidth Monitor"  "t" "Torrent Guard"
+    ui_mid
+    ui_sector "MAINTENANCE"
+    ui_line "${gy}u${nc}${g0})${nc} ${gw}$(printf '%-24s' 'Update')${nc} ${gr}x${nc}${g0})${nc} ${gw}Uninstall${nc}"
+    ui_line "${gr}0${nc}${g0})${nc} ${gw}Exit${nc}"
+    ui_bot
+    printf '%s' "  ${g2}${GL_ARROW}${nc} ${gw}select${nc} ${g0}[1-9/b/t/u/x/0]${nc} "
+    read -r opt || true
     case "$opt" in
         1) create_account;; 2) delete_account;; 3) list_accounts;;
         4) service_status;; 5) restart_services;; 6) system_info;;
