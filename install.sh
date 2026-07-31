@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
-# Version : 4.2.0-hardened (xHTTP + WS, integrity-checked, injection-safe)
+# Version : 4.3.0-hardened (xHTTP + WS, integrity-checked, injection-safe)
 # Trust model (option B / split):
 #   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
 #   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
@@ -49,6 +49,8 @@ readonly PORT_TROJAN_WS=10003
 readonly PORT_VLESS_XHTTP=10004
 readonly PORT_VMESS_XHTTP=10005
 readonly PORT_XRAY_API=10085
+# BitTorrent / DHT / public tracker port ranges (multiport limit: 15 slots)
+readonly AT_PORTS="6881:6999,51413,6969,2710,1337"
 
 localip="" ; public_ip="" ; hostname_v="" ; domain=""
 
@@ -144,10 +146,12 @@ json_edit() {
     local tmp; tmp="$(mktemp "$(dirname "$file")/.jq.XXXXXX")"
     (
         flock 9
-        if jq "$@" "$file" > "$tmp"; then
-            mv -f "$tmp" "$file"; chmod 600 "$file"
+        if jq "$@" "$file" > "$tmp" && [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+            chmod 600 "$tmp"; mv -f "$tmp" "$file"
         else
-            rm -f "$tmp"; return 1
+            rm -f "$tmp"
+            log_error "json_edit refused to write invalid/empty JSON to $file"
+            return 1
         fi
     ) 9>"$lock"
 }
@@ -162,7 +166,7 @@ verify_release() {
     load_manifest
     [[ -n "$_manifest" ]] || die "No manifest found at ${MANIFEST_URL}."
     local fail=0 sum key url tmp got
-    while read -r sum key; do
+    while IFS=$' \t' read -r sum key; do
         [[ -z "$sum" || "$sum" == \#* ]] && continue
         for url in "${REPO_RAW}/${key}" "${ASSET_URL}/${key}" "${ASSET_URL}/bin/${key}"; do
             tmp="$(mktemp)"
@@ -244,7 +248,9 @@ configure_squid() {
     log_info "Setting up Squid proxy..."
     fetch "$BASE_URL/config/squid.conf" /etc/squid/squid.conf || die "Failed to download squid.conf."
     local esc; esc="$(printf '%s' "$public_ip" | sed 's/[&/\]/\\&/g')"
-    sed -i "s|__PUBLIC_IP__|${esc}|g; s|\bIP\b|${esc}|g" /etc/squid/squid.conf
+    sed -i "s|__PUBLIC_IP__|${esc}|g" /etc/squid/squid.conf
+    # Only substitute the bare IP token on acl lines (upstream template style).
+    sed -i "/^[[:space:]]*acl[[:space:]]/ s|\bIP\b|${esc}|g" /etc/squid/squid.conf
     chmod 644 /etc/squid/squid.conf
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable squid  >/dev/null 2>&1 || true
@@ -254,19 +260,11 @@ configure_squid() {
 
 install_gum() {
     log_info "Installing gum..."
-    local ver="0.16.2" tgz gum_arch asset
-    # Match the CPU arch (install_xray already supports aarch64); otherwise an
-    # ARM VPS would silently pull an x86_64 binary that cannot execute.
-    case "$(uname -m)" in
-        x86_64)  gum_arch="x86_64" ;;
-        aarch64) gum_arch="arm64" ;;
-        *)       die "Unsupported arch for gum: $(uname -m)" ;;
-    esac
-    asset="gum_${ver}_Linux_${gum_arch}.tar.gz"
+    local ver="0.16.2" tgz
     tgz="$(mktemp)"
-    fetch "https://github.com/charmbracelet/gum/releases/download/v${ver}/${asset}" "$tgz" \
+    fetch "https://github.com/charmbracelet/gum/releases/download/v${ver}/gum_${ver}_Linux_x86_64.tar.gz" "$tgz" \
         || die "Failed to download gum."
-    verify_file "$tgz" "$asset"
+    verify_file "$tgz" "gum_${ver}_Linux_x86_64.tar.gz"
     tar -xzf "$tgz" -C /usr/local/bin --strip-components=1 --wildcards '*/gum'
     rm -f "$tgz"
     [[ -f /usr/local/bin/gum ]] || die "Failed to install gum."
@@ -416,29 +414,25 @@ configure_xray() {
           settings:{ address:"127.0.0.1" } },
         { tag:"vless-ws", listen:"127.0.0.1", port:$p_vw, protocol:"vless",
           settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/vless-ws" } },
-          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vless-ws" } } },
         { tag:"vmess-ws", listen:"127.0.0.1", port:$p_mw, protocol:"vmess",
           settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/vmess-ws" } },
-          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/vmess-ws" } } },
         { tag:"trojan-ws", listen:"127.0.0.1", port:$p_tw, protocol:"trojan",
           settings:{ clients:[{password:$trojan,email:"admin_trojan"}] },
-          streamSettings:{ network:"ws", wsSettings:{ path:"/trojan-ws" } },
-          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
+          streamSettings:{ network:"ws", wsSettings:{ path:"/trojan-ws" } } },
         { tag:"vless-xhttp", listen:"127.0.0.1", port:$p_vx, protocol:"vless",
           settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
-          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } },
-          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } },
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } } },
         { tag:"vmess-xhttp", listen:"127.0.0.1", port:$p_mx, protocol:"vmess",
           settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
-          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } },
-          sniffing:{ enabled:true, destOverride:["http","tls","quic"], routeOnly:true } }
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } } }
       ],
       outbounds: [ { tag:"direct", protocol:"freedom" }, { tag:"blocked", protocol:"blackhole" } ]
     }' | atomic_write "${XRAY_DIR}/config.json"
     chmod 600 "${XRAY_DIR}/config.json"
 
+    _migrate_xray_antitorrent "${XRAY_DIR}/config.json"
     jq empty "${XRAY_DIR}/config.json" >/dev/null 2>&1 || die "config.json failed JSON validation."
     log_success "config.json passed JSON validation."
 
@@ -465,33 +459,33 @@ SERVICE
 }
 
 _write_xray_locations() {
-    cat > /etc/nginx/xray-locations.conf <<'NGINXLOC'
+    cat > /etc/nginx/xray-locations.conf <<NGINXLOC
 location /vless-ws {
-    proxy_pass http://127.0.0.1:10001; proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host; proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:${PORT_VLESS_WS}; proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host; proxy_read_timeout 86400s;
 }
 location /vmess-ws {
-    proxy_pass http://127.0.0.1:10002; proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host; proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:${PORT_VMESS_WS}; proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host; proxy_read_timeout 86400s;
 }
 location /trojan-ws {
-    proxy_pass http://127.0.0.1:10003; proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host; proxy_read_timeout 86400s;
+    proxy_pass http://127.0.0.1:${PORT_TROJAN_WS}; proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host; proxy_read_timeout 86400s;
 }
 location /vless-xhttp {
-    proxy_pass http://127.0.0.1:10004; proxy_http_version 1.1;
-    proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://127.0.0.1:${PORT_VLESS_XHTTP}; proxy_http_version 1.1;
+    proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_buffering off; proxy_cache off; proxy_request_buffering off;
     proxy_read_timeout 86400s; client_max_body_size 0;
 }
 location /vmess-xhttp {
-    proxy_pass http://127.0.0.1:10005; proxy_http_version 1.1;
-    proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://127.0.0.1:${PORT_VMESS_XHTTP}; proxy_http_version 1.1;
+    proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_buffering off; proxy_cache off; proxy_request_buffering off;
     proxy_read_timeout 86400s; client_max_body_size 0;
 }
@@ -598,9 +592,17 @@ configure_stunnel() {
 
 configure_fail2ban() {
     log_info "Configuring fail2ban..."
-    cat > /etc/fail2ban/jail.local <<'F2B_JAIL'
+    mkdir -p /var/log/xray
+    : > /var/log/xray/access.log
+    [[ -f /var/log/xray/error.log ]] || : > /var/log/xray/error.log
+    [[ -f /var/log/kern.log ]]       || : > /var/log/kern.log
+    [[ -f /var/log/syslog ]]         || : > /var/log/syslog
+
+    # Server's own addresses are whitelisted so an outbound match can never
+    # get the VPS banned by its own jail.
+    cat > /etc/fail2ban/jail.local <<F2B_JAIL
 [DEFAULT]
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 127.0.0.1/8 ::1 ${localip} ${public_ip}
            103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 104.16.0.0/13
            104.24.0.0/14 108.162.192.0/18 131.0.72.0/22 141.101.64.0/18
            162.158.0.0/15 172.64.0.0/13 173.245.48.0/20 188.114.96.0/20
@@ -638,65 +640,201 @@ maxretry = 2
 bantime  = 2h
 F2B_JAIL
 
+    # FIX: the old regex was ".*rejected.*<HOST>.*", but Xray prints the peer
+    # address BEFORE the verdict, so the jail never matched anything. Xray also
+    # needs an explicit datepattern (yyyy/mm/dd) or every line is skipped.
     cat > /etc/fail2ban/filter.d/xray-auth.conf <<'F2B_XRAY'
 [Definition]
-failregex = .*rejected.*<HOST>.*
-            .*failed.*<HOST>.*
+datepattern = ^%%Y/%%m/%%d %%H:%%M:%%S
+failregex = ^.*from (?:tcp|udp):<HOST>:\d+ .*(?:rejected|invalid|failed|unauthorized).*$
+            ^.*(?:rejected|invalid|failed|unauthorized).*(?:tcp|udp):<HOST>:\d+.*$
+            ^.*<HOST>.*(?:rejected|invalid user|authentication failed).*$
 ignoreregex =
 F2B_XRAY
 
-    mkdir -p /var/log/xray; : > /var/log/xray/access.log
-    cat >> /etc/fail2ban/jail.local <<'F2B_XRAY_JAIL'
+    # Bans remote peers that keep hammering the box with BitTorrent traffic.
+    # Only the IN-direction kernel log is matched (see anti-torrent engine).
+    cat > /etc/fail2ban/filter.d/asx-torrent.conf <<'F2B_TORRENT'
+[Definition]
+failregex = ^.*ASX-TORRENT-IN .*SRC=<HOST>\s.*$
+ignoreregex =
+F2B_TORRENT
+
+    cat >> /etc/fail2ban/jail.local <<'F2B_EXTRA_JAILS'
 
 [xray-auth]
 enabled  = true
 port     = 443,80
 filter   = xray-auth
-logpath  = /var/log/xray/access.log
+logpath  = /var/log/xray/error.log
+           /var/log/xray/access.log
 maxretry = 5
 bantime  = 1h
-F2B_XRAY_JAIL
+
+[asx-torrent]
+enabled  = true
+filter   = asx-torrent
+logpath  = /var/log/kern.log
+           /var/log/syslog
+maxretry = 25
+findtime = 10m
+bantime  = 24h
+action   = iptables-allports[name=asx-torrent]
+F2B_EXTRA_JAILS
 
     systemctl enable fail2ban  >/dev/null 2>&1 || true
     systemctl restart fail2ban >/dev/null 2>&1 || log_warning "Failed to restart fail2ban."
-    log_success "fail2ban configured (SSH + Nginx + Xray jails, CDN whitelisted)."
+    log_success "fail2ban configured (SSH + Nginx + Xray + anti-torrent jails, CDN whitelisted)."
+}
+
+# ---------------------------------------------------------------------------
+# Anti-torrent engine (packet layer)
+#
+# Why it is built this way:
+#  * The old rules lived only in FORWARD. A VPN/proxy box terminates the
+#    tunnel locally and re-originates the traffic, so peer/tracker packets
+#    traverse OUTPUT (and INPUT), never FORWARD. The old ruleset therefore
+#    matched almost nothing. Now all three hooks are covered.
+#  * Direction-specific chains: only inbound/forward drops are logged with the
+#    "ASX-TORRENT-IN " prefix, so the fail2ban jail sees remote peers. Logging
+#    OUTPUT drops under the same prefix would show the VPS's own address and
+#    fail2ban would ban the server itself.
+#  * Signatures are specific. The bare words "torrent" and "announce" were
+#    removed: they occur in ordinary plaintext HTTP (news pages, search
+#    queries, CDN paths) and silently killed legitimate connections.
+#  * Scans are bounded with --from/--to so per-packet cost stays low.
+# ---------------------------------------------------------------------------
+_at_sig_string=(
+    "BitTorrent protocol"  "peer_id="              "info_hash="
+    "&info_hash"           "?info_hash"            "/announce?"
+    "/announce.php"        "announce.php?passkey=" "/scrape?"
+    "d1:ad2:id20:"         "d1:rd2:id20:"          "9:get_peers"
+    "13:announce_peer"     "9:find_node"           "13:announce-peers"
+    "application/x-bittorrent" "urn:btih:"         ".torrent"
+    "BitComet"             "uTorrent"              "qBittorrent"
+    "Transmission/"        "libtorrent"            "Deluge/"
+    "Azureus"
+)
+_at_sig_hex=( "|13|BitTorrent protocol" )
+_at_dns_keywords=(
+    "openbittorrent" "opentrackr" "publicbt" "coppersurfer" "leechers-paradise"
+    "exodus.desync" "torrent.eu.org" "demonii" "thepiratebay" "1337x"
+    "rarbg" "nyaa.si" "yts.mx" "gbitt"
+)
+
+_at_load_modules() {
+    local m
+    for m in xt_string xt_multiport xt_conntrack xt_hashlimit xt_length; do
+        modprobe "$m" >/dev/null 2>&1 || true
+    done
+}
+
+# Remove the pre-4.3 FORWARD-only string rules so they cannot pile up.
+_at_cleanup_legacy() {
+    local s
+    for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
+             ".torrent" "announce.php?passkey=" torrent announce info_hash; do
+        while iptables -D FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
+    done
+}
+
+# _at_build <iptables|ip6tables> <IN|OUT>
+_at_build() {
+    local ipt="$1" dir="$2" s miss=0
+    local scan="ASX-TORRENT-${dir}" drop="ASX-TORRENT-DROP-${dir}"
+    "$ipt" -N "$drop" >/dev/null 2>&1 || true; "$ipt" -F "$drop" >/dev/null 2>&1 || true
+    "$ipt" -N "$scan" >/dev/null 2>&1 || true; "$ipt" -F "$scan" >/dev/null 2>&1 || true
+
+    # verdict chain: rate-limited log, then RST for TCP (fast client failure), DROP otherwise
+    if [[ "$dir" == "IN" ]]; then
+        "$ipt" -A "$drop" -m limit --limit 6/min --limit-burst 10 \
+            -j LOG --log-prefix "ASX-TORRENT-IN " --log-level 4 >/dev/null 2>&1 || true
+    else
+        "$ipt" -A "$drop" -m limit --limit 2/min --limit-burst 4 \
+            -j LOG --log-prefix "ASX-TORRENT-OUT " --log-level 4 >/dev/null 2>&1 || true
+    fi
+    "$ipt" -A "$drop" -p tcp -j REJECT --reject-with tcp-reset >/dev/null 2>&1 \
+        || "$ipt" -A "$drop" -p tcp -j DROP >/dev/null 2>&1 || true
+    "$ipt" -A "$drop" -j DROP >/dev/null 2>&1 || true
+
+    # never inspect loopback or the admin SSH session
+    "$ipt" -A "$scan" -o lo -j RETURN >/dev/null 2>&1 || true
+    "$ipt" -A "$scan" -i lo -j RETURN >/dev/null 2>&1 || true
+    "$ipt" -A "$scan" -p tcp --dport 22 -j RETURN >/dev/null 2>&1 || true
+    "$ipt" -A "$scan" -p tcp --sport 22 -j RETURN >/dev/null 2>&1 || true
+
+    # 1. peer wire handshake (exact byte 0x13 + protocol string)
+    for s in "${_at_sig_hex[@]}"; do
+        "$ipt" -A "$scan" -p tcp -m string --hex-string "$s" --algo bm --from 0 --to 96 \
+            -j "$drop" >/dev/null 2>&1 || miss=1
+    done
+    # 2. tracker HTTP/UDP + DHT bencode + client fingerprints
+    for s in "${_at_sig_string[@]}"; do
+        "$ipt" -A "$scan" -m string --string "$s" --algo bm --from 0 --to 1500 \
+            -j "$drop" >/dev/null 2>&1 || miss=1
+    done
+    # 3. DNS lookups of well-known trackers / indexers (kills them before connect)
+    for s in "${_at_dns_keywords[@]}"; do
+        "$ipt" -A "$scan" -p udp --dport 53 -m string --string "$s" --algo bm -j "$drop" >/dev/null 2>&1 || miss=1
+        "$ipt" -A "$scan" -p tcp --dport 53 -m string --string "$s" --algo bm -j "$drop" >/dev/null 2>&1 || miss=1
+    done
+    # 4. classic BitTorrent / DHT / tracker port ranges
+    "$ipt" -A "$scan" -p tcp -m multiport --dports "$AT_PORTS" -j "$drop" >/dev/null 2>&1 || miss=1
+    "$ipt" -A "$scan" -p udp -m multiport --dports "$AT_PORTS" -j "$drop" >/dev/null 2>&1 || miss=1
+    # 5. DHT storm heuristic: floods of tiny UDP datagrams from one source
+    "$ipt" -A "$scan" -p udp -m length --length 0:128 \
+        -m hashlimit --hashlimit-above 80/sec --hashlimit-burst 160 \
+        --hashlimit-mode srcip --hashlimit-name "asx_dht_${dir}" -j "$drop" >/dev/null 2>&1 || miss=1
+
+    [[ "$miss" -eq 0 ]] || log_warning "Some ${ipt} ${dir} match modules are unavailable on this kernel."
+    return 0
+}
+
+_at_hook() {
+    local ipt="$1" hook="$2" chain="$3"
+    "$ipt" -C "$hook" -j "$chain" >/dev/null 2>&1 \
+        || "$ipt" -I "$hook" 1 -j "$chain" >/dev/null 2>&1 || true
+}
+
+_at_apply_family() {
+    local ipt="$1"
+    command -v "$ipt" >/dev/null 2>&1 || return 0
+    _at_build "$ipt" IN
+    _at_build "$ipt" OUT
+    _at_hook "$ipt" INPUT   ASX-TORRENT-IN
+    _at_hook "$ipt" FORWARD ASX-TORRENT-IN
+    _at_hook "$ipt" OUTPUT  ASX-TORRENT-OUT
+    return 0
 }
 
 apply_firewall_rules() {
-    log_info "Applying firewall rules (anti-torrent)..."
-    local s port chain
-    # Torrent payload signatures. Deliberately specific to minimise false
-    # positives now that we also filter the OUTPUT chain (see below):
-    #   - "BitTorrent protocol" : the classic peer handshake (pstr).
-    #   - get_peers/announce_peer/find_node : KRPC (DHT) query names.
-    #   - "d1:ad2:id20:"        : the bencoded prefix of a DHT query packet.
-    #   - info_hash/peer_id=/announce.php?passkey= : HTTP tracker announces.
-    #   - ".torrent"            : metainfo fetches over cleartext HTTP.
-    local -a torrent_sigs=(
-        "BitTorrent protocol" "get_peers" "announce_peer" "find_node"
-        "d1:ad2:id20:" "info_hash" "peer_id=" "announce.php?passkey=" ".torrent"
-    )
-    # Proxied traffic is *locally generated* by the xray process, so it leaves
-    # via OUTPUT — not FORWARD. Filter both so signatures are actually hit:
-    #   FORWARD : any routed/NAT'd traffic (e.g. badvpn/tun paths).
-    #   OUTPUT  : the proxy's own upstream connections (the real torrent path).
-    # -m string with no -p also inspects UDP payloads, covering uTP/DHT.
-    for chain in FORWARD OUTPUT; do
-        for s in "${torrent_sigs[@]}"; do
-            iptables -C "$chain" -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1 \
-                || iptables -A "$chain" -m string --string "$s" --algo bm -j DROP
-        done
-    done
+    log_info "Applying firewall + anti-torrent rules..."
+    _at_load_modules
+    _at_cleanup_legacy
+
+    local port
     for port in 22 80 443 8080; do
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
-            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+            || log_warning "Could not open tcp/${port}."
     done
+    for port in 7200 7300; do
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+            || iptables -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+            || log_warning "Could not open udp/${port} (badvpn)."
+    done
+
+    # Hooked at position 1, i.e. evaluated BEFORE the accepts above.
+    _at_apply_family iptables
+    _at_apply_family ip6tables
+
     mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4
-    cp /etc/iptables/rules.v4 /etc/iptables.up.rules
+    iptables-save  > /etc/iptables/rules.v4 || log_warning "Could not persist IPv4 rules."
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    cp /etc/iptables/rules.v4 /etc/iptables.up.rules 2>/dev/null || true
     netfilter-persistent save   >/dev/null 2>&1 || true
     netfilter-persistent reload >/dev/null 2>&1 || true
-    log_success "Firewall rules applied (torrent signatures dropped on FORWARD + OUTPUT)."
+    log_success "Anti-torrent filter active: ${#_at_sig_string[@]} wire signatures, ${#_at_dns_keywords[@]} tracker DNS blocks, ports ${AT_PORTS}, DHT rate guard (IN/OUT/FORWARD)."
 }
 
 # ===========================================================================
@@ -713,8 +851,11 @@ update_script() {
     log_info "Snapshotting protected files -> ${snap_dir}"
     local p
     for p in "${PROTECTED[@]}"; do
-        [[ -f "$p" ]] && cp -p "$p" "${snap_dir}/$(basename "$p")" \
-            || log_warning "  Not found (won't restore): $p"
+        if [[ -f "$p" ]]; then
+            cp -p "$p" "${snap_dir}/$(basename "$p")" || die "Snapshot failed for $p - aborting update."
+        else
+            log_warning "  Not found (won't restore): $p"
+        fi
     done
 
     log_info "Re-downloading helper scripts..."
@@ -751,6 +892,7 @@ update_script() {
 
     log_info "Rebuilding /usr/bin/menu..."; _write_main_menu; rm -f /usr/bin/xray-menu
     log_info "Rebuilding limit monitor...";  _write_limit_monitor
+    log_info "Rebuilding torrent watchdog..."; _write_torrent_watchdog
     log_info "Refreshing nginx fragments..."; _write_xray_locations
 
     local cur_domain; cur_domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo localhost)"
@@ -799,26 +941,12 @@ update_script() {
             || json_edit "$cfg" "$CFG_LOCK" '.routing.rules = [{type:"field",inboundTag:["api"],outboundTag:"direct"}] + .routing.rules'
         jq -e '.log.access' "$cfg" >/dev/null 2>&1 \
             || json_edit "$cfg" "$CFG_LOCK" '.log = ((.log // {}) + {access:"/var/log/xray/access.log",error:"/var/log/xray/error.log",loglevel:"warning"})'
-
-        # --- Anti-torrent migration (idempotent) ---
-        # 1) Enable sniffing on every proxy inbound. The bittorrent protocol
-        #    matcher (below) is a silent no-op unless sniffing is enabled, so
-        #    older configs were never actually blocking torrents at L7.
-        json_edit "$cfg" "$CFG_LOCK" '
-          .inbounds |= map(
-            if (.protocol=="vless" or .protocol=="vmess" or .protocol=="trojan")
-            then .sniffing = {enabled:true,destOverride:["http","tls","quic"],routeOnly:true}
-            else . end )' \
-            && log_success "  sniffing enabled on proxy inbounds."
-        # 2) Ensure a blackhole outbound named "blocked" exists.
-        jq -e '.outbounds[]?|select(.tag=="blocked")' "$cfg" >/dev/null 2>&1 \
-            || json_edit "$cfg" "$CFG_LOCK" '.outbounds = ((.outbounds // []) + [{tag:"blocked",protocol:"blackhole"}])'
-        # 3) Ensure the bittorrent -> blocked routing rule exists.
-        jq -e '.routing.rules[]?|select(.protocol and (.protocol|index("bittorrent")))' "$cfg" >/dev/null 2>&1 \
-            || json_edit "$cfg" "$CFG_LOCK" '.routing = (.routing // {domainStrategy:"AsIs"}) | .routing.rules = ((.routing.rules // []) + [{type:"field",protocol:["bittorrent"],outboundTag:"blocked"}])' \
-            && log_success "  bittorrent routing rule ensured."
         log_success "  config.json migration complete."
     fi
+
+    log_info "Re-applying anti-torrent policy..."
+    _migrate_xray_antitorrent "${XRAY_DIR}/config.json"
+    apply_firewall_rules
 
     log_info "Reloading Xray and Nginx..."
     systemctl restart xray >/dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
@@ -826,7 +954,7 @@ update_script() {
     else log_warning "Nginx config test failed — NOT reloaded."; fi
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
-    log_success "Update complete. Version 4.2.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    log_success "Update complete. Version 4.3.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
     read -rp "Press Enter to return..." _ || true
 }
 
@@ -855,8 +983,9 @@ json_edit() {
     local file="$1" lock="$2"; shift 2
     local tmp; tmp="$(mktemp "$(dirname "$file")/.jq.XXXXXX")"
     ( flock 9
-      if jq "$@" "$file" > "$tmp"; then mv -f "$tmp" "$file"; chmod 600 "$file"
-      else rm -f "$tmp"; return 1; fi
+      if jq "$@" "$file" > "$tmp" && [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+          chmod 600 "$tmp"; mv -f "$tmp" "$file"
+      else rm -f "$tmp"; echo "json_edit: refused invalid JSON for $file" >&2; return 1; fi
     ) 9>"$lock"
 }
 csv_lock()   { exec 8>"$CSV_LOCK"; flock 8; }
@@ -874,7 +1003,7 @@ show_header() {
     domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
     uptime_str="$(uptime -p 2>/dev/null || echo '?')"
     echo -e "${cyan}================================================${nc}"
-    echo -e "${cyan}       AutoScriptX  v4.2.0  |  Main Menu       ${nc}"
+    echo -e "${cyan}       AutoScriptX  v4.3.0  |  Main Menu       ${nc}"
     echo -e "${cyan}------------------------------------------------${nc}"
     printf  "  Domain  : %s\n" "$domain"
     printf  "  Xray    : %s\n" "$(_get_xray_ver)"
@@ -913,13 +1042,15 @@ _add_client_by_tag() {
         else . end )'
 }
 repair_xhttp_clients() {
-    [[ -f "$XRAY_CONF" ]] || return
+    [[ -f "$XRAY_CONF" ]] || return 0
+    jq -e '.inbounds[]|select(.tag=="vless-xhttp" or .tag=="vmess-xhttp")' \
+        "$XRAY_CONF" >/dev/null 2>&1 || return 0
     json_edit "$XRAY_CONF" "$CFG_LOCK" '
-      ( .inbounds[]|select(.tag=="vless-ws")|.settings.clients ) as $v |
-      ( .inbounds[]|select(.tag=="vmess-ws")|.settings.clients ) as $m |
+      (first(.inbounds[]|select(.tag=="vless-ws")|.settings.clients) // []) as $v |
+      (first(.inbounds[]|select(.tag=="vmess-ws")|.settings.clients) // []) as $m |
       .inbounds |= map(
-        if   .tag=="vless-xhttp" then .settings.clients=$v
-        elif .tag=="vmess-xhttp" then .settings.clients=$m
+        if   .tag=="vless-xhttp" and ($v|length)>0 then .settings.clients=$v
+        elif .tag=="vmess-xhttp" and ($m|length)>0 then .settings.clients=$m
         else . end )'
 }
 
@@ -1116,7 +1247,7 @@ bandwidth_monitor() {
 service_status() {
     show_header; echo -e "${blue}-- Service Status --${nc}\n"
     local svc
-    for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor; do
+    for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor asx-torrent-watch; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then echo -e "  ${green}[on ]${nc} $svc"
         else echo -e "  ${red}[off]${nc} $svc"; fi
     done
@@ -1125,7 +1256,7 @@ service_status() {
 restart_services() {
     show_header; echo -e "${blue}Restarting services...${nc}\n"
     local svc
-    for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor; do
+    for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor asx-torrent-watch; do
         systemctl restart "$svc" >/dev/null 2>&1 && echo -e "  ${green}[ok]${nc} $svc" \
             || echo -e "  ${yellow}[!!]${nc} $svc"
     done
@@ -1200,6 +1331,53 @@ do_update() {
     else echo -e "${red}Fetch failed.${nc}"; rm -f "$up"; fi
     read -rp "Press Enter to return..." _ || true
 }
+torrent_guard() {
+    show_header; echo -e "${blue}-- Torrent Guard --${nc}\n"
+    local conf="${ASX_DIR}/antitorrent.conf" autos
+    autos="$(awk -F= '/^AUTOSUSPEND=/{print $2}' "$conf" 2>/dev/null | tail -1)"; autos="${autos:-0}"
+    if systemctl is-active --quiet asx-torrent-watch 2>/dev/null; then
+        echo -e "  Watchdog     : ${green}running${nc}"
+    else
+        echo -e "  Watchdog     : ${red}stopped${nc}"
+    fi
+    if iptables -nL ASX-TORRENT-IN >/dev/null 2>&1; then
+        echo -e "  Packet filter: ${green}loaded${nc}"
+    else
+        echo -e "  Packet filter: ${red}missing${nc}  (run: install.sh --antitorrent-only)"
+    fi
+    if jq -e '[.routing.rules[]?|select((.protocol//[])|index("bittorrent"))]|length>0' "$XRAY_CONF" >/dev/null 2>&1 \
+       && jq -e '[.inbounds[]?|select(.tag!="api" and (.sniffing.enabled//false))]|length>0' "$XRAY_CONF" >/dev/null 2>&1; then
+        echo -e "  Xray policy  : ${green}active (sniffing on)${nc}"
+    else
+        echo -e "  Xray policy  : ${red}incomplete${nc}"
+    fi
+    echo -e "  Auto-suspend : ${autos} (1 = suspend offenders, 0 = log only)"
+
+    echo -e "\n  ${blue}Kernel drops (non-zero counters):${nc}"
+    { iptables -nvL ASX-TORRENT-IN  2>/dev/null | awk 'NR>2 && $1+0>0 {print "   IN  "$1" pkts  "$3" "$4}';
+      iptables -nvL ASX-TORRENT-OUT 2>/dev/null | awk 'NR>2 && $1+0>0 {print "   OUT "$1" pkts  "$3" "$4}'; } | head -14
+    echo -e "\n  ${blue}Xray P2P blocks per account (current window):${nc}"
+    if [[ -s /var/lib/AutoScriptX/torrent-hits.csv ]]; then
+        awk -F',' '{printf "   %-20s %s hits\n", $1, $3}' /var/lib/AutoScriptX/torrent-hits.csv | head -15
+    else
+        echo "   (none recorded)"
+    fi
+    echo -e "\n  ${green}1)${nc} Toggle auto-suspend  ${green}2)${nc} Zero kernel counters  ${green}3)${nc} Clear hit records  ${green}0)${nc} Back"
+    read -rp "  Select: " c
+    case "$c" in
+        1) if [[ "$autos" == "1" ]]; then sed -i 's/^AUTOSUSPEND=.*/AUTOSUSPEND=0/' "$conf"
+           else sed -i 's/^AUTOSUSPEND=.*/AUTOSUSPEND=1/' "$conf"; fi
+           systemctl restart asx-torrent-watch >/dev/null 2>&1 || true
+           echo -e "  ${green}Policy updated.${nc}";;
+        2) iptables -Z ASX-TORRENT-IN >/dev/null 2>&1 || true
+           iptables -Z ASX-TORRENT-OUT >/dev/null 2>&1 || true
+           echo -e "  ${green}Counters zeroed.${nc}";;
+        3) : > /var/lib/AutoScriptX/torrent-hits.csv 2>/dev/null || true
+           echo -e "  ${green}Hit records cleared.${nc}";;
+        *) ;;
+    esac
+    read -rp "  Enter..." _ || true
+}
 full_uninstall() {
     [[ -t 0 ]] || { echo "Uninstall requires an interactive TTY."; return 1; }
     clear
@@ -1213,7 +1391,7 @@ full_uninstall() {
     [[ "$c2" == "YES" ]] || { echo -e "${green}Aborted.${nc}"; read -rp "Enter..." _; return 0; }
 
     local svc
-    for svc in xray xray-limit-monitor ws-proxy nginx dropbear stunnel4 squid fail2ban \
+    for svc in xray xray-limit-monitor asx-torrent-watch ws-proxy nginx dropbear stunnel4 squid fail2ban \
                badvpn-udpgw@7200 badvpn-udpgw@7300 netfilter-persistent; do
         systemctl stop "$svc" >/dev/null 2>&1 || true
         systemctl disable "$svc" >/dev/null 2>&1 || true
@@ -1230,30 +1408,40 @@ full_uninstall() {
     rmdir /home/vps 2>/dev/null || true
     rm -f /etc/nginx/xray-locations.conf /etc/nginx/conf.d/xhttp-port80.conf \
           /etc/nginx/conf.d/reverse-proxy.conf /etc/nginx/conf.d/real_ip_sources.conf
-    rm -f /usr/local/bin/ws-proxy /usr/local/bin/xray-limit-monitor /usr/local/bin/gum /usr/bin/badvpn-udpgw
+    rm -f /usr/local/bin/ws-proxy /usr/local/bin/xray-limit-monitor /usr/local/bin/gum \
+          /usr/bin/badvpn-udpgw /usr/local/bin/asx-torrent-watch
+    rm -f /etc/systemd/system/asx-torrent-watch.service
+    rm -rf /var/lib/AutoScriptX
     rm -f /usr/bin/menu /usr/bin/autoscriptx /usr/bin/asx /usr/bin/xray-menu /usr/bin/slowdns-menu \
           /usr/bin/create-account /usr/bin/delete-account /usr/bin/edit-banner /usr/bin/edit-response \
           /usr/bin/lock-unlock /usr/bin/renew-account /usr/bin/change-domain /usr/bin/manage-services \
           /usr/bin/system-info /usr/bin/clean-expired-accounts /usr/bin/setup-slowdns /usr/bin/slowdns-status
     rm -f /etc/cron.d/auto-reboot /etc/cron.d/clean-expired-accounts
     service cron restart >/dev/null 2>&1 || true
-    local s chain
-    # Union of legacy + current signatures, cleared from BOTH chains, so an
-    # uninstall fully reverts firewall state regardless of installer version.
-    for chain in FORWARD OUTPUT; do
-        for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
-                 ".torrent" "announce.php?passkey=" torrent announce info_hash "d1:ad2:id20:"; do
-            while iptables -D "$chain" -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
+    local s
+    for s in get_peers announce_peer find_node BitTorrent "BitTorrent protocol" "peer_id=" \
+             ".torrent" "announce.php?passkey=" torrent announce info_hash; do
+        while iptables -D FORWARD -m string --string "$s" --algo bm -j DROP >/dev/null 2>&1; do :; done
+    done
+    local ch hook
+    for hook in INPUT FORWARD OUTPUT; do
+        for ch in ASX-TORRENT-IN ASX-TORRENT-OUT; do
+            while iptables -D "$hook" -j "$ch" >/dev/null 2>&1; do :; done
+            while ip6tables -D "$hook" -j "$ch" >/dev/null 2>&1; do :; done
         done
     done
-    for port in 22 80 443 8080; do
-        while iptables -D INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do :; done
+    for ch in ASX-TORRENT-IN ASX-TORRENT-OUT ASX-TORRENT-DROP-IN ASX-TORRENT-DROP-OUT; do
+        iptables  -F "$ch" >/dev/null 2>&1 || true; iptables  -X "$ch" >/dev/null 2>&1 || true
+        ip6tables -F "$ch" >/dev/null 2>&1 || true; ip6tables -X "$ch" >/dev/null 2>&1 || true
     done
+    iptables -D INPUT -p tcp --dport 80  -j ACCEPT >/dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
     rm -f /etc/iptables.up.rules
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     rm -f /etc/sysctl.d/99-disable-ipv6.conf; sysctl --system >/dev/null 2>&1 || true
     rm -f /etc/stunnel/key.pem /etc/stunnel/cert.pem /etc/stunnel/stunnel.pem
-    rm -f /etc/fail2ban/filter.d/xray-auth.conf /etc/fail2ban/jail.local
+    rm -f /etc/fail2ban/filter.d/xray-auth.conf /etc/fail2ban/filter.d/asx-torrent.conf \
+          /etc/fail2ban/jail.local
     echo -e "\n${red}Uninstall complete. Reboot recommended.${nc}"
     read -rp "  Reboot now? (y/N): " r
     [[ "$r" =~ ^[Yy]$ ]] && reboot || echo "Reboot skipped."
@@ -1264,13 +1452,15 @@ while true; do
     echo -e "\n  ${green}1)${nc} Create Account   ${green}2)${nc} Delete Account   ${green}3)${nc} List Accounts"
     echo -e "  ${green}4)${nc} Service Status   ${green}5)${nc} Restart Services ${green}6)${nc} System Info"
     echo -e "  ${green}7)${nc} Change Domain    ${green}8)${nc} Edit Banner      ${green}9)${nc} Edit 101 Response"
-    echo -e "  ${cyan}b)${nc} Bandwidth Monitor ${yellow}u)${nc} Update  ${red}x)${nc} Uninstall  ${red}0)${nc} Exit\n"
+    echo -e "  ${cyan}b)${nc} Bandwidth Monitor ${cyan}t)${nc} Torrent Guard"
+    echo -e "  ${yellow}u)${nc} Update           ${red}x)${nc} Uninstall        ${red}0)${nc} Exit\n"
     read -rp "Select option: " opt
     case "$opt" in
         1) create_account;; 2) delete_account;; 3) list_accounts;;
         4) service_status;; 5) restart_services;; 6) system_info;;
         7) change_domain;; 8) edit_banner;; 9) edit_response;;
-        b|B) bandwidth_monitor;; u|U) do_update;; x|X) full_uninstall;;
+        b|B) bandwidth_monitor;; t|T) torrent_guard;;
+        u|U) do_update;; x|X) full_uninstall;;
         0) exit 0;; *) echo -e "${red}Invalid.${nc}"; sleep 1;;
     esac
 done
@@ -1309,7 +1499,8 @@ suspend_user() {
     tmp="$(mktemp "$(dirname "$XRAY_CONF")/.jq.XXXXXX")"
     ( flock 9
       if jq --arg user "$u" '.inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $user)) else . end)' \
-           "$XRAY_CONF" > "$tmp"; then mv -f "$tmp" "$XRAY_CONF"; chmod 600 "$XRAY_CONF"
+           "$XRAY_CONF" > "$tmp" && [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+          chmod 600 "$tmp"; mv -f "$tmp" "$XRAY_CONF"
       else rm -f "$tmp"; fi
     ) 9>"$CFG_LOCK"
     systemctl restart xray >/dev/null 2>&1 || true
@@ -1366,6 +1557,166 @@ MONITOR_SVC
     systemctl restart xray-limit-monitor >/dev/null 2>&1 || true
 }
 
+# ---------------------------------------------------------------------------
+# Anti-torrent policy inside Xray (application layer)
+# ---------------------------------------------------------------------------
+_at_routing_rules_json() {
+    cat <<'ATRULES'
+[
+ {"type":"field","protocol":["bittorrent"],"outboundTag":"blocked"},
+ {"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},
+ {"type":"field","port":"6881-6999,51413,6969,2710,1337","outboundTag":"blocked"},
+ {"type":"field","outboundTag":"blocked","domain":[
+   "keyword:torrent","keyword:tracker.","keyword:announce.","keyword:btih",
+   "domain:thepiratebay.org","domain:1337x.to","domain:rarbg.to","domain:nyaa.si",
+   "domain:yts.mx","domain:opentrackr.org","domain:openbittorrent.com",
+   "domain:coppersurfer.tk","domain:leechers-paradise.org","domain:exodus.desync.com",
+   "domain:demonii.si","domain:torrent.eu.org","domain:gbitt.info"]}
+]
+ATRULES
+}
+
+# Idempotent: safe to run on a fresh config or on an upgrade.
+_migrate_xray_antitorrent() {
+    local cfg="${1:-${XRAY_DIR}/config.json}" rules
+    [[ -f "$cfg" ]] || return 0
+    rules="$(_at_routing_rules_json)"
+    if json_edit "$cfg" "$CFG_LOCK" --argjson atrules "$rules" '
+        # 1. protocol:["bittorrent"] only ever matches when sniffing is ON.
+        #    Without this the original block rule was dead configuration.
+        .inbounds |= map(
+            if (.tag // "") != "api"
+            then .sniffing = {enabled:true,destOverride:["http","tls","quic"],
+                              metadataOnly:false,routeOnly:false}
+            else . end)
+        # 2. domain rules need IPIfNonMatch to also catch raw-IP peers.
+        | .routing = ((.routing // {}) + {domainStrategy:"IPIfNonMatch"})
+        # 3. rebuild the blocked ruleset, preserve every other rule (api, etc).
+        | .routing.rules = ([ (.routing.rules // [])[] | select(.outboundTag != "blocked") ] + $atrules)
+        # 4. guarantee the blackhole outbound exists.
+        | .outbounds = (if ([ (.outbounds // [])[] | select(.tag == "blocked") ] | length) == 0
+                        then ((.outbounds // []) + [{tag:"blocked",protocol:"blackhole"}])
+                        else .outbounds end)'; then
+        log_success "Xray anti-torrent policy applied (sniffing + protocol/port/domain blocks)."
+    else
+        log_warning "Could not apply the Xray anti-torrent policy to ${cfg}."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Anti-torrent watchdog: correlates Xray's own "blocked" verdicts per account.
+# Log-only by default; set AUTOSUSPEND=1 in /etc/AutoScriptX/antitorrent.conf
+# to cut off repeat offenders automatically.
+# ---------------------------------------------------------------------------
+_write_torrent_watchdog() {
+    mkdir -p /var/lib/AutoScriptX "$ASX_DIR"
+    if [[ ! -f "${ASX_DIR}/antitorrent.conf" ]]; then
+        cat > "${ASX_DIR}/antitorrent.conf" <<'ATCONF'
+# AutoScriptX anti-torrent policy
+# AUTOSUSPEND=1 -> suspend an account after THRESHOLD blocked P2P attempts
+#                 inside WINDOW seconds. 0 -> log only (default).
+AUTOSUSPEND=0
+THRESHOLD=200
+WINDOW=3600
+ATCONF
+        chmod 600 "${ASX_DIR}/antitorrent.conf"
+    fi
+
+    cat > /usr/local/bin/asx-torrent-watch <<'TORRENTWATCH'
+#!/usr/bin/env bash
+set -uo pipefail
+ASX_DIR="/etc/AutoScriptX"
+CONF="${ASX_DIR}/antitorrent.conf"
+ACCESS_LOG="/var/log/xray/access.log"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
+STATE_DIR="/var/lib/AutoScriptX"
+OFFSET_FILE="${STATE_DIR}/torrent.offset"
+HITS_FILE="${STATE_DIR}/torrent-hits.csv"   # email,window_start,count
+AUTOSUSPEND=0; THRESHOLD=200; WINDOW=3600
+
+mkdir -p "$STATE_DIR"; touch "$HITS_FILE"; chmod 600 "$HITS_FILE"
+
+suspend_user() {
+    local u="$1" tmp
+    tmp="$(mktemp "$(dirname "$XRAY_CONF")/.jq.XXXXXX")"
+    ( flock 9
+      if jq --arg user "$u" '.inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $user)) else . end)' \
+           "$XRAY_CONF" > "$tmp" && [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+          chmod 600 "$tmp"; mv -f "$tmp" "$XRAY_CONF"
+      else rm -f "$tmp"; return 1; fi
+    ) 9>"$CFG_LOCK" || return 1
+    passwd -l "$u" >/dev/null 2>&1 || true
+    systemctl restart xray >/dev/null 2>&1 || true
+}
+
+while true; do
+    [[ -r "$CONF" ]] && . "$CONF"
+    if [[ -r "$ACCESS_LOG" ]]; then
+        size="$(stat -c %s "$ACCESS_LOG" 2>/dev/null || echo 0)"
+        offset="$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)"
+        [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+        (( offset > size )) && offset=0          # log was rotated
+        if (( size > offset )); then
+            now="$(date +%s)"
+            printf '%s\n' "$size" > "$OFFSET_FILE"
+            tail -c "+$((offset + 1))" "$ACCESS_LOG" 2>/dev/null | head -c "$((size - offset))" \
+              | grep -F '>> blocked]' \
+              | sed -n 's/.*email: *\([A-Za-z0-9_.-]\{1,32\}\).*/\1/p' \
+              | sort | uniq -c \
+              | while read -r cnt email; do
+                    [[ -n "$email" && "$cnt" =~ ^[0-9]+$ ]] || continue
+                    start="$(awk -F',' -v u="$email" '$1==u{print $2}' "$HITS_FILE" | tail -1)"
+                    prev="$(awk -F',' -v u="$email" '$1==u{print $3}' "$HITS_FILE" | tail -1)"
+                    [[ "$start" =~ ^[0-9]+$ ]] || start="$now"
+                    [[ "$prev"  =~ ^[0-9]+$ ]] || prev=0
+                    if (( now - start > WINDOW )); then start="$now"; prev=0; fi
+                    total=$(( prev + cnt ))
+                    grep -v "^${email}," "$HITS_FILE" > "${HITS_FILE}.tmp" 2>/dev/null || true
+                    printf '%s,%s,%s\n' "$email" "$start" "$total" >> "${HITS_FILE}.tmp"
+                    mv -f "${HITS_FILE}.tmp" "$HITS_FILE"; chmod 600 "$HITS_FILE"
+                    if (( total >= THRESHOLD )); then
+                        logger -t asx-torrent "account ${email}: ${total} blocked P2P attempts in window"
+                        if [[ "${AUTOSUSPEND:-0}" == "1" ]]; then
+                            if suspend_user "$email"; then
+                                logger -t asx-torrent "account ${email} SUSPENDED by torrent policy"
+                            fi
+                            grep -v "^${email}," "$HITS_FILE" > "${HITS_FILE}.tmp" 2>/dev/null || true
+                            mv -f "${HITS_FILE}.tmp" "$HITS_FILE"; chmod 600 "$HITS_FILE"
+                        fi
+                    fi
+                done
+        fi
+    fi
+    sleep 120
+done
+TORRENTWATCH
+    chmod 0755 /usr/local/bin/asx-torrent-watch
+
+    cat > /etc/systemd/system/asx-torrent-watch.service <<'ATSVC'
+[Unit]
+Description=AutoScriptX Anti-Torrent Watchdog
+After=xray.service
+Wants=xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/asx-torrent-watch
+Restart=always
+RestartSec=15
+CPUQuota=5%
+MemoryMax=48M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+ATSVC
+
+    systemctl daemon-reload             >/dev/null 2>&1 || true
+    systemctl enable asx-torrent-watch  >/dev/null 2>&1 || true
+    systemctl restart asx-torrent-watch >/dev/null 2>&1 || true
+}
+
 install_scripts() {
     log_info "Installing scripts..."
     load_manifest
@@ -1399,6 +1750,7 @@ install_scripts() {
     fi
     _write_main_menu; rm -f /usr/bin/xray-menu
     _write_limit_monitor
+    _write_torrent_watchdog
     fetch "$BASE_URL/uninstall.sh" "${ASX_DIR}/uninstall.sh" \
         && chmod +x "${ASX_DIR}/uninstall.sh" || log_warning "Optional uninstall.sh unavailable."
     [[ -n "$_manifest" ]] && rm -f "$_manifest" || true
@@ -1432,6 +1784,8 @@ AutoScriptX installer (hardened)
   (no args)        Full install
   --update-only    Non-destructive update of scripts/config (preserves users)
   --verify-only    Check the live repo against SHA256SUMS (pre-release; no root)
+  --antitorrent-only
+                   Re-apply firewall + Xray anti-torrent enforcement only
   --help           This message
 USAGE
 }
@@ -1445,11 +1799,22 @@ main() {
     check_root
     mkdir -p /run/lock
 
-    if [[ "${1:-}" == "--update-only" ]]; then
-        log_info "Running in UPDATE-ONLY mode."
-        update_script
-        return 0
-    fi
+    case "${1:-}" in
+        --update-only)
+            log_info "Running in UPDATE-ONLY mode."
+            update_script
+            return 0 ;;
+        --antitorrent-only)
+            log_info "Re-applying anti-torrent enforcement only."
+            apply_firewall_rules
+            _migrate_xray_antitorrent "${XRAY_DIR}/config.json"
+            _write_torrent_watchdog
+            systemctl restart xray >/dev/null 2>&1 || log_warning "Xray restart failed."
+            log_success "Anti-torrent enforcement refreshed."
+            return 0 ;;
+        "") ;;
+        *) usage; die "Unknown option: ${1}" ;;
+    esac
 
     setup_hosts
     setup_domain
@@ -1471,7 +1836,7 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "Installation complete! AutoScriptX v4.2.0-hardened."
+    log_success "Installation complete! AutoScriptX v4.3.0-hardened."
     log_success "Run 'autoscriptx' or 'asx' to start."
 }
 
