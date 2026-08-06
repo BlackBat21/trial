@@ -496,9 +496,15 @@ setup_ssl_cert() {
     rm -f "$acme_log"
 
     # Install the issued cert into the paths nginx/xray consume.
-    "$acme" --installcert -d "$domain" \
-        --fullchainpath "${ASX_DIR}/cert.crt" --keypath "${ASX_DIR}/cert.key" --ecc \
-        >/dev/null 2>&1 || die "acme.sh --installcert failed for '${domain}'."
+    # NOTE: '-k ec-256' issuance stores the cert under "${domain}_ecc"; the
+    # '--ecc' flag is required here so acme.sh installs from that ECC directory.
+    # Use the current hyphenated flags ('--install-cert', '--fullchain-file',
+    # '--key-file'): the deprecated '--installcert'/'--fullchainpath'/'--keypath'
+    # aliases are silently ignored on newer builds, which yields exit 0 with no
+    # files written (the "success but files missing" symptom).
+    "$acme" --install-cert -d "$domain" \
+        --fullchain-file "${ASX_DIR}/cert.crt" --key-file "${ASX_DIR}/cert.key" --ecc \
+        >/dev/null 2>&1 || die "acme.sh --install-cert failed for '${domain}'."
 
     [[ -s "${ASX_DIR}/cert.crt" && -s "${ASX_DIR}/cert.key" ]] \
         || die "acme.sh reported success but cert files are missing/empty."
