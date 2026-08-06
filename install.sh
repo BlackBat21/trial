@@ -403,36 +403,116 @@ setup_websocket_service() {
     log_success "SSH-WebSocket service set up."
 }
 
+# A bare IPv4 literal — a public CA can never issue for one, so it is the only
+# case in which we accept a self-signed certificate. validate_domain() passes
+# IPs (digits/dots satisfy its regex), so we must detect them explicitly here.
+is_ip4() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+
+# Generate the local self-signed cert used only for IP-only installs.
+_ssl_selfsigned() {
+    log_warning "Generating SELF-SIGNED certificate — clients WILL see an untrusted cert."
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${ASX_DIR}/cert.key" -out "${ASX_DIR}/cert.crt" \
+        -subj "/CN=${domain}" >/dev/null 2>&1 \
+        || die "Failed to generate self-signed certificate."
+    chmod 600 "${ASX_DIR}/cert.key"; chmod 644 "${ASX_DIR}/cert.crt"
+    log_success "Self-signed SSL cert installed (IP-only mode)."
+}
+
 setup_ssl_cert() {
     log_info "Requesting SSL cert..."
     systemctl stop nginx >/dev/null 2>&1 || true
     mkdir -p "$ASX_DIR" /root/.acme.sh
+
+    # 1) Respect an existing certificate — keeps re-runs idempotent and avoids
+    #    hitting Let's Encrypt rate limits on repeat installs.
     if [[ -s "${ASX_DIR}/cert.crt" && -s "${ASX_DIR}/cert.key" ]]; then
         log_info "Existing certificate found — keeping it."
-    else
-        if fetch "https://get.acme.sh" /root/.acme.sh/acme.sh; then
-            chmod +x /root/.acme.sh/acme.sh
-            /root/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
-            /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-            if validate_domain "$domain"; then
-                /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 >/dev/null 2>&1 \
-                    || log_warning "acme.sh issue failed (will fall back to self-signed)."
-                /root/.acme.sh/acme.sh --installcert -d "$domain" \
-                    --fullchainpath "${ASX_DIR}/cert.crt" --keypath "${ASX_DIR}/cert.key" --ecc \
-                    >/dev/null 2>&1 || log_warning "acme.sh install failed."
-            fi
-        else
-            log_warning "Could not fetch acme.sh — using self-signed."
+        chmod 600 "${ASX_DIR}/cert.key"; chmod 644 "${ASX_DIR}/cert.crt"
+        log_success "SSL cert installed."
+        return 0
+    fi
+
+    # 2) IP-only install: no public CA can issue for a bare IP. This is the ONLY
+    #    path that yields a self-signed cert.
+    if is_ip4 "$domain" || ! validate_domain "$domain"; then
+        log_warning "No valid domain ('$domain'): a public CA cannot issue a trusted"
+        log_warning "certificate for an IP address. Point a real domain's A record at"
+        log_warning "this server and re-run for browser-trusted TLS."
+        _ssl_selfsigned
+        return 0
+    fi
+
+    # 3) Domain install — commit to acme.sh. Any failure here aborts the install
+    #    rather than silently degrading to an untrusted cert.
+    fetch "https://get.acme.sh" /root/.acme.sh/acme.sh \
+        || die "Could not download acme.sh from https://get.acme.sh — check outbound network."
+    chmod +x /root/.acme.sh/acme.sh
+    local acme="/root/.acme.sh/acme.sh"
+    "$acme" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+
+    # Preflight: standalone HTTP-01 needs :80 free (nginx already stopped above).
+    if command -v ss >/dev/null 2>&1 && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'; then
+        log_warning "Port 80 appears to be in use — acme.sh --standalone may fail."
+        log_warning "Holder: $(ss -ltnp 2>/dev/null | awk '/[:.]80 /{print $NF; exit}')"
+    fi
+
+    # Preflight: does the domain resolve to this box? Non-fatal (NAT/CDN/split
+    # DNS are legitimate) but recorded to sharpen the failure diagnostic.
+    local resolved_ip="" dns_note=""
+    resolved_ip="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')"
+    if [[ -n "$resolved_ip" && -n "${public_ip:-}" && "$resolved_ip" != "$public_ip" ]]; then
+        dns_note="DNS: ${domain} -> ${resolved_ip}, but this host is ${public_ip}."
+        log_warning "$dns_note"
+    elif [[ -z "$resolved_ip" ]]; then
+        dns_note="DNS: ${domain} did not resolve to any A record."
+        log_warning "$dns_note"
+    fi
+
+    # Issue: try Let's Encrypt first, then ZeroSSL. Capture output so the abort
+    # diagnostic can quote the real acme.sh error instead of hiding it.
+    local ca issued=0 acme_log
+    acme_log="$(mktemp)"
+    for ca in letsencrypt zerossl; do
+        log_info "Requesting certificate from ${ca}..."
+        "$acme" --set-default-ca --server "$ca" >/dev/null 2>&1 || true
+        if "$acme" --issue -d "$domain" --standalone -k ec-256 >"$acme_log" 2>&1; then
+            issued=1; log_success "Certificate issued by ${ca}."; break
         fi
+        log_warning "Issuance via ${ca} failed; trying next CA if available."
+    done
+
+    if [[ "$issued" -ne 1 ]]; then
+        log_error "acme.sh could not obtain a certificate for '${domain}'."
+        [[ -n "$dns_note" ]] && log_error "  ${dns_note}"
+        log_error "  Likely causes: inbound TCP/80 not reachable from the internet,"
+        log_error "  DNS A record not pointing at ${public_ip:-this host}, or CA rate limiting."
+        log_error "  Last acme.sh output:"
+        sed 's/^/    /' "$acme_log" >&2 || true
+        log_error "  Full log: /root/.acme.sh/acme.sh.log"
+        rm -f "$acme_log"
+        die "TLS certificate issuance failed — refusing to fall back to self-signed."
     fi
-    if [[ ! -s "${ASX_DIR}/cert.crt" || ! -s "${ASX_DIR}/cert.key" ]]; then
-        log_warning "Falling back to SELF-SIGNED certificate (clients will see an untrusted cert)."
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "${ASX_DIR}/cert.key" -out "${ASX_DIR}/cert.crt" \
-            -subj "/CN=${domain}" >/dev/null 2>&1
+    rm -f "$acme_log"
+
+    # Install the issued cert into the paths nginx/xray consume.
+    "$acme" --installcert -d "$domain" \
+        --fullchainpath "${ASX_DIR}/cert.crt" --keypath "${ASX_DIR}/cert.key" --ecc \
+        >/dev/null 2>&1 || die "acme.sh --installcert failed for '${domain}'."
+
+    [[ -s "${ASX_DIR}/cert.crt" && -s "${ASX_DIR}/cert.key" ]] \
+        || die "acme.sh reported success but cert files are missing/empty."
+
+    # Sanity check: a CA-issued cert must not be self-signed (issuer != subject).
+    local iss sub
+    iss="$(openssl x509 -in "${ASX_DIR}/cert.crt" -noout -issuer 2>/dev/null | sed 's/^issuer=//')"
+    sub="$(openssl x509 -in "${ASX_DIR}/cert.crt" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+    if [[ -n "$iss" && "$iss" == "$sub" ]]; then
+        die "Installed certificate is self-signed (issuer == subject) — refusing. Re-check DNS/port 80."
     fi
+
     chmod 600 "${ASX_DIR}/cert.key"; chmod 644 "${ASX_DIR}/cert.crt"
-    log_success "SSL cert installed."
+    log_success "SSL cert installed (issued by ${iss:-CA})."
 }
 
 install_xray() {
