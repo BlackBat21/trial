@@ -445,10 +445,16 @@ setup_ssl_cert() {
 
     # 3) Domain install — commit to acme.sh. Any failure here aborts the install
     #    rather than silently degrading to an untrusted cert.
-    fetch "https://get.acme.sh" /root/.acme.sh/acme.sh \
-        || die "Could not download acme.sh from https://get.acme.sh — check outbound network."
+    # Download the REAL acme.sh script. NOTE: https://get.acme.sh returns an
+    # installer WRAPPER, not acme.sh itself — executing that wrapper with
+    # '--issue' can exit 0 without issuing anything, which produces exactly
+    # the "acme.sh reported success but cert files are missing" failure.
+    fetch "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" /root/.acme.sh/acme.sh \
+        || die "Could not download acme.sh from GitHub — check outbound network."
     chmod +x /root/.acme.sh/acme.sh
     local acme="/root/.acme.sh/acme.sh"
+    # Self-install so renewal cron + account config are set up, then enable auto-upgrade.
+    "$acme" --install --home /root/.acme.sh >/dev/null 2>&1 || true
     "$acme" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 
     # Preflight: standalone HTTP-01 needs :80 free (nginx already stopped above).
@@ -493,21 +499,54 @@ setup_ssl_cert() {
         rm -f "$acme_log"
         die "TLS certificate issuance failed — refusing to fall back to self-signed."
     fi
+    # Verify the issued cert actually landed on disk before trusting the exit
+    # code — guards against anything that exits 0 without writing files.
+    local issued_fullchain
+    issued_fullchain="$(find /root/.acme.sh -maxdepth 2 -name 'fullchain.cer' -newermt '10 minutes ago' 2>/dev/null | head -n 1)"
+    if [[ -z "$issued_fullchain" ]]; then
+        log_error "acme.sh claimed success, but no certificate exists under /root/.acme.sh."
+        log_error "  Last acme.sh output:"
+        sed 's/^/    /' "$acme_log" >&2 || true
+        rm -f "$acme_log"
+        die "Issuance produced no files — see acme.sh output above."
+    fi
     rm -f "$acme_log"
 
     # Install the issued cert into the paths nginx/xray consume.
-    # NOTE: '-k ec-256' issuance stores the cert under "${domain}_ecc"; the
-    # '--ecc' flag is required here so acme.sh installs from that ECC directory.
-    # Use the current hyphenated flags ('--install-cert', '--fullchain-file',
-    # '--key-file'): the deprecated '--installcert'/'--fullchainpath'/'--keypath'
-    # aliases are silently ignored on newer builds, which yields exit 0 with no
-    # files written (the "success but files missing" symptom).
-    "$acme" --install-cert -d "$domain" \
-        --fullchain-file "${ASX_DIR}/cert.crt" --key-file "${ASX_DIR}/cert.key" --ecc \
-        >/dev/null 2>&1 || die "acme.sh --install-cert failed for '${domain}'."
+    # '-k ec-256' issuance stores the cert under "${domain}_ecc"; the '--ecc'
+    # flag is required so acme.sh installs from that ECC directory. Use the
+    # current hyphenated flags: the deprecated '--installcert'/'--fullchainpath'/
+    # '--keypath' aliases are silently ignored on newer builds, which yields
+    # exit 0 with no files written. Capture output (not /dev/null) so any real
+    # failure is diagnosable; a non-zero exit falls through to the copy below.
+    local install_log
+    install_log="$(mktemp)"
+    if ! "$acme" --install-cert -d "$domain" --ecc \
+        --fullchain-file "${ASX_DIR}/cert.crt" \
+        --key-file "${ASX_DIR}/cert.key" >"$install_log" 2>&1; then
+        log_warning "acme.sh --install-cert exited non-zero for '${domain}':"
+        sed 's/^/    /' "$install_log" >&2 || true
+        log_warning "Falling back to copying the issued files directly."
+    fi
+    rm -f "$install_log"
 
-    [[ -s "${ASX_DIR}/cert.crt" && -s "${ASX_DIR}/cert.key" ]] \
-        || die "acme.sh reported success but cert files are missing/empty."
+    # Backstop: if the targets are missing/empty for ANY reason (flag parsing,
+    # ECC-dir mismatch, etc.), copy the issued files located above into place.
+    if [[ ! -s "${ASX_DIR}/cert.crt" || ! -s "${ASX_DIR}/cert.key" ]]; then
+        local src_dir src_key
+        src_dir="$(dirname "$issued_fullchain")"
+        src_key="${src_dir}/${domain}.key"
+        log_warning "Copying cert directly from ${src_dir}."
+        install -m 644 "$issued_fullchain" "${ASX_DIR}/cert.crt"
+        install -m 600 "$src_key" "${ASX_DIR}/cert.key"
+    fi
+
+    if [[ ! -s "${ASX_DIR}/cert.crt" || ! -s "${ASX_DIR}/cert.key" ]]; then
+        log_error "Cert files still missing/empty at ${ASX_DIR} after install + fallback."
+        log_error "Contents of /root/.acme.sh (paste this for debugging):"
+        find /root/.acme.sh -maxdepth 2 2>&1 | sed 's/^/    /' >&2 || true
+        die "TLS cert install failed."
+    fi
 
     # Sanity check: a CA-issued cert must not be self-signed (issuer != subject).
     local iss sub
