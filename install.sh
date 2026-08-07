@@ -2748,6 +2748,17 @@ _reality_print_configs() {
     tag="${tag//[^A-Za-z0-9._-]/-}"
     local sid_q=""
     [[ -n "$sid" ]] && sid_q="&sid=${sid}"
+    # Reality shortId is optional server-side (the inbound carries ["", <sid>]).
+    # Emit the shortId key ONLY when a non-empty id exists, so clients never send
+    # a blank shortId the server would reject. jq builds valid JSON either way.
+    local sb_short xr_short
+    if [[ -n "$sid" ]]; then
+        sb_short="$(printf '"short_id": "%s"' "$sid")"
+        xr_short="$(printf '"shortId": "%s",' "$sid")"
+    else
+        sb_short='"short_id": ""'
+        xr_short=""
+    fi
 
     echo ""
     echo -e "${g0}-- Connection summary --${nc}"
@@ -2779,7 +2790,7 @@ _reality_print_configs() {
     "enabled": true,
     "server_name": "${sni}",
     "utls": { "enabled": true, "fingerprint": "${fp}" },
-    "reality": { "enabled": true, "public_key": "${pbk}", "short_id": "${sid}" }
+    "reality": { "enabled": true, "public_key": "${pbk}", ${sb_short} }
   },
   "packet_encoding": "xudp"
 }
@@ -2805,7 +2816,7 @@ REOF
       "serverName": "${sni}",
       "fingerprint": "${fp}",
       "publicKey": "${pbk}",
-      "shortId": "${sid}",
+      ${xr_short}
       "spiderX": "/"
     }
   }
