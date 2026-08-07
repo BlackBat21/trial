@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
-# Version : 4.4.1-hardened (xHTTP + WS + VLESS Reality + ShadowTLS, Cloudflare dest, visible handshake logs)
+# Version : 4.4.2-hardened (xHTTP + WS + VLESS Reality + ShadowTLS, live-config generator, SNI gate)
 # Trust model (option B / split):
 #   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
 #   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
@@ -1712,7 +1712,7 @@ update_script() {
     else log_warning "Nginx config test failed — NOT reloaded."; fi
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
-    log_success "Update complete. Version 4.4.1-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    log_success "Update complete. Version 4.4.2-hardened. Users/UUIDs/certs/domain UNTOUCHED."
     # ui_pause lives only inside /usr/bin/menu. When --update-only is invoked
     # from the installer (or menu's do_update subprocess), calling it here
     # trips set -e with "command not found" (exit 127) after a successful update.
@@ -1980,7 +1980,7 @@ show_header() {
 
     ui_top
     ui_line "${g2}   A U T O S C R I P T X${nc}  ${g0}//${nc}  ${gw}CONTROL CONSOLE${nc}"
-    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.1-hardened${nc}"
+    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.2-hardened${nc}"
     ui_mid
     ui_kv "NODE"     "$domain"
     ui_kv "XRAY"     "$(_get_xray_ver)"
@@ -2658,14 +2658,35 @@ _reality_pick_sni() {
     esac
 }
 
+_reality_live_material() {
+    # Source of truth = the RUNNING config.json. credentials.env can drift after
+    # manual jq edits; xray only trusts config.json. Sets LIVE_* globals.
+    LIVE_PORT=""; LIVE_PRIV=""; LIVE_PBK=""; LIVE_SID=""; LIVE_DEST=""
+    local base='.inbounds[]?|select(.tag=="vless-reality")'
+    LIVE_PORT="$(jq -r "${base}|.port // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
+    LIVE_PRIV="$(jq -r "${base}|.streamSettings.realitySettings.privateKey // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
+    LIVE_DEST="$(jq -r "${base}|.streamSettings.realitySettings.dest // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
+    LIVE_SID="$(jq -r "(${base}|.streamSettings.realitySettings.shortIds // []) | map(select(. != \"\")) | .[0] // \"\"" "$XRAY_CONF" 2>/dev/null)"
+    if [[ -n "$LIVE_PRIV" ]]; then
+        LIVE_PBK="$("$XRAY_BIN" x25519 -i "$LIVE_PRIV" 2>/dev/null | awk -F: 'tolower($1) ~ /password|public/ {sub(/^[^:]*:[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}')"
+        [[ -z "$LIVE_PBK" ]] && LIVE_PBK="$("$XRAY_BIN" x25519 -i "$LIVE_PRIV" 2>/dev/null | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -1)"
+    fi
+    # Fallbacks to credentials.env only if the inbound is missing fields
+    [[ -n "$LIVE_PBK"  ]] || LIVE_PBK="$(_asx_reality_pbk)"
+    [[ -n "$LIVE_SID"  ]] || LIVE_SID="$(_asx_reality_sid)"
+    [[ -n "$LIVE_PORT" ]] || LIVE_PORT="$(_asx_port_reality)"
+    [[ -n "$LIVE_DEST" ]] || LIVE_DEST="$(_asx_reality_sni):443"
+}
+
 _reality_print_configs() {
     local user="$1" uuid="$2" sni="$3" fp="${4:-chrome}"
     local host port pbk sid dest
     host="$(get_public_ip)"
-    port="$(_asx_port_reality)"
-    pbk="$(_asx_reality_pbk)"
-    sid="$(_asx_reality_sid)"
-    dest="$(_reality_dest_current)"
+    _reality_live_material
+    port="$LIVE_PORT"
+    pbk="$LIVE_PBK"
+    sid="$LIVE_SID"
+    dest="$LIVE_DEST"
     [[ -n "$dest" ]] || dest="${sni}:443"
 
     if [[ -z "$pbk" || -z "$sid" || -z "$uuid" || -z "$host" ]]; then
@@ -2746,12 +2767,20 @@ EOF
 }
 EOF
 
-    # Note about server registration
-    if _reality_server_names | grep -qxF "$sni"; then
-        echo -e "\n  ${g2}[OK]${nc} SNI is registered on server serverNames."
+    # Hard self-check against the RUNNING config: never declare victory on a dead config.
+    local ok_sni=0 ok_port=0 ok_uuid=0
+    _reality_server_names | grep -qxF "$sni" && ok_sni=1
+    ss -lnt 2>/dev/null | grep -q ":${port}[[:space:]]" && ok_port=1
+    jq -e --arg u "$uuid" '.inbounds[]?|select(.tag=="vless-reality")|.settings.clients[]?|select(.id==$u)' \
+        "$XRAY_CONF" >/dev/null 2>&1 && ok_uuid=1
+    echo ""
+    if [[ $ok_sni -eq 1 && $ok_port -eq 1 && $ok_uuid -eq 1 ]]; then
+        echo -e "  ${g2}[READY]${nc} SNI registered + port ${port} listening + UUID on Reality inbound."
     else
-        echo -e "\n  ${yellow}[!!]${nc} SNI is NOT in server serverNames yet."
-        echo -e "  ${g0}Use menu option 'Register SNI on server' or handshake may fail/fall through.${nc}"
+        [[ $ok_sni  -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} SNI ${sni} NOT in server serverNames — client can never authenticate."
+        [[ $ok_port -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} xray is not listening on ${port}."
+        [[ $ok_uuid -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} UUID ${uuid} NOT in vless-reality clients."
+        echo -e "  ${g0}Run menu r → 7 (Diagnose + auto-repair) to fix all three.${nc}"
     fi
     return 0
 }
@@ -2882,6 +2911,22 @@ reality_config_menu() {
                 local RE_USER="" RE_UUID="" RE_SNI="" fp="chrome"
                 _reality_pick_user || { ui_pause; continue; }
                 _reality_pick_sni || { ui_pause; continue; }
+                # Reality hard rule: server only authenticates SNIs in its serverNames.
+                # An unregistered SNI is silently forwarded to dest → client NEVER works.
+                if ! _reality_server_names | grep -qxF "$RE_SNI"; then
+                    echo ""
+                    echo -e "  ${yellow}!! ${RE_SNI} is NOT registered on the server.${nc}"
+                    echo -e "  ${g0}A config with this SNI cannot connect until it is added to serverNames.${nc}"
+                    local reg=""
+                    read -rp "  Register ${RE_SNI} on the server now? [Y/n]: " reg
+                    reg="$(printf '%s' "${reg:-Y}" | tr -d '[:space:]')"
+                    if [[ "${reg:-Y}" =~ ^[Yy]$ || -z "$reg" ]]; then
+                        _reality_register_sni "$RE_SNI" || { ui_pause; continue; }
+                    else
+                        echo -e "  ${red}Cancelled — no config generated (it would be dead anyway).${nc}"
+                        ui_pause; continue
+                    fi
+                fi
                 read -rp "  uTLS fingerprint [chrome]: " fp
                 fp="$(printf '%s' "${fp:-chrome}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
                 case "$fp" in
@@ -3465,7 +3510,7 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "Installation complete! AutoScriptX v4.4.1-hardened (Reality + ShadowTLS)."
+    log_success "Installation complete! AutoScriptX v4.4.2-hardened (Reality + ShadowTLS)."
     log_success "Reality :${PORT_VLESS_REALITY} (SNI ${REALITY_SNI}) | ShadowTLS :${PORT_SHADOWTLS}"
     log_success "Run 'autoscriptx' or 'asx' to start."
 }
