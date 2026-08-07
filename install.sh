@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
-# Version : 4.4.2-hardened (xHTTP + WS + VLESS Reality + ShadowTLS, live-config generator, SNI gate)
+# Version : 4.4.3-hardened (xHTTP + WS + VLESS Reality + ShadowTLS, live-config generator, SNI gate)
 # Trust model (option B / split):
 #   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
 #   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
@@ -1712,7 +1712,7 @@ update_script() {
     else log_warning "Nginx config test failed — NOT reloaded."; fi
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
-    log_success "Update complete. Version 4.4.2-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    log_success "Update complete. Version 4.4.3-hardened. Users/UUIDs/certs/domain UNTOUCHED."
     # ui_pause lives only inside /usr/bin/menu. When --update-only is invoked
     # from the installer (or menu's do_update subprocess), calling it here
     # trips set -e with "command not found" (exit 127) after a successful update.
@@ -1980,7 +1980,7 @@ show_header() {
 
     ui_top
     ui_line "${g2}   A U T O S C R I P T X${nc}  ${g0}//${nc}  ${gw}CONTROL CONSOLE${nc}"
-    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.2-hardened${nc}"
+    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.3-hardened${nc}"
     ui_mid
     ui_kv "NODE"     "$domain"
     ui_kv "XRAY"     "$(_get_xray_ver)"
@@ -2543,12 +2543,107 @@ _reality_dest_current() {
         "$XRAY_CONF" 2>/dev/null || true
 }
 
+_sni_clean() {
+    local h="$1"
+    h="$(printf '%s' "$h" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    h="${h#https://}"; h="${h#http://}"; h="${h%%/*}"; h="${h%%:*}"
+    printf '%s' "$h"
+}
+
+_dest_sans() {
+    local host="$1" port="${2:-443}"
+    command -v openssl >/dev/null 2>&1 || return 0
+    timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" </dev/null 2>/dev/null \
+        | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+        | grep -o 'DNS:[^,]*' | sed 's/^DNS://' | tr -d ' ' | sed '/^$/d'
+}
+
+_san_match() {
+    local sni="$1"; shift
+    local san suffix prefix
+    sni="$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')"
+    for san in "$@"; do
+        [[ -z "$san" ]] && continue
+        san="$(printf '%s' "$san" | tr '[:upper:]' '[:lower:]')"
+        [[ "$san" == "$sni" ]] && return 0
+        case "$san" in
+            \*.*)
+                suffix="${san#\*}"
+                case "$sni" in
+                    *"$suffix")
+                        prefix="${sni%"$suffix"}"
+                        if [[ -n "$prefix" && "$prefix" != *.* ]]; then return 0; fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    return 1
+}
+
+_dest_chain_bytes() {
+    local host="$1" port="${2:-443}" tmp total=0 f b
+    command -v openssl >/dev/null 2>&1 || { printf '0'; return 0; }
+    tmp="$(mktemp -d)"
+    timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -showcerts </dev/null 2>/dev/null \
+        | awk -v d="$tmp" '/BEGIN CERTIFICATE/{n++} n{print > (d "/c" n ".pem")}' 2>/dev/null || true
+    for f in "$tmp"/c*.pem; do
+        [[ -f "$f" ]] || continue
+        b="$(openssl x509 -in "$f" -outform DER 2>/dev/null | wc -c)"
+        if [[ "$b" =~ ^[0-9]+$ ]]; then total=$(( total + b )); fi
+    done
+    rm -rf "$tmp"
+    printf '%s' "$total"
+}
+
+_probe_site() {
+    local host="$1" port="${2:-443}" ok=1 bytes
+    echo ""
+    echo -e "  ${g0}Probing ${host}:${port} ...${nc}"
+    if ! getent hosts "$host" >/dev/null 2>&1; then
+        echo -e "  ${gr}[FAIL]${nc} DNS does not resolve from this VPS"
+        return 1
+    fi
+    echo -e "  ${g2}[OK]${nc}   DNS resolves"
+    if timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 </dev/null >/dev/null 2>&1; then
+        echo -e "  ${g2}[OK]${nc}   TLS 1.3 supported"
+    else
+        echo -e "  ${gr}[FAIL]${nc} No TLS 1.3 - Reality requires it"
+        ok=0
+    fi
+    bytes="$(_dest_chain_bytes "$host" "$port")"
+    if [[ "${bytes:-0}" -gt 0 ]]; then
+        if [[ "$bytes" -le 7000 ]]; then
+            echo -e "  ${g2}[OK]${nc}   cert chain ${bytes} B (Reality buffer 8192 B)"
+        elif [[ "$bytes" -le 8192 ]]; then
+            echo -e "  ${gy}[WARN]${nc} cert chain ${bytes} B - near the 8192 B limit"
+        else
+            echo -e "  ${gr}[FAIL]${nc} cert chain ${bytes} B > 8192 B - handshakes WILL reset"
+            ok=0
+        fi
+    fi
+    local -a sans=()
+    mapfile -t sans < <(_dest_sans "$host" "$port")
+    if [[ ${#sans[@]} -gt 0 ]]; then
+        echo -e "  ${g0}       SANs: ${sans[*]:0:6}${nc}"
+        if _san_match "$host" "${sans[@]}"; then
+            echo -e "  ${g2}[OK]${nc}   certificate covers ${host}"
+        else
+            echo -e "  ${gr}[FAIL]${nc} certificate does NOT cover ${host}"
+            ok=0
+        fi
+    else
+        echo -e "  ${gy}[WARN]${nc} could not read SANs"
+    fi
+    if [[ "$ok" -eq 1 ]]; then return 0; fi
+    return 1
+}
+
 _reality_pick_user() {
-    # Sets RE_USER RE_UUID via nameref-style globals for the caller.
     RE_USER=""; RE_UUID=""
     migrate_csv
-    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1{f=1;exit} END{exit !f}' "$CSV_DB"; then
-        echo -e "  ${yellow}No accounts in CSV. Enter UUID manually.${nc}"
+    if [[ ! -s "$CSV_DB" ]] || ! awk -F',' 'NR>1 && $1 != "" {f=1;exit} END{exit !f}' "$CSV_DB"; then
+        echo -e "  ${gy}No accounts in CSV. Enter UUID manually.${nc}"
         read -rp "  UUID: " RE_UUID
         RE_UUID="$(printf '%s' "$RE_UUID" | tr -d '[:space:]')"
         [[ -n "$RE_UUID" ]] || return 1
@@ -2557,13 +2652,12 @@ _reality_pick_user() {
     fi
     echo ""
     printf "  %-4s %-18s %-38s\n" "#" "USER" "UUID"
-    local i=0 line name pass uuid
+    local i=0 name pass uuid pick
     local -a _users=() _uuids=()
     while IFS=',' read -r name pass uuid _rest; do
         [[ "$name" == "Username" || -z "$name" ]] && continue
         i=$((i + 1))
-        _users+=("$name")
-        _uuids+=("$uuid")
+        _users+=("$name"); _uuids+=("$uuid")
         printf "  %-4s %-18s %-38s\n" "$i" "$name" "$uuid"
     done < "$CSV_DB"
     echo ""
@@ -2571,11 +2665,9 @@ _reality_pick_user() {
     pick="$(printf '%s' "$pick" | tr -d '[:space:]')"
     [[ -z "$pick" ]] && return 1
     if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#_users[@]} )); then
-        RE_USER="${_users[$((pick - 1))]}"
-        RE_UUID="${_uuids[$((pick - 1))]}"
+        RE_USER="${_users[$((pick - 1))]}"; RE_UUID="${_uuids[$((pick - 1))]}"
         return 0
     fi
-    # Treat as raw UUID / email lookup
     if [[ "$pick" =~ ^[0-9a-fA-F-]{36}$ ]]; then
         RE_UUID="$pick"
         RE_USER="$(awk -F',' -v u="$pick" 'NR>1 && $3==u {print $1; exit}' "$CSV_DB" 2>/dev/null || echo test)"
@@ -2588,94 +2680,56 @@ _reality_pick_user() {
         [[ -n "$RE_UUID" ]] || return 1
         return 0
     fi
-    echo -e "  ${red}Invalid selection.${nc}"
+    echo -e "  ${gr}Invalid selection.${nc}"
     return 1
 }
 
-_reality_pick_sni() {
-    # Sets RE_SNI. Presets + custom + default.
+_reality_pick_active_sni() {
     RE_SNI=""
-    local def_sni; def_sni="$(_asx_reality_sni)"
-    local -a presets=(
-        "$def_sni"
-        "www.cloudflare.com"
-        "dl.google.com"
-        "www.apple.com"
-        "www.samsung.com"
-        "www.yahoo.com"
-        "www.googletagmanager.com"
-        "gateway.icloud.com"
-        "www.lovelive-anime.jp"
-    )
-    # Deduplicate while preserving order
-    local -a uniq=()
-    local p u seen
-    for p in "${presets[@]}"; do
-        seen=0
-        for u in "${uniq[@]}"; do [[ "$u" == "$p" ]] && { seen=1; break; }; done
-        (( seen )) || uniq+=("$p")
-    done
-    presets=("${uniq[@]}")
-
+    local -a names=()
+    mapfile -t names < <(_reality_server_names)
+    if [[ ${#names[@]} -eq 0 ]]; then
+        echo -e "  ${gr}No serverNames on the Reality inbound.${nc}"
+        return 1
+    fi
+    if [[ ${#names[@]} -eq 1 ]]; then
+        RE_SNI="${names[0]}"
+        return 0
+    fi
     echo ""
-    ui_head "SNI PRESETS (client server_name)"
-    local i=0
-    for p in "${presets[@]}"; do
+    echo -e "  ${g0}Active SNIs accepted by this server:${nc}"
+    local i=0 n pick
+    for n in "${names[@]}"; do
         i=$((i + 1))
-        local mark=""
-        [[ "$p" == "$def_sni" ]] && mark=" ${g0}(default)${nc}"
-        if _reality_server_names | grep -qxF "$p"; then
-            mark="${mark} ${g2}[on-server]${nc}"
-        else
-            mark="${mark} ${gy}[client-only until registered]${nc}"
-        fi
-        printf "  ${g2}%d${nc}) %s%s\n" "$i" "$p" "$mark"
+        printf "  ${g2}%d${nc}) %s\n" "$i" "$n"
     done
-    printf "  ${g2}c${nc}) Custom SNI\n"
-    printf "  ${gr}0${nc}) Cancel\n"
     echo ""
-    read -rp "  Select: " choice
-    choice="$(printf '%s' "$choice" | tr -d '[:space:]')"
-    case "$choice" in
-        0|"") return 1 ;;
-        c|C)
-            read -rp "  Custom SNI (hostname only): " RE_SNI
-            RE_SNI="$(printf '%s' "$RE_SNI" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-            # strip scheme/path if user pasted a URL
-            RE_SNI="${RE_SNI#https://}"; RE_SNI="${RE_SNI#http://}"
-            RE_SNI="${RE_SNI%%/*}"
-            validate_domain "$RE_SNI" || { echo -e "  ${red}Invalid hostname.${nc}"; return 1; }
-            return 0
-            ;;
-        *)
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#presets[@]} )); then
-                RE_SNI="${presets[$((choice - 1))]}"
-                return 0
-            fi
-            echo -e "  ${red}Invalid.${nc}"
-            return 1
-            ;;
-    esac
+    read -rp "  Select SNI [1]: " pick
+    pick="$(printf '%s' "${pick:-1}" | tr -d '[:space:]')"
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#names[@]} )); then
+        RE_SNI="${names[$((pick - 1))]}"
+        return 0
+    fi
+    echo -e "  ${gr}Invalid.${nc}"
+    return 1
 }
 
 _reality_live_material() {
-    # Source of truth = the RUNNING config.json. credentials.env can drift after
-    # manual jq edits; xray only trusts config.json. Sets LIVE_* globals.
     LIVE_PORT=""; LIVE_PRIV=""; LIVE_PBK=""; LIVE_SID=""; LIVE_DEST=""
     local base='.inbounds[]?|select(.tag=="vless-reality")'
     LIVE_PORT="$(jq -r "${base}|.port // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
     LIVE_PRIV="$(jq -r "${base}|.streamSettings.realitySettings.privateKey // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
     LIVE_DEST="$(jq -r "${base}|.streamSettings.realitySettings.dest // empty" "$XRAY_CONF" 2>/dev/null | head -1)"
-    LIVE_SID="$(jq -r "(${base}|.streamSettings.realitySettings.shortIds // []) | map(select(. != \"\")) | .[0] // \"\"" "$XRAY_CONF" 2>/dev/null)"
+    LIVE_SID="$(jq -r "${base}|.streamSettings.realitySettings.shortIds//[]|map(select(.!=\"\"))|.[0]//\"\"" "$XRAY_CONF" 2>/dev/null | head -1)"
     if [[ -n "$LIVE_PRIV" ]]; then
         LIVE_PBK="$("$XRAY_BIN" x25519 -i "$LIVE_PRIV" 2>/dev/null | awk -F: 'tolower($1) ~ /password|public/ {sub(/^[^:]*:[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}')"
-        [[ -z "$LIVE_PBK" ]] && LIVE_PBK="$("$XRAY_BIN" x25519 -i "$LIVE_PRIV" 2>/dev/null | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -1)"
+        if [[ -z "$LIVE_PBK" ]]; then
+            LIVE_PBK="$("$XRAY_BIN" x25519 -i "$LIVE_PRIV" 2>/dev/null | grep -Eo '[A-Za-z0-9_-]{40,60}' | head -1)"
+        fi
     fi
-    # Fallbacks to credentials.env only if the inbound is missing fields
     [[ -n "$LIVE_PBK"  ]] || LIVE_PBK="$(_asx_reality_pbk)"
     [[ -n "$LIVE_SID"  ]] || LIVE_SID="$(_asx_reality_sid)"
     [[ -n "$LIVE_PORT" ]] || LIVE_PORT="$(_asx_port_reality)"
-    [[ -n "$LIVE_DEST" ]] || LIVE_DEST="$(_asx_reality_sni):443"
 }
 
 _reality_print_configs() {
@@ -2683,42 +2737,37 @@ _reality_print_configs() {
     local host port pbk sid dest
     host="$(get_public_ip)"
     _reality_live_material
-    port="$LIVE_PORT"
-    pbk="$LIVE_PBK"
-    sid="$LIVE_SID"
-    dest="$LIVE_DEST"
-    [[ -n "$dest" ]] || dest="${sni}:443"
+    port="$LIVE_PORT"; pbk="$LIVE_PBK"; sid="$LIVE_SID"; dest="$LIVE_DEST"
 
-    if [[ -z "$pbk" || -z "$sid" || -z "$uuid" || -z "$host" ]]; then
-        echo -e "  ${red}Missing Reality material (pbk/sid/uuid/public IP).${nc}"
+    if [[ -z "$pbk" || -z "$uuid" || -z "$host" ]]; then
+        echo -e "  ${gr}Missing Reality material (pbk/uuid/public IP).${nc}"
         return 1
     fi
-    if is_private_ipv4 "$host"; then
-        echo -e "  ${yellow}WARNING: server IP looks private ($host).${nc}"
-    fi
 
-    local tag="${user}-VLESS-REALITY-${sni}"
+    local tag="${user}-REALITY"
     tag="${tag//[^A-Za-z0-9._-]/-}"
+    local sid_q=""
+    [[ -n "$sid" ]] && sid_q="&sid=${sid}"
 
     echo ""
-    echo -e "${blue}-- Connection summary --${nc}"
-    echo -e "  Server   : ${green}${host}${nc}"
-    echo -e "  Port     : ${green}${port}${nc}"
-    echo -e "  UUID     : ${green}${uuid}${nc}"
-    echo -e "  Flow     : ${green}xtls-rprx-vision${nc}"
-    echo -e "  SNI      : ${green}${sni}${nc}"
-    echo -e "  Fingerprint: ${green}${fp}${nc}"
-    echo -e "  PublicKey: ${green}${pbk}${nc}"
-    echo -e "  ShortId  : ${green}${sid}${nc}"
-    echo -e "  Dest(srv): ${green}${dest}${nc}"
+    echo -e "${g0}-- Connection summary --${nc}"
+    echo -e "  Server     : ${g2}${host}${nc}"
+    echo -e "  Port       : ${g2}${port}${nc}"
+    echo -e "  UUID       : ${g2}${uuid}${nc}"
+    echo -e "  Flow       : ${g2}xtls-rprx-vision${nc}"
+    echo -e "  SNI        : ${g2}${sni}${nc}"
+    echo -e "  Fingerprint: ${g2}${fp}${nc}"
+    echo -e "  PublicKey  : ${g2}${pbk}${nc}"
+    echo -e "  ShortId    : ${g2}${sid:-(empty)}${nc}"
+    echo -e "  Dest (srv) : ${g2}${dest}${nc}"
 
     echo ""
-    echo -e "${blue}-- vless:// share link --${nc}"
-    echo "vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${tag}"
+    echo -e "${g0}-- vless:// share link --${nc}"
+    echo "vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}${sid_q}&type=tcp&headerType=none#${tag}"
 
     echo ""
-    echo -e "${blue}-- sing-box outbound JSON --${nc}"
-    cat <<EOF
+    echo -e "${g0}-- sing-box outbound JSON --${nc}"
+    cat <<REOF
 {
   "type": "vless",
   "tag": "${tag}",
@@ -2730,21 +2779,18 @@ _reality_print_configs() {
     "enabled": true,
     "server_name": "${sni}",
     "utls": { "enabled": true, "fingerprint": "${fp}" },
-    "reality": {
-      "enabled": true,
-      "public_key": "${pbk}",
-      "short_id": "${sid}"
-    }
+    "reality": { "enabled": true, "public_key": "${pbk}", "short_id": "${sid}" }
   },
   "packet_encoding": "xudp"
 }
-EOF
+REOF
 
     echo ""
-    echo -e "${blue}-- Xray URI-style JSON (outbounds fragment) --${nc}"
-    cat <<EOF
+    echo -e "${g0}-- Xray outbound JSON --${nc}"
+    cat <<REOF
 {
   "protocol": "vless",
+  "tag": "${tag}",
   "settings": {
     "vnext": [{
       "address": "${host}",
@@ -2762,171 +2808,338 @@ EOF
       "shortId": "${sid}",
       "spiderX": "/"
     }
-  },
-  "tag": "${tag}"
+  }
 }
-EOF
+REOF
 
-    # Hard self-check against the RUNNING config: never declare victory on a dead config.
     local ok_sni=0 ok_port=0 ok_uuid=0
     _reality_server_names | grep -qxF "$sni" && ok_sni=1
     ss -lnt 2>/dev/null | grep -q ":${port}[[:space:]]" && ok_port=1
     jq -e --arg u "$uuid" '.inbounds[]?|select(.tag=="vless-reality")|.settings.clients[]?|select(.id==$u)' \
         "$XRAY_CONF" >/dev/null 2>&1 && ok_uuid=1
+
     echo ""
     if [[ $ok_sni -eq 1 && $ok_port -eq 1 && $ok_uuid -eq 1 ]]; then
-        echo -e "  ${g2}[READY]${nc} SNI registered + port ${port} listening + UUID on Reality inbound."
+        echo -e "  ${g2}[VERIFIED]${nc} SNI accepted + port ${port} listening + UUID on Reality inbound."
     else
-        [[ $ok_sni  -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} SNI ${sni} NOT in server serverNames — client can never authenticate."
-        [[ $ok_port -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} xray is not listening on ${port}."
-        [[ $ok_uuid -eq 1 ]] || echo -e "  ${red}[BLOCKED]${nc} UUID ${uuid} NOT in vless-reality clients."
-        echo -e "  ${g0}Run menu r → 7 (Diagnose + auto-repair) to fix all three.${nc}"
+        [[ $ok_sni  -eq 1 ]] || echo -e "  ${gr}[BLOCKED]${nc} SNI ${sni} is not in serverNames - cannot authenticate."
+        [[ $ok_port -eq 1 ]] || echo -e "  ${gr}[BLOCKED]${nc} xray is not listening on ${port}."
+        [[ $ok_uuid -eq 1 ]] || echo -e "  ${gr}[BLOCKED]${nc} UUID not present on vless-reality."
+        echo -e "  ${g0}Use option 7 (Diagnose + auto-repair).${nc}"
     fi
     return 0
 }
 
-_reality_register_sni() {
-    local sni="$1"
-    validate_domain "$sni" || { echo -e "  ${red}Invalid SNI.${nc}"; return 1; }
+_reality_switch_target() {
+    local host="$1" port="${2:-443}"
+    host="$(_sni_clean "$host")"
+    validate_domain "$host" || { echo -e "  ${gr}Invalid hostname.${nc}"; return 1; }
     jq -e '.inbounds[]|select(.tag=="vless-reality")' "$XRAY_CONF" >/dev/null 2>&1 \
-        || { echo -e "  ${red}vless-reality inbound missing.${nc}"; return 1; }
+        || { echo -e "  ${gr}vless-reality inbound missing.${nc}"; return 1; }
 
-    if _reality_server_names | grep -qxF "$sni"; then
-        echo -e "  ${g0}SNI already registered: ${sni}${nc}"
-        return 0
+    if ! _probe_site "$host" "$port"; then
+        local go=""
+        echo ""
+        read -rp "  Probe failed. Switch anyway? [y/N]: " go
+        [[ "$go" =~ ^[Yy]$ ]] || { echo -e "  ${gy}Cancelled.${nc}"; return 1; }
     fi
 
-    # Append to serverNames; keep existing dest (dest host need not equal every SNI,
-    # but dest must speak TLS — typically the default camouflage host:443).
-    if json_edit "$XRAY_CONF" "$CFG_LOCK" --arg sni "$sni" '
-        .inbounds |= map(
-          if .tag == "vless-reality" then
-            .streamSettings.realitySettings.serverNames =
-              ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
-          else . end)'; then
+    local -a sans=() names=()
+    mapfile -t sans < <(_dest_sans "$host" "$port")
+    names+=("$host")
+    local alt
+    if [[ "$host" == www.* ]]; then alt="${host#www.}"; else alt="www.${host}"; fi
+    if [[ ${#sans[@]} -gt 0 ]] && _san_match "$alt" "${sans[@]}"; then
+        names+=("$alt")
+    fi
+
+    local backup; backup="${XRAY_CONF}.bak.$(date +%s)"
+    cp -p "$XRAY_CONF" "$backup" 2>/dev/null || { echo -e "  ${gr}Backup failed.${nc}"; return 1; }
+
+    local names_json
+    names_json="$(printf '%s\n' "${names[@]}" | jq -R . | jq -s 'unique')"
+
+    if ! json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "${host}:${port}" --argjson names "$names_json" '
+        .inbounds |= map(if .tag=="vless-reality" then
+            .streamSettings.realitySettings.dest = $dest
+            | .streamSettings.realitySettings.serverNames = $names
+            | .streamSettings.realitySettings.show = true
+          else . end)
+        | .log.loglevel = "info"'; then
+        cp -p "$backup" "$XRAY_CONF"
+        rm -f "$backup"
+        echo -e "  ${gr}Config edit failed; rolled back.${nc}"
+        return 1
+    fi
+
+    if "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
         systemctl restart xray >/dev/null 2>&1 || true
-        echo -e "  ${green}Registered SNI on server: ${sni}${nc}"
-        echo -e "  ${g0}Current serverNames:${nc}"
-        _reality_server_names | sed 's/^/    - /'
-        return 0
+        sleep 1
+        if systemctl is-active --quiet xray; then
+            if [[ -f "$CREDS_ENV" ]]; then
+                if grep -q '^REALITY_DEST=' "$CREDS_ENV"; then
+                    sed -i "s|^REALITY_DEST=.*|REALITY_DEST=\"${host}:${port}\"|" "$CREDS_ENV"
+                else
+                    printf 'REALITY_DEST="%s"\n' "${host}:${port}" >> "$CREDS_ENV"
+                fi
+                if grep -q '^REALITY_SNI=' "$CREDS_ENV"; then
+                    sed -i "s|^REALITY_SNI=.*|REALITY_SNI=\"${host}\"|" "$CREDS_ENV"
+                else
+                    printf 'REALITY_SNI="%s"\n' "$host" >> "$CREDS_ENV"
+                fi
+                chmod 600 "$CREDS_ENV"
+            fi
+            rm -f "$backup"
+            echo ""
+            echo -e "  ${g2}Target switched.${nc}"
+            echo -e "  dest        : ${g2}${host}:${port}${nc}"
+            echo -e "  serverNames : ${g2}${names[*]}${nc}"
+            echo -e "  ${gy}All Reality clients must now use SNI ${host} (or an alias above).${nc}"
+            return 0
+        fi
     fi
-    echo -e "  ${red}Failed to update config.json${nc}"
+
+    cp -p "$backup" "$XRAY_CONF"
+    systemctl restart xray >/dev/null 2>&1 || true
+    rm -f "$backup"
+    echo -e "  ${gr}xray rejected the new target - rolled back to the previous working config.${nc}"
     return 1
 }
 
-_reality_unregister_sni() {
-    local sni="$1" def_sni
-    def_sni="$(_asx_reality_sni)"
-    validate_domain "$sni" || return 1
-    if [[ "$sni" == "$def_sni" ]]; then
-        echo -e "  ${red}Refusing to remove the default SNI (${def_sni}).${nc}"
+_reality_add_alias() {
+    local sni="$1" dest host port
+    sni="$(_sni_clean "$sni")"
+    validate_domain "$sni" || { echo -e "  ${gr}Invalid hostname.${nc}"; return 1; }
+    dest="$(_reality_dest_current)"
+    [[ -n "$dest" ]] || { echo -e "  ${gr}No dest configured.${nc}"; return 1; }
+    host="${dest%%:*}"; port="${dest##*:}"
+    [[ "$host" == "$port" ]] && port=443
+
+    if _reality_server_names | grep -qxF "$sni"; then
+        echo -e "  ${g0}Already registered: ${sni}${nc}"
+        return 0
+    fi
+
+    local -a sans=()
+    mapfile -t sans < <(_dest_sans "$host" "$port")
+    if [[ ${#sans[@]} -eq 0 ]]; then
+        echo -e "  ${gy}Could not read ${host} certificate SANs.${nc}"
+    elif ! _san_match "$sni" "${sans[@]}"; then
+        echo ""
+        echo -e "  ${gr}${sni} is NOT covered by the ${host} certificate.${nc}"
+        echo -e "  ${g0}SANs: ${sans[*]:0:8}${nc}"
+        echo -e "  ${g0}Reality forwards the handshake to dest, so this SNI would always fail.${nc}"
+        echo -e "  ${g0}To test ${sni}, use option 2 and switch the whole target to it.${nc}"
+        return 1
+    fi
+
+    if json_edit "$XRAY_CONF" "$CFG_LOCK" --arg sni "$sni" '
+        .inbounds |= map(if .tag=="vless-reality" then
+            .streamSettings.realitySettings.serverNames =
+              ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
+          else . end)'; then
+        if "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
+            systemctl restart xray >/dev/null 2>&1 || true
+            echo -e "  ${g2}Alias SNI added: ${sni}${nc}"
+            return 0
+        fi
+    fi
+    echo -e "  ${gr}Failed to add alias.${nc}"
+    return 1
+}
+
+_reality_remove_alias() {
+    local sni="$1" dest host
+    sni="$(_sni_clean "$sni")"
+    dest="$(_reality_dest_current)"
+    host="${dest%%:*}"
+    if [[ "$sni" == "$host" ]]; then
+        echo -e "  ${gr}Refusing to remove the primary SNI (matches dest ${host}).${nc}"
         return 1
     fi
     if json_edit "$XRAY_CONF" "$CFG_LOCK" --arg sni "$sni" '
-        .inbounds |= map(
-          if .tag == "vless-reality" then
+        .inbounds |= map(if .tag=="vless-reality" then
             .streamSettings.realitySettings.serverNames =
               [ ((.streamSettings.realitySettings.serverNames // [])[]) | select(. != $sni) ]
           else . end)'; then
         systemctl restart xray >/dev/null 2>&1 || true
-        echo -e "  ${green}Removed SNI from server: ${sni}${nc}"
+        echo -e "  ${g2}Removed: ${sni}${nc}"
         return 0
     fi
     return 1
 }
 
-_reality_set_dest() {
-    local host="$1" dest
-    validate_domain "$host" || { echo -e "  ${red}Invalid dest host.${nc}"; return 1; }
-    dest="${host}:443"
-    if json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "$dest" --arg sni "$host" '
-        .inbounds |= map(
-          if .tag == "vless-reality" then
-            .streamSettings.realitySettings.dest = $dest
-            | .streamSettings.realitySettings.serverNames =
-                ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
-          else . end)'; then
-        # Keep credentials.env in sync for menu defaults display
-        if [[ -f "$CREDS_ENV" ]]; then
-            if grep -q '^REALITY_DEST=' "$CREDS_ENV" 2>/dev/null; then
-                sed -i "s|^REALITY_DEST=.*|REALITY_DEST=\"${dest}\"|" "$CREDS_ENV"
-            else
-                printf 'REALITY_DEST="%s"\n' "$dest" >> "$CREDS_ENV"
-            fi
-            if grep -q '^REALITY_SNI=' "$CREDS_ENV" 2>/dev/null; then
-                sed -i "s|^REALITY_SNI=.*|REALITY_SNI=\"${host}\"|" "$CREDS_ENV"
-            else
-                printf 'REALITY_SNI="%s"\n' "$host" >> "$CREDS_ENV"
-            fi
-            chmod 600 "$CREDS_ENV"
-        fi
-        systemctl restart xray >/dev/null 2>&1 || true
-        echo -e "  ${green}Reality dest set to ${dest}; SNI ${host} ensured in serverNames.${nc}"
-        return 0
+_reality_diagnose() {
+    local d port host
+    _reality_live_material
+    port="$LIVE_PORT"; d="$LIVE_DEST"
+    echo -e "${g0}== Reality diagnostics ==${nc}"
+    echo ""
+    if systemctl is-active --quiet xray; then
+        echo -e "  xray       : ${g2}active${nc}"
+    else
+        echo -e "  xray       : ${gr}inactive${nc}"
     fi
-    return 1
+    if ss -lnt 2>/dev/null | grep -q ":${port}[[:space:]]"; then
+        echo -e "  listen     : ${g2}${port} OK${nc}"
+    else
+        echo -e "  listen     : ${gr}${port} NOT listening${nc}"
+    fi
+    echo -e "  public IP  : $(get_public_ip)"
+    echo -e "  pbk        : ${LIVE_PBK:-missing}"
+    echo -e "  sid        : ${LIVE_SID:-(empty)}"
+    echo -e "  dest       : ${d:-missing}"
+    echo -e "  serverNames:"
+    _reality_server_names | sed 's/^/    - /'
+    echo ""
+    echo -e "  Reality clients:"
+    jq -r '.inbounds[]?|select(.tag=="vless-reality")|.settings.clients[]?|"    - \(.email // "?")  flow=\(.flow // "")  \(.id)"' \
+        "$XRAY_CONF" 2>/dev/null || echo "    (none)"
+
+    host="${d%%:*}"
+    echo ""
+    if [[ -n "$host" ]]; then
+        local -a sans=() bad=()
+        mapfile -t sans < <(_dest_sans "$host" 443)
+        if [[ ${#sans[@]} -gt 0 ]]; then
+            local n
+            while IFS= read -r n; do
+                [[ -z "$n" ]] && continue
+                _san_match "$n" "${sans[@]}" || bad+=("$n")
+            done < <(_reality_server_names)
+            if [[ ${#bad[@]} -eq 0 ]]; then
+                echo -e "  ${g2}[OK]${nc} every serverName is covered by the ${host} certificate"
+            else
+                echo -e "  ${gr}[PROBLEM]${nc} these serverNames are NOT served by ${host}:"
+                printf '    - %s\n' "${bad[@]}"
+                echo -e "  ${g0}Clients using them can never authenticate.${nc}"
+            fi
+        fi
+        local bytes; bytes="$(_dest_chain_bytes "$host" 443)"
+        if [[ "${bytes:-0}" -gt 8192 ]]; then
+            echo -e "  ${gr}[PROBLEM]${nc} dest cert chain ${bytes} B > 8192 B - switch target (option 2)"
+        fi
+    fi
+
+    echo ""
+    echo -e "  Recent xray log:"
+    journalctl -u xray -n 80 --no-pager 2>/dev/null \
+        | grep -iE 'reality|invalid|handshake|failed' | tail -12 \
+        || tail -20 /var/log/xray/error.log 2>/dev/null || echo "    (no hits)"
+    echo ""
+    echo -e "  ${g0}Live watch: journalctl -u xray -f   (then connect once)${nc}"
+}
+
+_reality_autorepair() {
+    echo ""
+    echo -e "  ${g0}Repairing...${nc}"
+
+    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg rflow "xtls-rprx-vision" '
+      (first(.inbounds[]?|select(.tag=="vless-ws")|.settings.clients) // []) as $src
+      | ($src|map({id:.id, email:(.email//.id), flow:$rflow})) as $rc
+      | ($src|map({id:.id, email:(.email//.id), flow:""})) as $sc
+      | .inbounds |= map(
+          if .tag=="vless-reality" and ($rc|length)>0 then
+            .settings.clients=$rc | .listen="0.0.0.0"
+          elif .tag=="vless-stls" and ($sc|length)>0 then
+            .settings.clients=$sc
+          else . end)
+      | .log.loglevel="info"' \
+      && echo -e "  ${g2}[OK]${nc} clients synced from vless-ws"
+
+    _reality_live_material
+    if [[ -n "$LIVE_PBK" && -f "$CREDS_ENV" ]]; then
+        if grep -q '^REALITY_PUBLIC_KEY=' "$CREDS_ENV"; then
+            sed -i "s|^REALITY_PUBLIC_KEY=.*|REALITY_PUBLIC_KEY=\"${LIVE_PBK}\"|" "$CREDS_ENV"
+        else
+            printf 'REALITY_PUBLIC_KEY="%s"\n' "$LIVE_PBK" >> "$CREDS_ENV"
+        fi
+        chmod 600 "$CREDS_ENV"
+        echo -e "  ${g2}[OK]${nc} pbk refreshed: ${LIVE_PBK}"
+    fi
+
+    local dest host
+    dest="$(_reality_dest_current)"; host="${dest%%:*}"
+    if [[ -n "$host" ]]; then
+        local -a sans=() keep=()
+        mapfile -t sans < <(_dest_sans "$host" 443)
+        if [[ ${#sans[@]} -gt 0 ]]; then
+            local n
+            while IFS= read -r n; do
+                [[ -z "$n" ]] && continue
+                if _san_match "$n" "${sans[@]}"; then keep+=("$n"); fi
+            done < <(_reality_server_names)
+            if [[ ${#keep[@]} -eq 0 ]]; then keep=("$host"); fi
+            local keep_json
+            keep_json="$(printf '%s\n' "${keep[@]}" | jq -R . | jq -s 'unique')"
+            json_edit "$XRAY_CONF" "$CFG_LOCK" --argjson names "$keep_json" '
+              .inbounds |= map(if .tag=="vless-reality" then
+                  .streamSettings.realitySettings.serverNames=$names
+                else . end)' \
+              && echo -e "  ${g2}[OK]${nc} serverNames pruned to: ${keep[*]}"
+        fi
+
+        local bytes bad=0
+        bytes="$(_dest_chain_bytes "$host" 443)"
+        timeout 6 openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 </dev/null >/dev/null 2>&1 || bad=1
+        [[ "${bytes:-0}" -gt 8192 ]] && bad=1
+        if [[ "$bad" -eq 1 ]]; then
+            echo -e "  ${gy}[!!]${nc} dest ${host} unusable - switching to www.cloudflare.com"
+            _reality_switch_target "www.cloudflare.com" 443 >/dev/null 2>&1 \
+                && echo -e "  ${g2}[OK]${nc} dest switched to www.cloudflare.com"
+        fi
+    fi
+
+    if "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
+        systemctl restart xray >/dev/null 2>&1 || true
+        echo -e "  ${g2}[OK]${nc} config valid, xray restarted"
+    else
+        echo -e "  ${gr}[FAIL]${nc} config test failed:"
+        "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 | tail -15
+    fi
 }
 
 reality_config_menu() {
     while true; do
         show_header
         ui_screen "VLESS REALITY // CONFIG LAB"
-        local host port pbk sid def_sni dest
+        local host port pbk sid dest
         host="$(get_public_ip)"
-        port="$(_asx_port_reality)"
-        pbk="$(_asx_reality_pbk)"
-        sid="$(_asx_reality_sid)"
-        def_sni="$(_asx_reality_sni)"
-        dest="$(_reality_dest_current)"
-        [[ -n "$dest" ]] || dest="${def_sni}:443"
+        _reality_live_material
+        port="$LIVE_PORT"; pbk="$LIVE_PBK"; sid="$LIVE_SID"; dest="$LIVE_DEST"
 
-        ui_kv "SERVER"  "$host"
-        ui_kv "PORT"    "$port"
-        ui_kv "PBK"     "${pbk:-missing}"
-        ui_kv "SID"     "${sid:-missing}"
-        ui_kv "DEFAULT" "$def_sni"
-        ui_kv "DEST"    "$dest"
-        ui_title "SERVER serverNames"
+        ui_kv "SERVER" "$host"
+        ui_kv "PORT"   "$port"
+        ui_kv "DEST"   "${dest:-missing}"
+        ui_kv "PBK"    "${pbk:-missing}"
+        ui_kv "SID"    "${sid:-(empty)}"
+        ui_title "ACCEPTED SNI (serverNames)"
         local sn count=0
         while IFS= read -r sn; do
             [[ -z "$sn" ]] && continue
             count=$((count + 1))
             ui_line "  ${g1}${GL_DOT}${nc} ${gw}${sn}${nc}"
         done < <(_reality_server_names)
-        (( count == 0 )) && ui_line "  ${gy}(none — Reality inbound missing?)${nc}"
+        (( count == 0 )) && ui_line "  ${gy}(none - Reality inbound missing?)${nc}"
+        ui_line "${g0}  SNI must be served by dest. To test another site, use 2.${nc}"
 
         ui_mid
-        ui_line "${g2}1${nc}${g0})${nc} ${gw}Generate client config (pick SNI)${nc}"
-        ui_line "${g2}2${nc}${g0})${nc} ${gw}Register SNI on server${nc}"
-        ui_line "${g2}3${nc}${g0})${nc} ${gw}Generate + register SNI${nc}"
-        ui_line "${g2}4${nc}${g0})${nc} ${gw}Remove test SNI from server${nc}"
-        ui_line "${g2}5${nc}${g0})${nc} ${gw}Change Reality dest + default SNI${nc}"
+        ui_line "${g2}1${nc}${g0})${nc} ${gw}Generate client config${nc}"
+        ui_line "${g2}2${nc}${g0})${nc} ${gw}Switch camouflage target (dest + SNI)${nc}"
+        ui_line "${g2}3${nc}${g0})${nc} ${gw}Test a candidate site (no changes)${nc}"
+        ui_line "${g2}4${nc}${g0})${nc} ${gw}Add alias SNI (same certificate)${nc}"
+        ui_line "${g2}5${nc}${g0})${nc} ${gw}Remove alias SNI${nc}"
         ui_line "${g2}6${nc}${g0})${nc} ${gw}Show raw Reality inbound JSON${nc}"
         ui_line "${g2}7${nc}${g0})${nc} ${gw}Diagnose + auto-repair${nc}"
         ui_line "${gr}0${nc}${g0})${nc} ${gw}Back${nc}"
         ui_bot
+
         local c; ui_prompt "select" c
         case "$c" in
             1)
-                local RE_USER="" RE_UUID="" RE_SNI="" fp="chrome"
+                local RE_USER="" RE_UUID="" RE_SNI="" fp=""
                 _reality_pick_user || { ui_pause; continue; }
-                _reality_pick_sni || { ui_pause; continue; }
-                # Reality hard rule: server only authenticates SNIs in its serverNames.
-                # An unregistered SNI is silently forwarded to dest → client NEVER works.
-                if ! _reality_server_names | grep -qxF "$RE_SNI"; then
-                    echo ""
-                    echo -e "  ${yellow}!! ${RE_SNI} is NOT registered on the server.${nc}"
-                    echo -e "  ${g0}A config with this SNI cannot connect until it is added to serverNames.${nc}"
-                    local reg=""
-                    read -rp "  Register ${RE_SNI} on the server now? [Y/n]: " reg
-                    reg="$(printf '%s' "${reg:-Y}" | tr -d '[:space:]')"
-                    if [[ "${reg:-Y}" =~ ^[Yy]$ || -z "$reg" ]]; then
-                        _reality_register_sni "$RE_SNI" || { ui_pause; continue; }
-                    else
-                        echo -e "  ${red}Cancelled — no config generated (it would be dead anyway).${nc}"
-                        ui_pause; continue
-                    fi
-                fi
+                _reality_pick_active_sni || { ui_pause; continue; }
                 read -rp "  uTLS fingerprint [chrome]: " fp
                 fp="$(printf '%s' "${fp:-chrome}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
                 case "$fp" in
@@ -2938,159 +3151,85 @@ reality_config_menu() {
                 ui_pause
                 ;;
             2)
-                local RE_SNI=""
-                _reality_pick_sni || { ui_pause; continue; }
-                _reality_register_sni "$RE_SNI"
+                clear
+                ui_banner "SWITCH CAMOUFLAGE TARGET"
+                echo -e "  ${g0}Reality relays the TLS handshake to dest, so dest and SNI move together.${nc}"
+                echo -e "  ${g0}Current: ${dest}${nc}"
+                echo ""
+                echo -e "  ${g0}Known-good targets:${nc}"
+                echo "    www.cloudflare.com   dl.google.com      www.bing.com"
+                echo "    www.apple.com        www.amazon.com     www.samsung.com"
+                echo -e "  ${gy}   avoid www.microsoft.com (cert chain exceeds the 8192 B buffer)${nc}"
+                echo ""
+                local nt=""
+                read -rp "  New target host (Enter to cancel): " nt
+                if [[ -z "$nt" ]]; then
+                    echo -e "  ${gy}Cancelled.${nc}"; ui_pause; continue
+                fi
+                if _reality_switch_target "$nt" 443; then
+                    echo ""
+                    local gen=""
+                    read -rp "  Generate a client config now? [Y/n]: " gen
+                    if [[ -z "$gen" || "$gen" =~ ^[Yy]$ ]]; then
+                        local RE_USER="" RE_UUID="" RE_SNI=""
+                        if _reality_pick_user && _reality_pick_active_sni; then
+                            clear
+                            _reality_print_configs "$RE_USER" "$RE_UUID" "$RE_SNI" "chrome"
+                        fi
+                    fi
+                fi
                 ui_pause
                 ;;
             3)
-                local RE_USER="" RE_UUID="" RE_SNI="" fp="chrome"
-                _reality_pick_user || { ui_pause; continue; }
-                _reality_pick_sni || { ui_pause; continue; }
-                _reality_register_sni "$RE_SNI" || true
-                read -rp "  uTLS fingerprint [chrome]: " fp
-                fp="$(printf '%s' "${fp:-chrome}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-                case "$fp" in
-                    chrome|firefox|safari|ios|android|edge|360|qq|random|randomized) ;;
-                    *) fp="chrome" ;;
-                esac
                 clear
-                _reality_print_configs "$RE_USER" "$RE_UUID" "$RE_SNI" "$fp"
+                ui_banner "TEST CANDIDATE SITE"
+                local ct=""
+                read -rp "  Host to test (Enter to cancel): " ct
+                if [[ -z "$ct" ]]; then ui_pause; continue; fi
+                ct="$(_sni_clean "$ct")"
+                if _probe_site "$ct" 443; then
+                    echo ""
+                    echo -e "  ${g2}SUITABLE${nc} - use option 2 to switch to ${ct}."
+                else
+                    echo ""
+                    echo -e "  ${gr}NOT SUITABLE${nc} as a Reality target."
+                fi
                 ui_pause
                 ;;
             4)
+                clear
+                ui_banner "ADD ALIAS SNI"
+                echo -e "  ${g0}Only names on the current dest certificate can be aliases.${nc}"
+                echo -e "  ${g0}dest: ${dest}${nc}"
                 echo ""
-                echo "  Registered SNIs:"
-                _reality_server_names | nl -w2 -s') '
-                echo ""
-                read -rp "  SNI to remove: " rs
-                rs="$(printf '%s' "$rs" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-                [[ -n "$rs" ]] && _reality_unregister_sni "$rs"
+                local al=""
+                read -rp "  Alias SNI (Enter to cancel): " al
+                [[ -n "$al" ]] && _reality_add_alias "$al"
                 ui_pause
                 ;;
             5)
-                echo -e "  ${g0}This updates Reality dest (TLS handshake target) and ensures SNI is allowed.${nc}"
-                echo -e "  Current dest: ${dest}"
-                read -rp "  New dest host (e.g. www.example.com): " nh
-                nh="$(printf '%s' "$nh" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-                nh="${nh#https://}"; nh="${nh#http://}"; nh="${nh%%/*}"
-                [[ -n "$nh" ]] && _reality_set_dest "$nh"
+                clear
+                echo "  Registered SNIs:"
+                _reality_server_names | nl -w2 -s') '
+                echo ""
+                local rs=""
+                read -rp "  SNI to remove (Enter to cancel): " rs
+                [[ -n "$rs" ]] && _reality_remove_alias "$rs"
                 ui_pause
                 ;;
             6)
                 clear
-                jq '.inbounds[]|select(.tag=="vless-reality")' "$XRAY_CONF" 2>/dev/null \
+                jq '.inbounds[]?|select(.tag=="vless-reality")' "$XRAY_CONF" 2>/dev/null \
                     || echo "(vless-reality inbound not found)"
                 ui_pause
                 ;;
             7)
                 clear
-                echo -e "${blue}== Reality diagnostics ==${nc}"
+                _reality_diagnose
                 echo ""
-                systemctl is-active --quiet xray && echo -e "  xray: ${green}active${nc}" || echo -e "  xray: ${red}inactive${nc}"
-                ss -lntup 2>/dev/null | grep -E ':8443\b' || echo -e "  ${red}NOT listening on 8443${nc}"
-                echo ""
-                echo "  Public IP : $(get_public_ip)"
-                echo "  pbk       : $(_asx_reality_pbk)"
-                echo "  sid       : $(_asx_reality_sid)"
-                echo "  sni       : $(_asx_reality_sni)"
-                echo "  dest      : $(_reality_dest_current)"
-                echo "  serverNames:"
-                _reality_server_names | sed 's/^/    - /'
-                echo ""
-                echo "  Reality clients (email / flow / id):"
-                jq -r '.inbounds[]|select(.tag=="vless-reality")|.settings.clients[]?|"    - \(.email // "?")  flow=\(.flow // "")  id=\(.id)"' \
-                    "$XRAY_CONF" 2>/dev/null || echo "    (none)"
-                echo ""
-                local d; d="$(_reality_dest_current)"
-                if [[ -n "$d" ]] && command -v timeout >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
-                    if timeout 5 openssl s_client -connect "$d" -servername "${d%%:*}" </dev/null >/dev/null 2>&1; then
-                        echo -e "  dest TLS  : ${green}OK${nc} ($d)"
-                    else
-                        echo -e "  dest TLS  : ${red}FAIL${nc} ($d) — will auto-fix to cloudflare.com if you confirm"
-                    fi
-                fi
-                echo ""
-                echo "  Recent xray log (reality/invalid/handshake):"
-                journalctl -u xray -n 80 --no-pager 2>/dev/null | grep -iE 'reality|invalid|handshake|8443|failed' | tail -15 \
-                    || tail -30 /var/log/xray/error.log 2>/dev/null || echo "    (no log hits)"
-                echo ""
-                echo "  Live watch: journalctl -u xray -f   (then connect once from client)"
-                echo ""
+                local fix=""
                 read -rp "  Run auto-repair now? [y/N]: " fix
-                if [[ "$fix" =~ ^[Yy]$ ]]; then
-                    # 1) Sync all vless-ws users onto Reality (vision) + STLS
-                    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg rflow "xtls-rprx-vision" '
-                      (first(.inbounds[]|select(.tag=="vless-ws")|.settings.clients)//[]) as $src |
-                      ($src|map({id:.id,email:(.email//.id),flow:$rflow})) as $rc |
-                      ($src|map({id:.id,email:(.email//.id),flow:""})) as $sc |
-                      .inbounds |= map(
-                        if .tag=="vless-reality" and ($rc|length)>0 then
-                          .settings.clients=$rc
-                          | .listen="0.0.0.0"
-                          | .sniffing={enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}
-                        elif .tag=="vless-stls" and ($sc|length)>0 then .settings.clients=$sc
-                        else . end)'
-                    echo -e "  ${green}Clients synced from vless-ws → vless-reality (flow=vision)${nc}"
-
-                    # 2) Refresh pbk from privateKey (never use Hash32)
-                    local pr pb sid
-                    pr="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.privateKey//empty' "$XRAY_CONF")"
-                    sid="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.shortIds[1]//.streamSettings.realitySettings.shortIds[0]//empty' "$XRAY_CONF")"
-                    pb="$("$XRAY_BIN" x25519 -i "$pr" 2>/dev/null | awk -F: 'tolower($1) ~ /password|public/ {sub(/^[^:]*:[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}')"
-                    [[ -z "$pb" ]] && pb="$("$XRAY_BIN" x25519 -i "$pr" 2>/dev/null | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -1)"
-                    if [[ -n "$pb" ]]; then
-                        grep -q '^REALITY_PUBLIC_KEY=' "$CREDS_ENV" 2>/dev/null \
-                            && sed -i "s|^REALITY_PUBLIC_KEY=.*|REALITY_PUBLIC_KEY=\"${pb}\"|" "$CREDS_ENV" \
-                            || printf 'REALITY_PUBLIC_KEY="%s"\n' "$pb" >> "$CREDS_ENV"
-                        grep -q '^REALITY_PRIVATE_KEY=' "$CREDS_ENV" 2>/dev/null \
-                            && sed -i "s|^REALITY_PRIVATE_KEY=.*|REALITY_PRIVATE_KEY=\"${pr}\"|" "$CREDS_ENV" \
-                            || printf 'REALITY_PRIVATE_KEY="%s"\n' "$pr" >> "$CREDS_ENV"
-                        [[ -n "$sid" ]] && {
-                            grep -q '^REALITY_SHORT_ID=' "$CREDS_ENV" 2>/dev/null \
-                                && sed -i "s|^REALITY_SHORT_ID=.*|REALITY_SHORT_ID=\"${sid}\"|" "$CREDS_ENV" \
-                                || printf 'REALITY_SHORT_ID="%s"\n' "$sid" >> "$CREDS_ENV"
-                        }
-                        chmod 600 "$CREDS_ENV"
-                        echo -e "  ${green}pbk refreshed: ${pb}${nc}"
-                    else
-                        echo -e "  ${yellow}Could not derive pbk (check xray x25519 -i)${nc}"
-                    fi
-
-                    # 3) If dest TLS fails, switch to www.cloudflare.com:443
-                    local dest host
-                    dest="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.dest//empty' "$XRAY_CONF")"
-                    host="${dest%%:*}"
-                    if [[ -z "$dest" ]] || ! timeout 5 openssl s_client -connect "$dest" -servername "$host" </dev/null >/dev/null 2>&1; then
-                        json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "www.cloudflare.com:443" --arg sni "www.cloudflare.com" --arg sid "${sid}" '
-                          .inbounds |= map(if .tag=="vless-reality" then
-                            .streamSettings.realitySettings.dest=$dest
-                            | .streamSettings.realitySettings.serverNames=
-                                ((.streamSettings.realitySettings.serverNames//[]) + [$sni] | unique)
-                            | .streamSettings.realitySettings.shortIds=(["", $sid] | unique)
-                          else . end)'
-                        sed -i 's|^REALITY_DEST=.*|REALITY_DEST="www.cloudflare.com:443"|' "$CREDS_ENV" 2>/dev/null || true
-                        sed -i 's|^REALITY_SNI=.*|REALITY_SNI="www.cloudflare.com"|' "$CREDS_ENV" 2>/dev/null || true
-                        grep -q '^REALITY_DEST=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_DEST="www.cloudflare.com:443"' >> "$CREDS_ENV"
-                        grep -q '^REALITY_SNI=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_SNI="www.cloudflare.com"' >> "$CREDS_ENV"
-                        chmod 600 "$CREDS_ENV"
-                        echo -e "  ${green}Dest switched to www.cloudflare.com:443 (client SNI must match)${nc}"
-                    else
-                        echo -e "  ${green}Dest TLS OK: ${dest}${nc}"
-                    fi
-
-                    # 4) Validate + restart
-                    if jq empty "$XRAY_CONF" && "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
-                        systemctl restart xray >/dev/null 2>&1 || true
-                        echo -e "  ${green}xray config OK and restarted${nc}"
-                    else
-                        echo -e "  ${red}xray config test failed — check journalctl -u xray${nc}"
-                        "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 | tail -20
-                    fi
-                    echo ""
-                    echo -e "  ${g0}Next: menu → r → 1 and generate a fresh link (use new SNI + pbk).${nc}"
-                    echo -e "  ${g0}Client server= must be public IP $(get_public_ip), port 8443, flow=xtls-rprx-vision.${nc}"
-                fi
+                [[ "$fix" =~ ^[Yy]$ ]] && _reality_autorepair
                 ui_pause
                 ;;
             0) return ;;
@@ -3510,7 +3649,7 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "Installation complete! AutoScriptX v4.4.2-hardened (Reality + ShadowTLS)."
+    log_success "Installation complete! AutoScriptX v4.4.3-hardened (Reality + ShadowTLS)."
     log_success "Reality :${PORT_VLESS_REALITY} (SNI ${REALITY_SNI}) | ShadowTLS :${PORT_SHADOWTLS}"
     log_success "Run 'autoscriptx' or 'asx' to start."
 }
