@@ -7,8 +7,8 @@ XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONF="${XRAY_CONF:-/usr/local/etc/xray/config.json}"
 CREDS="${CREDS:-/usr/local/etc/xray/credentials.env}"
 CFG_LOCK="${CFG_LOCK:-/run/lock/autoscriptx-cfg.lock}"
-FALLBACK_DEST="www.microsoft.com:443"
-FALLBACK_SNI="www.microsoft.com"
+FALLBACK_DEST="www.cloudflare.com:443"
+FALLBACK_SNI="www.cloudflare.com"
 
 die() { echo "xx $1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
