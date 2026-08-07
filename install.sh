@@ -78,8 +78,11 @@ readonly PORT_VLESS_STLS=10007
 readonly SHADOWTLS_BIN="/usr/local/bin/shadow-tls"
 readonly SHADOWTLS_ENV="${XRAY_DIR}/shadowtls.env"
 # Primary camouflage / SNI destination for Reality + ShadowTLS handshakes
-readonly REALITY_SNI="www.iwanttfc.com"
-readonly REALITY_DEST="www.iwanttfc.com:443"
+# Reality dest MUST be a real host that speaks TLS 1.3 and is reachable from the VPS.
+# Fake/non-resolving names (or sites without TLS1.3) break every client handshake.
+# Change via menu → r → "Change Reality dest + default SNI".
+readonly REALITY_SNI="www.microsoft.com"
+readonly REALITY_DEST="www.microsoft.com:443"
 readonly REALITY_FLOW="xtls-rprx-vision"
 # BitTorrent / DHT / public tracker port ranges (multiport limit: 15 slots)
 readonly AT_PORTS="6881:6999,51413,6969,2710,1337"
@@ -644,7 +647,11 @@ setup_ssl_cert() {
 # ---------------------------------------------------------------------------
 # Reality key material + ShadowTLS binary/service helpers
 # ---------------------------------------------------------------------------
-# Parse `xray x25519` across historical output formats.
+# Parse `xray x25519` across historical + current output formats.
+# Modern xray prints:
+#   PrivateKey: ...
+#   Password (PublicKey): ...   <-- client pbk (NOT Hash32)
+#   Hash32: ...
 _parse_x25519() {
     local raw priv pub line k v
     priv=""; pub=""
@@ -652,20 +659,40 @@ _parse_x25519() {
     while IFS= read -r line; do
         line="${line//$\r/}"
         [[ -z "$line" ]] && continue
-        k="$(printf '%s' "$line" | awk -F: '{print tolower($1)}' | sed 's/[[:space:]]//g')"
+        # Normalize label: lowercase, strip spaces and parentheses.
+        k="$(printf '%s' "$line" | awk -F: '{print tolower($1)}' | sed 's/[[:space:]]//g; s/[()]//g')"
         v="$(printf '%s' "$line" | sed 's/^[^:]*:[[:space:]]*//')"
         case "$k" in
             privatekey|private) priv="$v" ;;
-            publickey|public|password) pub="$v" ;;
+            # Match publickey, password, passwordpublickey
+            publickey|public|password|passwordpublickey) pub="$v" ;;
+            hash32) ;; # never use Hash32 as client pbk
         esac
     done <<< "$raw"
     if [[ -z "$priv" || -z "$pub" ]]; then
-        mapfile -t _keys < <(printf '%s\n' "$raw" | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -2)
+        # Prefer labeled extraction failed — take first two long tokens, skip if 3rd is hash-like.
+        mapfile -t _keys < <(printf '%s\n' "$raw" | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -3)
         [[ -z "$priv" && ${#_keys[@]} -ge 1 ]] && priv="${_keys[0]}"
         [[ -z "$pub"  && ${#_keys[@]} -ge 2 ]] && pub="${_keys[1]}"
     fi
     [[ -n "$priv" && -n "$pub" ]] || return 1
     printf '%s\n%s\n' "$priv" "$pub"
+}
+
+# Derive the client public key (pbk) from a server private key. Most reliable path.
+_reality_pubkey_from_private() {
+    local priv="$1" out pub
+    out="$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || "$XRAY_BIN" x25519 -i="$priv" 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+        pub="$(printf '%s\n' "$out" | awk -F: '
+            tolower($1) ~ /password|public/ {
+                sub(/^[^:]*:[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit
+            }')"
+        if [[ -z "$pub" ]]; then
+            pub="$(printf '%s\n' "$out" | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -1)"
+        fi
+    fi
+    printf '%s' "${pub:-}"
 }
 
 generate_reality_keys() {
@@ -674,6 +701,10 @@ generate_reality_keys() {
     out="$("$XRAY_BIN" x25519 2>/dev/null)" || die "xray x25519 failed."
     mapfile -t _pair < <(_parse_x25519 "$out") || die "Could not parse xray x25519 output."
     priv="${_pair[0]:-}"; pub="${_pair[1]:-}"
+    # Prefer derived public key from private — avoids Hash32 / label mixups on new xray.
+    local derived
+    derived="$(_reality_pubkey_from_private "$priv")"
+    [[ -n "$derived" ]] && pub="$derived"
     [[ -n "$priv" && -n "$pub" ]] || die "Empty Reality key material."
     sid="$(openssl rand -hex 8)"
     REALITY_PRIVATE_KEY="$priv"
@@ -785,6 +816,118 @@ SERVICE
     log_success "ShadowTLS configured (listen ${PORT_SHADOWTLS} -> 127.0.0.1:${PORT_VLESS_STLS}, SNI ${REALITY_SNI})."
 }
 
+# Test that a Reality dest host:port accepts a TLS TCP connect from this VPS.
+_reality_dest_ok() {
+    local dest="$1" host port
+    host="${dest%%:*}"
+    port="${dest##*:}"
+    [[ "$host" == "$port" ]] && port=443
+    # bash /dev/tcp is enough; openssl s_client is better when present.
+    if command -v timeout >/dev/null 2>&1; then
+        if command -v openssl >/dev/null 2>&1; then
+            timeout 5 openssl s_client -connect "${host}:${port}" -servername "$host" </dev/null >/dev/null 2>&1 && return 0
+        fi
+        timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null && return 0
+    else
+        bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Sync every VLESS-WS client onto Reality (flow=vision) and STLS backend (flow empty).
+# Without this, accounts created before Reality existed cannot authenticate on :8443.
+repair_reality_stls_clients() {
+    local cfg="${1:-${XRAY_DIR}/config.json}"
+    [[ -f "$cfg" ]] || return 0
+    jq -e '.inbounds[]|select(.tag=="vless-reality" or .tag=="vless-stls")' "$cfg" >/dev/null 2>&1 || return 0
+    json_edit "$cfg" "$CFG_LOCK" --arg rflow "xtls-rprx-vision" '
+      (first(.inbounds[]|select(.tag=="vless-ws")|.settings.clients) // []) as $src |
+      ($src | map({
+          id: .id,
+          email: (.email // .id),
+          flow: $rflow
+      })) as $rclients |
+      ($src | map({
+          id: .id,
+          email: (.email // .id),
+          flow: ""
+      })) as $sclients |
+      .inbounds |= map(
+        if   .tag=="vless-reality" and ($rclients|length)>0 then .settings.clients=$rclients
+        elif .tag=="vless-stls"    and ($sclients|length)>0 then .settings.clients=$sclients
+        else . end )' \
+      && log_success "  Reality/STLS clients synced from vless-ws." \
+      || log_warning "  Could not sync Reality/STLS clients."
+}
+
+# If current Reality dest is dead, fall back to a known-good TLS1.3 host.
+repair_reality_dest() {
+    local cfg="${1:-${XRAY_DIR}/config.json}"
+    local creds="${XRAY_DIR}/credentials.env"
+    local dest host fallback="www.microsoft.com:443" fb_host="www.microsoft.com"
+    [[ -f "$cfg" ]] || return 0
+    jq -e '.inbounds[]|select(.tag=="vless-reality")' "$cfg" >/dev/null 2>&1 || return 0
+
+    dest="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.dest//empty' "$cfg" 2>/dev/null || true)"
+    [[ -n "$dest" ]] || dest="$fallback"
+    host="${dest%%:*}"
+
+    if _reality_dest_ok "$dest"; then
+        log_success "  Reality dest reachable: ${dest}"
+        return 0
+    fi
+
+    log_warning "  Reality dest not reachable via TLS (${dest}). Switching to ${fallback}."
+    json_edit "$cfg" "$CFG_LOCK" --arg dest "$fallback" --arg sni "$fb_host" '
+      .inbounds |= map(
+        if .tag=="vless-reality" then
+          .streamSettings.realitySettings.dest=$dest
+          | .streamSettings.realitySettings.serverNames =
+              ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
+        else . end)' || return 1
+
+    if [[ -f "$creds" ]]; then
+        grep -q '^REALITY_DEST=' "$creds" 2>/dev/null \
+            && sed -i "s|^REALITY_DEST=.*|REALITY_DEST=\"${fallback}\"|" "$creds" \
+            || printf 'REALITY_DEST="%s"\n' "$fallback" >> "$creds"
+        grep -q '^REALITY_SNI=' "$creds" 2>/dev/null \
+            && sed -i "s|^REALITY_SNI=.*|REALITY_SNI=\"${fb_host}\"|" "$creds" \
+            || printf 'REALITY_SNI="%s"\n' "$fb_host" >> "$creds"
+        chmod 600 "$creds"
+    fi
+    log_success "  Reality dest repaired → ${fallback} (update client SNI to ${fb_host})."
+}
+
+# Re-derive pbk from privateKey in config and rewrite credentials.env (fixes wrong pbk).
+repair_reality_pubkey() {
+    local cfg="${1:-${XRAY_DIR}/config.json}"
+    local creds="${XRAY_DIR}/credentials.env"
+    local priv pub sid
+    [[ -f "$cfg" ]] || return 0
+    priv="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.privateKey//empty' "$cfg" 2>/dev/null || true)"
+    [[ -n "$priv" ]] || return 0
+    pub="$(_reality_pubkey_from_private "$priv")"
+    [[ -n "$pub" ]] || return 0
+    sid="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.shortIds[1]//.streamSettings.realitySettings.shortIds[0]//empty' "$cfg" 2>/dev/null || true)"
+    [[ -n "$sid" ]] || sid="$(awk -F= '/^REALITY_SHORT_ID=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+
+    if [[ -f "$creds" ]]; then
+        grep -q '^REALITY_PUBLIC_KEY=' "$creds" 2>/dev/null \
+            && sed -i "s|^REALITY_PUBLIC_KEY=.*|REALITY_PUBLIC_KEY=\"${pub}\"|" "$creds" \
+            || printf 'REALITY_PUBLIC_KEY="%s"\n' "$pub" >> "$creds"
+        grep -q '^REALITY_PRIVATE_KEY=' "$creds" 2>/dev/null \
+            && sed -i "s|^REALITY_PRIVATE_KEY=.*|REALITY_PRIVATE_KEY=\"${priv}\"|" "$creds" \
+            || printf 'REALITY_PRIVATE_KEY="%s"\n' "$priv" >> "$creds"
+        if [[ -n "$sid" ]]; then
+            grep -q '^REALITY_SHORT_ID=' "$creds" 2>/dev/null \
+                && sed -i "s|^REALITY_SHORT_ID=.*|REALITY_SHORT_ID=\"${sid}\"|" "$creds" \
+                || printf 'REALITY_SHORT_ID="%s"\n' "$sid" >> "$creds"
+        fi
+        chmod 600 "$creds"
+    fi
+    log_success "  Reality client pbk refreshed from server privateKey."
+}
+
 # Idempotent migration: ensure Reality + STLS backend inbounds exist on upgrades.
 ensure_reality_stls_inbounds() {
     local cfg="${1:-${XRAY_DIR}/config.json}"
@@ -803,11 +946,38 @@ ensure_reality_stls_inbounds() {
         stls_pass="$(awk -F= '/^SHADOWTLS_PASSWORD=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
     fi
 
-    if [[ -z "${priv}" || -z "${pub}" || -z "${sid}" ]]; then
+    # Prefer privateKey already embedded in config.json over credentials.
+    local cfg_priv
+    cfg_priv="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.privateKey//empty' "$cfg" 2>/dev/null || true)"
+    [[ -n "$cfg_priv" ]] && priv="$cfg_priv"
+
+    if [[ -z "${priv}" || -z "${sid}" ]]; then
         generate_reality_keys
         priv="$REALITY_PRIVATE_KEY"; pub="$REALITY_PUBLIC_KEY"; sid="$REALITY_SHORT_ID"
+    else
+        # Always re-derive pbk from private key (fixes wrong Password/Hash32 mixups).
+        pub="$(_reality_pubkey_from_private "$priv")"
+        [[ -n "$pub" ]] || pub="$(awk -F= '/^REALITY_PUBLIC_KEY=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        [[ -n "$pub" ]] || { generate_reality_keys; priv="$REALITY_PRIVATE_KEY"; pub="$REALITY_PUBLIC_KEY"; sid="$REALITY_SHORT_ID"; }
     fi
     [[ -n "${stls_pass}" ]] || stls_pass="$(openssl rand -hex 16)"
+
+    # Pick a working dest: prefer configured REALITY_DEST if reachable, else microsoft.
+    local use_dest use_sni
+    use_dest="$REALITY_DEST"
+    use_sni="$REALITY_SNI"
+    if [[ -f "$creds" ]]; then
+        local cdest csni
+        cdest="$(awk -F= '/^REALITY_DEST=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        csni="$(awk -F= '/^REALITY_SNI=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        [[ -n "$cdest" ]] && use_dest="$cdest"
+        [[ -n "$csni" ]] && use_sni="$csni"
+    fi
+    if ! _reality_dest_ok "$use_dest"; then
+        log_warning "  Configured Reality dest ${use_dest} is not reachable; using www.microsoft.com:443"
+        use_dest="www.microsoft.com:443"
+        use_sni="www.microsoft.com"
+    fi
 
     umask 077
     local tmpc; tmpc="$(mktemp "${XRAY_DIR}/.creds.XXXXXX")"
@@ -821,8 +991,8 @@ ensure_reality_stls_inbounds() {
         printf 'REALITY_PRIVATE_KEY="%s"\n' "$priv"
         printf 'REALITY_PUBLIC_KEY="%s"\n' "$pub"
         printf 'REALITY_SHORT_ID="%s"\n' "$sid"
-        printf 'REALITY_SNI="%s"\n' "$REALITY_SNI"
-        printf 'REALITY_DEST="%s"\n' "$REALITY_DEST"
+        printf 'REALITY_SNI="%s"\n' "$use_sni"
+        printf 'REALITY_DEST="%s"\n' "$use_dest"
         printf 'REALITY_FLOW="%s"\n' "$REALITY_FLOW"
         printf 'SHADOWTLS_PASSWORD="%s"\n' "$stls_pass"
         printf 'PORT_VLESS_REALITY="%s"\n' "$PORT_VLESS_REALITY"
@@ -834,7 +1004,7 @@ ensure_reality_stls_inbounds() {
     if ! jq -e '.inbounds[]|select(.tag=="vless-reality")' "$cfg" >/dev/null 2>&1; then
         json_edit "$cfg" "$CFG_LOCK" \
           --arg uuid "$uuid_vless" --arg priv "$priv" --arg sid "$sid" \
-          --arg dest "$REALITY_DEST" --arg sni "$REALITY_SNI" --arg flow "$REALITY_FLOW" \
+          --arg dest "$use_dest" --arg sni "$use_sni" --arg flow "$REALITY_FLOW" \
           --argjson port "$PORT_VLESS_REALITY" '
           .inbounds += [{
             tag:"vless-reality", listen:"0.0.0.0", port:$port, protocol:"vless",
@@ -846,8 +1016,25 @@ ensure_reality_stls_inbounds() {
                 serverNames:[$sni], privateKey:$priv, shortIds:["", $sid]
               }
             },
-            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true }
           }]' && log_success "  vless-reality inbound added (port ${PORT_VLESS_REALITY})."
+    else
+        # Keep listen/port/keys; force working dest + ensure default SNI present.
+        json_edit "$cfg" "$CFG_LOCK" \
+          --arg dest "$use_dest" --arg sni "$use_sni" --arg priv "$priv" --arg sid "$sid" '
+          .inbounds |= map(
+            if .tag=="vless-reality" then
+              .listen="0.0.0.0"
+              | .streamSettings.security="reality"
+              | .streamSettings.network="tcp"
+              | .streamSettings.realitySettings.dest=$dest
+              | .streamSettings.realitySettings.privateKey=$priv
+              | .streamSettings.realitySettings.shortIds=(["", $sid] | unique)
+              | .streamSettings.realitySettings.serverNames=
+                  ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
+              | .sniffing={enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}
+            else . end)' \
+          && log_success "  vless-reality inbound hardened (dest/SNI/keys/listen)."
     fi
 
     if ! jq -e '.inbounds[]|select(.tag=="vless-stls")' "$cfg" >/dev/null 2>&1; then
@@ -857,9 +1044,12 @@ ensure_reality_stls_inbounds() {
             tag:"vless-stls", listen:"127.0.0.1", port:$port, protocol:"vless",
             settings:{ clients:[{id:$uuid, flow:"", email:"admin_vless"}], decryption:"none" },
             streamSettings:{ network:"tcp", security:"none" },
-            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true }
           }]' && log_success "  vless-stls backend inbound added (127.0.0.1:${PORT_VLESS_STLS})."
     fi
+
+    repair_reality_stls_clients "$cfg"
+    repair_reality_pubkey "$cfg"
 }
 
 install_xray() {
@@ -1548,7 +1738,7 @@ CSV_LOCK="/run/lock/autoscriptx-csv.lock"
 CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 PORT_VLESS_REALITY=8443
 PORT_SHADOWTLS=8444
-REALITY_SNI="www.iwanttfc.com"
+REALITY_SNI="www.microsoft.com"
 REALITY_FLOW="xtls-rprx-vision"
 CREDS_ENV="${XRAY_DIR}/credentials.env"
 
@@ -1560,7 +1750,7 @@ _load_asx_cred() {
 }
 _asx_reality_pbk()  { _load_asx_cred REALITY_PUBLIC_KEY; }
 _asx_reality_sid()  { _load_asx_cred REALITY_SHORT_ID; }
-_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.iwanttfc.com}"; }
+_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.microsoft.com}"; }
 _asx_stls_pass()    { _load_asx_cred SHADOWTLS_PASSWORD; }
 _asx_port_reality() { local v; v="$(_load_asx_cred PORT_VLESS_REALITY)"; printf '%s' "${v:-$PORT_VLESS_REALITY}"; }
 _asx_port_stls()    { local v; v="$(_load_asx_cred PORT_SHADOWTLS)"; printf '%s' "${v:-$PORT_SHADOWTLS}"; }
@@ -1876,6 +2066,7 @@ create_account() {
         echo -e "${red}  User '$u_name' already exists.${nc}"; ui_pause; return
     fi
     repair_xhttp_clients
+    repair_reality_stls_clients "$XRAY_CONF" 2>/dev/null || true
 
     local u_exp u_exp_fmt u_uuid u_trojan
     u_exp="$(date -d "+${days} days" +%Y-%m-%d)"
@@ -2680,6 +2871,7 @@ reality_config_menu() {
         ui_line "${g2}4${nc}${g0})${nc} ${gw}Remove test SNI from server${nc}"
         ui_line "${g2}5${nc}${g0})${nc} ${gw}Change Reality dest + default SNI${nc}"
         ui_line "${g2}6${nc}${g0})${nc} ${gw}Show raw Reality inbound JSON${nc}"
+        ui_line "${g2}7${nc}${g0})${nc} ${gw}Diagnose + auto-repair${nc}"
         ui_line "${gr}0${nc}${g0})${nc} ${gw}Back${nc}"
         ui_bot
         local c; ui_prompt "select" c
@@ -2742,6 +2934,114 @@ reality_config_menu() {
                 clear
                 jq '.inbounds[]|select(.tag=="vless-reality")' "$XRAY_CONF" 2>/dev/null \
                     || echo "(vless-reality inbound not found)"
+                ui_pause
+                ;;
+            7)
+                clear
+                echo -e "${blue}== Reality diagnostics ==${nc}"
+                echo ""
+                systemctl is-active --quiet xray && echo -e "  xray: ${green}active${nc}" || echo -e "  xray: ${red}inactive${nc}"
+                ss -lntup 2>/dev/null | grep -E ':8443\b' || echo -e "  ${red}NOT listening on 8443${nc}"
+                echo ""
+                echo "  Public IP : $(get_public_ip)"
+                echo "  pbk       : $(_asx_reality_pbk)"
+                echo "  sid       : $(_asx_reality_sid)"
+                echo "  sni       : $(_asx_reality_sni)"
+                echo "  dest      : $(_reality_dest_current)"
+                echo "  serverNames:"
+                _reality_server_names | sed 's/^/    - /'
+                echo ""
+                echo "  Reality clients (email / flow / id):"
+                jq -r '.inbounds[]|select(.tag=="vless-reality")|.settings.clients[]?|"    - \(.email // "?")  flow=\(.flow // "")  id=\(.id)"' \
+                    "$XRAY_CONF" 2>/dev/null || echo "    (none)"
+                echo ""
+                local d; d="$(_reality_dest_current)"
+                if [[ -n "$d" ]] && command -v timeout >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+                    if timeout 5 openssl s_client -connect "$d" -servername "${d%%:*}" </dev/null >/dev/null 2>&1; then
+                        echo -e "  dest TLS  : ${green}OK${nc} ($d)"
+                    else
+                        echo -e "  dest TLS  : ${red}FAIL${nc} ($d) — will auto-fix to microsoft.com if you confirm"
+                    fi
+                fi
+                echo ""
+                echo "  Recent xray log (reality/invalid):"
+                journalctl -u xray -n 50 --no-pager 2>/dev/null | grep -iE 'reality|invalid|8443|failed' | tail -15 \
+                    || tail -20 /var/log/xray/error.log 2>/dev/null || echo "    (no log hits)"
+                echo ""
+                read -rp "  Run auto-repair now? [y/N]: " fix
+                if [[ "$fix" =~ ^[Yy]$ ]]; then
+                    # 1) Sync all vless-ws users onto Reality (vision) + STLS
+                    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg rflow "xtls-rprx-vision" '
+                      (first(.inbounds[]|select(.tag=="vless-ws")|.settings.clients)//[]) as $src |
+                      ($src|map({id:.id,email:(.email//.id),flow:$rflow})) as $rc |
+                      ($src|map({id:.id,email:(.email//.id),flow:""})) as $sc |
+                      .inbounds |= map(
+                        if .tag=="vless-reality" and ($rc|length)>0 then
+                          .settings.clients=$rc
+                          | .listen="0.0.0.0"
+                          | .sniffing={enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}
+                        elif .tag=="vless-stls" and ($sc|length)>0 then .settings.clients=$sc
+                        else . end)'
+                    echo -e "  ${green}Clients synced from vless-ws → vless-reality (flow=vision)${nc}"
+
+                    # 2) Refresh pbk from privateKey (never use Hash32)
+                    local pr pb sid
+                    pr="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.privateKey//empty' "$XRAY_CONF")"
+                    sid="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.shortIds[1]//.streamSettings.realitySettings.shortIds[0]//empty' "$XRAY_CONF")"
+                    pb="$("$XRAY_BIN" x25519 -i "$pr" 2>/dev/null | awk -F: 'tolower($1) ~ /password|public/ {sub(/^[^:]*:[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}')"
+                    [[ -z "$pb" ]] && pb="$("$XRAY_BIN" x25519 -i "$pr" 2>/dev/null | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -1)"
+                    if [[ -n "$pb" ]]; then
+                        grep -q '^REALITY_PUBLIC_KEY=' "$CREDS_ENV" 2>/dev/null \
+                            && sed -i "s|^REALITY_PUBLIC_KEY=.*|REALITY_PUBLIC_KEY=\"${pb}\"|" "$CREDS_ENV" \
+                            || printf 'REALITY_PUBLIC_KEY="%s"\n' "$pb" >> "$CREDS_ENV"
+                        grep -q '^REALITY_PRIVATE_KEY=' "$CREDS_ENV" 2>/dev/null \
+                            && sed -i "s|^REALITY_PRIVATE_KEY=.*|REALITY_PRIVATE_KEY=\"${pr}\"|" "$CREDS_ENV" \
+                            || printf 'REALITY_PRIVATE_KEY="%s"\n' "$pr" >> "$CREDS_ENV"
+                        [[ -n "$sid" ]] && {
+                            grep -q '^REALITY_SHORT_ID=' "$CREDS_ENV" 2>/dev/null \
+                                && sed -i "s|^REALITY_SHORT_ID=.*|REALITY_SHORT_ID=\"${sid}\"|" "$CREDS_ENV" \
+                                || printf 'REALITY_SHORT_ID="%s"\n' "$sid" >> "$CREDS_ENV"
+                        }
+                        chmod 600 "$CREDS_ENV"
+                        echo -e "  ${green}pbk refreshed: ${pb}${nc}"
+                    else
+                        echo -e "  ${yellow}Could not derive pbk (check xray x25519 -i)${nc}"
+                    fi
+
+                    # 3) If dest TLS fails, switch to www.microsoft.com:443
+                    local dest host
+                    dest="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.dest//empty' "$XRAY_CONF")"
+                    host="${dest%%:*}"
+                    if [[ -z "$dest" ]] || ! timeout 5 openssl s_client -connect "$dest" -servername "$host" </dev/null >/dev/null 2>&1; then
+                        json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "www.microsoft.com:443" --arg sni "www.microsoft.com" --arg sid "${sid}" '
+                          .inbounds |= map(if .tag=="vless-reality" then
+                            .streamSettings.realitySettings.dest=$dest
+                            | .streamSettings.realitySettings.serverNames=
+                                ((.streamSettings.realitySettings.serverNames//[]) + [$sni] | unique)
+                            | .streamSettings.realitySettings.shortIds=(["", $sid] | unique)
+                          else . end)'
+                        sed -i 's|^REALITY_DEST=.*|REALITY_DEST="www.microsoft.com:443"|' "$CREDS_ENV" 2>/dev/null || true
+                        sed -i 's|^REALITY_SNI=.*|REALITY_SNI="www.microsoft.com"|' "$CREDS_ENV" 2>/dev/null || true
+                        grep -q '^REALITY_DEST=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_DEST="www.microsoft.com:443"' >> "$CREDS_ENV"
+                        grep -q '^REALITY_SNI=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_SNI="www.microsoft.com"' >> "$CREDS_ENV"
+                        chmod 600 "$CREDS_ENV"
+                        echo -e "  ${green}Dest switched to www.microsoft.com:443 (client SNI must match)${nc}"
+                    else
+                        echo -e "  ${green}Dest TLS OK: ${dest}${nc}"
+                    fi
+
+                    # 4) Validate + restart
+                    if jq empty "$XRAY_CONF" && "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
+                        systemctl restart xray >/dev/null 2>&1 || true
+                        echo -e "  ${green}xray config OK and restarted${nc}"
+                    else
+                        echo -e "  ${red}xray config test failed — check journalctl -u xray${nc}"
+                        "$XRAY_BIN" run -test -config "$XRAY_CONF" 2>&1 | tail -20
+                    fi
+                    echo ""
+                    echo -e "  ${g0}Next: menu → r → 1 and generate a fresh link (use new SNI + pbk).${nc}"
+                    echo -e "  ${g0}Client server= must be public IP $(get_public_ip), port 8443, flow=xtls-rprx-vision.${nc}"
+                fi
                 ui_pause
                 ;;
             0) return ;;
