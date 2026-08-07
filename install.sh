@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
-# Version : 4.3.0-hardened (xHTTP + WS, integrity-checked, injection-safe)
+# Version : 4.4.0-hardened (xHTTP + WS + VLESS Reality + ShadowTLS)
 # Trust model (option B / split):
 #   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
 #   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
@@ -71,6 +71,16 @@ readonly PORT_TROJAN_WS=10003
 readonly PORT_VLESS_XHTTP=10004
 readonly PORT_VMESS_XHTTP=10005
 readonly PORT_XRAY_API=10085
+# VLESS Reality (public TCP) + ShadowTLS front + local VLESS backend
+readonly PORT_VLESS_REALITY=8443
+readonly PORT_SHADOWTLS=8444
+readonly PORT_VLESS_STLS=10007
+readonly SHADOWTLS_BIN="/usr/local/bin/shadow-tls"
+readonly SHADOWTLS_ENV="${XRAY_DIR}/shadowtls.env"
+# Primary camouflage / SNI destination for Reality + ShadowTLS handshakes
+readonly REALITY_SNI="www.iwantffc.com"
+readonly REALITY_DEST="www.iwantffc.com:443"
+readonly REALITY_FLOW="xtls-rprx-vision"
 # BitTorrent / DHT / public tracker port ranges (multiport limit: 15 slots)
 readonly AT_PORTS="6881:6999,51413,6969,2710,1337"
 
@@ -560,6 +570,228 @@ setup_ssl_cert() {
     log_success "SSL cert installed (issued by ${iss:-CA})."
 }
 
+
+# ---------------------------------------------------------------------------
+# Reality key material + ShadowTLS binary/service helpers
+# ---------------------------------------------------------------------------
+# Parse `xray x25519` across historical output formats.
+_parse_x25519() {
+    local raw priv pub line k v
+    priv=""; pub=""
+    raw="$1"
+    while IFS= read -r line; do
+        line="${line//$\r/}"
+        [[ -z "$line" ]] && continue
+        k="$(printf '%s' "$line" | awk -F: '{print tolower($1)}' | sed 's/[[:space:]]//g')"
+        v="$(printf '%s' "$line" | sed 's/^[^:]*:[[:space:]]*//')"
+        case "$k" in
+            privatekey|private) priv="$v" ;;
+            publickey|public|password) pub="$v" ;;
+        esac
+    done <<< "$raw"
+    if [[ -z "$priv" || -z "$pub" ]]; then
+        mapfile -t _keys < <(printf '%s\n' "$raw" | grep -Eo '[A-Za-z0-9_\-]{40,60}' | head -2)
+        [[ -z "$priv" && ${#_keys[@]} -ge 1 ]] && priv="${_keys[0]}"
+        [[ -z "$pub"  && ${#_keys[@]} -ge 2 ]] && pub="${_keys[1]}"
+    fi
+    [[ -n "$priv" && -n "$pub" ]] || return 1
+    printf '%s\n%s\n' "$priv" "$pub"
+}
+
+generate_reality_keys() {
+    local out priv pub sid
+    command -v "$XRAY_BIN" >/dev/null 2>&1 || die "xray binary missing; install_xray first."
+    out="$("$XRAY_BIN" x25519 2>/dev/null)" || die "xray x25519 failed."
+    mapfile -t _pair < <(_parse_x25519 "$out") || die "Could not parse xray x25519 output."
+    priv="${_pair[0]:-}"; pub="${_pair[1]:-}"
+    [[ -n "$priv" && -n "$pub" ]] || die "Empty Reality key material."
+    sid="$(openssl rand -hex 8)"
+    REALITY_PRIVATE_KEY="$priv"
+    REALITY_PUBLIC_KEY="$pub"
+    REALITY_SHORT_ID="$sid"
+}
+
+_shadowtls_asset_name() {
+    case "$(uname -m)" in
+        x86_64)  printf '%s' "shadow-tls-x86_64-unknown-linux-musl" ;;
+        aarch64) printf '%s' "shadow-tls-aarch64-unknown-linux-musl" ;;
+        armv7l)  printf '%s' "shadow-tls-armv7-unknown-linux-musleabihf" ;;
+        *)       die "Unsupported arch for ShadowTLS: $(uname -m)" ;;
+    esac
+}
+
+install_shadowtls() {
+    log_info "Installing ShadowTLS..."
+    local asset tag url tmp
+    asset="$(_shadowtls_asset_name)"
+    tag="$(curl -fsSL -H "User-Agent: ${UA}" --max-time 10 \
+        "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" \
+        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    [[ -n "$tag" ]] || tag="v0.2.25"
+    url="https://github.com/ihciah/shadow-tls/releases/download/${tag}/${asset}"
+    tmp="$(mktemp)"
+    if ! fetch "$url" "$tmp"; then
+        rm -f "$tmp"
+        die "Failed to download ShadowTLS from ${url}."
+    fi
+    # Optional integrity when the key is present in SHA256SUMS.
+    verify_file "$tmp" "$asset" || true
+    install -m 0755 "$tmp" "$SHADOWTLS_BIN"
+    rm -f "$tmp"
+    log_success "ShadowTLS ${tag} installed -> ${SHADOWTLS_BIN}."
+}
+
+configure_shadowtls() {
+    log_info "Configuring ShadowTLS service..."
+    local stls_pass
+    if [[ -f "${XRAY_DIR}/credentials.env" ]]; then
+        stls_pass="$(awk -F= '/^SHADOWTLS_PASSWORD=/{gsub(/"/,"",$2); print $2; exit}' \
+            "${XRAY_DIR}/credentials.env" 2>/dev/null || true)"
+    fi
+    if [[ -z "${stls_pass:-}" ]]; then
+        stls_pass="$(openssl rand -hex 16)"
+        if [[ -f "${XRAY_DIR}/credentials.env" ]]; then
+            if grep -q '^SHADOWTLS_PASSWORD=' "${XRAY_DIR}/credentials.env" 2>/dev/null; then
+                sed -i "s|^SHADOWTLS_PASSWORD=.*|SHADOWTLS_PASSWORD=\"${stls_pass}\"|" \
+                    "${XRAY_DIR}/credentials.env"
+            else
+                printf 'SHADOWTLS_PASSWORD="%s"\n' "$stls_pass" >> "${XRAY_DIR}/credentials.env"
+            fi
+            chmod 600 "${XRAY_DIR}/credentials.env"
+        fi
+    fi
+
+    umask 077
+    cat > "$SHADOWTLS_ENV" <<EOF
+SHADOWTLS_PASSWORD=${stls_pass}
+SHADOWTLS_LISTEN=0.0.0.0:${PORT_SHADOWTLS}
+SHADOWTLS_BACKEND=127.0.0.1:${PORT_VLESS_STLS}
+SHADOWTLS_TLS=${REALITY_SNI}
+EOF
+    chmod 600 "$SHADOWTLS_ENV"
+
+    # Thin wrapper: password stays in 0600 env file, not baked into the unit argv template.
+    cat > /usr/local/bin/shadow-tls-run <<'WRAP'
+#!/usr/bin/env bash
+set -euo pipefail
+ENV_FILE="/usr/local/etc/xray/shadowtls.env"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+exec /usr/local/bin/shadow-tls --v3 server \
+    --listen "${SHADOWTLS_LISTEN}" \
+    --server "${SHADOWTLS_BACKEND}" \
+    --tls "${SHADOWTLS_TLS}" \
+    --password "${SHADOWTLS_PASSWORD}"
+WRAP
+    chmod 0755 /usr/local/bin/shadow-tls-run
+
+    cat > /etc/systemd/system/shadow-tls.service <<'SERVICE'
+[Unit]
+Description=ShadowTLS stealth handshake wrapper (AutoScriptX)
+Documentation=https://github.com/ihciah/shadow-tls
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/shadow-tls-run
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable shadow-tls >/dev/null 2>&1 || true
+    systemctl restart shadow-tls >/dev/null 2>&1 \
+        || log_warning "ShadowTLS restart failed (check journalctl -u shadow-tls)."
+    log_success "ShadowTLS configured (listen ${PORT_SHADOWTLS} -> 127.0.0.1:${PORT_VLESS_STLS}, SNI ${REALITY_SNI})."
+}
+
+# Idempotent migration: ensure Reality + STLS backend inbounds exist on upgrades.
+ensure_reality_stls_inbounds() {
+    local cfg="${1:-${XRAY_DIR}/config.json}"
+    local creds="${XRAY_DIR}/credentials.env"
+    local priv pub sid stls_pass uuid_vless
+    [[ -f "$cfg" ]] || return 0
+
+    uuid_vless="$(jq -r '.inbounds[]|select(.tag=="vless-ws")|.settings.clients[0].id // empty' "$cfg" 2>/dev/null || true)"
+    [[ -n "$uuid_vless" ]] || uuid_vless="$(cat /proc/sys/kernel/random/uuid)"
+
+    priv=""; pub=""; sid=""; stls_pass=""
+    if [[ -f "$creds" ]]; then
+        priv="$(awk -F= '/^REALITY_PRIVATE_KEY=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        pub="$(awk -F=  '/^REALITY_PUBLIC_KEY=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        sid="$(awk -F=  '/^REALITY_SHORT_ID=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+        stls_pass="$(awk -F= '/^SHADOWTLS_PASSWORD=/{gsub(/"/,"",$2); print $2; exit}' "$creds" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${priv}" || -z "${pub}" || -z "${sid}" ]]; then
+        generate_reality_keys
+        priv="$REALITY_PRIVATE_KEY"; pub="$REALITY_PUBLIC_KEY"; sid="$REALITY_SHORT_ID"
+    fi
+    [[ -n "${stls_pass}" ]] || stls_pass="$(openssl rand -hex 16)"
+
+    umask 077
+    local tmpc; tmpc="$(mktemp "${XRAY_DIR}/.creds.XXXXXX")"
+    if [[ -f "$creds" ]]; then
+        grep -Ev '^(REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|REALITY_SNI|REALITY_DEST|REALITY_FLOW|SHADOWTLS_PASSWORD|PORT_VLESS_REALITY|PORT_SHADOWTLS)=' \
+            "$creds" > "$tmpc" || true
+    else
+        : > "$tmpc"
+    fi
+    {
+        printf 'REALITY_PRIVATE_KEY="%s"\n' "$priv"
+        printf 'REALITY_PUBLIC_KEY="%s"\n' "$pub"
+        printf 'REALITY_SHORT_ID="%s"\n' "$sid"
+        printf 'REALITY_SNI="%s"\n' "$REALITY_SNI"
+        printf 'REALITY_DEST="%s"\n' "$REALITY_DEST"
+        printf 'REALITY_FLOW="%s"\n' "$REALITY_FLOW"
+        printf 'SHADOWTLS_PASSWORD="%s"\n' "$stls_pass"
+        printf 'PORT_VLESS_REALITY="%s"\n' "$PORT_VLESS_REALITY"
+        printf 'PORT_SHADOWTLS="%s"\n' "$PORT_SHADOWTLS"
+    } >> "$tmpc"
+    mv -f "$tmpc" "$creds"
+    chmod 600 "$creds"
+
+    if ! jq -e '.inbounds[]|select(.tag=="vless-reality")' "$cfg" >/dev/null 2>&1; then
+        json_edit "$cfg" "$CFG_LOCK" \
+          --arg uuid "$uuid_vless" --arg priv "$priv" --arg sid "$sid" \
+          --arg dest "$REALITY_DEST" --arg sni "$REALITY_SNI" --arg flow "$REALITY_FLOW" \
+          --argjson port "$PORT_VLESS_REALITY" '
+          .inbounds += [{
+            tag:"vless-reality", listen:"0.0.0.0", port:$port, protocol:"vless",
+            settings:{ clients:[{id:$uuid, flow:$flow, email:"admin_vless"}], decryption:"none" },
+            streamSettings:{
+              network:"tcp", security:"reality",
+              realitySettings:{
+                show:false, dest:$dest, xver:0,
+                serverNames:[$sni], privateKey:$priv, shortIds:["", $sid]
+              }
+            },
+            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+          }]' && log_success "  vless-reality inbound added (port ${PORT_VLESS_REALITY})."
+    fi
+
+    if ! jq -e '.inbounds[]|select(.tag=="vless-stls")' "$cfg" >/dev/null 2>&1; then
+        json_edit "$cfg" "$CFG_LOCK" \
+          --arg uuid "$uuid_vless" --argjson port "$PORT_VLESS_STLS" '
+          .inbounds += [{
+            tag:"vless-stls", listen:"127.0.0.1", port:$port, protocol:"vless",
+            settings:{ clients:[{id:$uuid, flow:"", email:"admin_vless"}], decryption:"none" },
+            streamSettings:{ network:"tcp", security:"none" },
+            sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+          }]' && log_success "  vless-stls backend inbound added (127.0.0.1:${PORT_VLESS_STLS})."
+    fi
+}
+
 install_xray() {
     log_info "Installing Xray-core..."
     local latest_tag arch tmp_dir
@@ -585,17 +817,31 @@ install_xray() {
 }
 
 configure_xray() {
-    log_info "Configuring Xray-core..."
-    local uuid_vless uuid_vmess trojan_pass
+    log_info "Configuring Xray-core (WS + xHTTP + Reality + ShadowTLS backend)..."
+    local uuid_vless uuid_vmess trojan_pass stls_pass
     uuid_vless="$(cat /proc/sys/kernel/random/uuid)"
     uuid_vmess="$(cat /proc/sys/kernel/random/uuid)"
     trojan_pass="$(openssl rand -hex 20)"
+    stls_pass="$(openssl rand -hex 16)"
+
+    generate_reality_keys
 
     umask 077
-    jq -n --arg v "$uuid_vless" --arg m "$uuid_vmess" --arg t "$trojan_pass" --arg d "$domain" \
-        '{VLESS_UUID:$v,VMESS_UUID:$m,TROJAN_PASS:$t,DOMAIN:$d}
-         | to_entries | map("\(.key)=\"\(.value)\"") | .[]' -r \
-        | atomic_write "${XRAY_DIR}/credentials.env"
+    {
+        printf 'VLESS_UUID="%s"\n' "$uuid_vless"
+        printf 'VMESS_UUID="%s"\n' "$uuid_vmess"
+        printf 'TROJAN_PASS="%s"\n' "$trojan_pass"
+        printf 'DOMAIN="%s"\n' "$domain"
+        printf 'REALITY_PRIVATE_KEY="%s"\n' "$REALITY_PRIVATE_KEY"
+        printf 'REALITY_PUBLIC_KEY="%s"\n' "$REALITY_PUBLIC_KEY"
+        printf 'REALITY_SHORT_ID="%s"\n' "$REALITY_SHORT_ID"
+        printf 'REALITY_SNI="%s"\n' "$REALITY_SNI"
+        printf 'REALITY_DEST="%s"\n' "$REALITY_DEST"
+        printf 'REALITY_FLOW="%s"\n' "$REALITY_FLOW"
+        printf 'SHADOWTLS_PASSWORD="%s"\n' "$stls_pass"
+        printf 'PORT_VLESS_REALITY="%s"\n' "$PORT_VLESS_REALITY"
+        printf 'PORT_SHADOWTLS="%s"\n' "$PORT_SHADOWTLS"
+    } | atomic_write "${XRAY_DIR}/credentials.env"
     printf 'Username,SSHPassword,XrayUUID,TrojanPassword,ExpiryDate,LimitGB,UsedBytes\n' \
         | atomic_write "$CSV_DB"
     chmod 600 "${XRAY_DIR}/credentials.env" "$CSV_DB"
@@ -603,10 +849,13 @@ configure_xray() {
     jq -n \
       --arg vless "$uuid_vless" --arg vmess "$uuid_vmess" --arg trojan "$trojan_pass" \
       --arg domain "$domain" \
+      --arg rpriv "$REALITY_PRIVATE_KEY" --arg rsid "$REALITY_SHORT_ID" \
+      --arg rdest "$REALITY_DEST" --arg rsni "$REALITY_SNI" --arg rflow "$REALITY_FLOW" \
       --argjson p_api  "$PORT_XRAY_API" \
       --argjson p_vw   "$PORT_VLESS_WS"    --argjson p_mw "$PORT_VMESS_WS" \
       --argjson p_tw   "$PORT_TROJAN_WS" \
-      --argjson p_vx   "$PORT_VLESS_XHTTP"  --argjson p_mx "$PORT_VMESS_XHTTP" '
+      --argjson p_vx   "$PORT_VLESS_XHTTP"  --argjson p_mx "$PORT_VMESS_XHTTP" \
+      --argjson p_vr   "$PORT_VLESS_REALITY" --argjson p_st "$PORT_VLESS_STLS" '
     {
       log: { loglevel:"warning", access:"/var/log/xray/access.log", error:"/var/log/xray/error.log" },
       stats: {},
@@ -636,7 +885,23 @@ configure_xray() {
           streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vless-xhttp", host:$domain } } },
         { tag:"vmess-xhttp", listen:"127.0.0.1", port:$p_mx, protocol:"vmess",
           settings:{ clients:[{id:$vmess,alterId:0,email:"admin_vmess"}] },
-          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } } }
+          streamSettings:{ network:"xhttp", xhttpSettings:{ path:"/vmess-xhttp", host:$domain } } },
+        { tag:"vless-reality", listen:"0.0.0.0", port:$p_vr, protocol:"vless",
+          settings:{ clients:[{id:$vless,flow:$rflow,email:"admin_vless"}], decryption:"none" },
+          streamSettings:{
+            network:"tcp", security:"reality",
+            realitySettings:{
+              show:false, dest:$rdest, xver:0,
+              serverNames:[$rsni], privateKey:$rpriv, shortIds:["", $rsid]
+            }
+          },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+        },
+        { tag:"vless-stls", listen:"127.0.0.1", port:$p_st, protocol:"vless",
+          settings:{ clients:[{id:$vless,flow:"",email:"admin_vless"}], decryption:"none" },
+          streamSettings:{ network:"tcp", security:"none" },
+          sniffing:{ enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:false }
+        }
       ],
       outbounds: [ { tag:"direct", protocol:"freedom" }, { tag:"blocked", protocol:"blackhole" } ]
     }' | atomic_write "${XRAY_DIR}/config.json"
@@ -665,7 +930,8 @@ SERVICE
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable xray   >/dev/null 2>&1 || true
     systemctl restart xray  >/dev/null 2>&1 || log_warning "Xray restart failed."
-    log_success "Xray-core configured (WS + xHTTP inbounds active)."
+    log_success "Xray-core configured (WS + xHTTP + Reality :${PORT_VLESS_REALITY} + STLS backend :${PORT_VLESS_STLS})."
+    log_info "Reality pbk=${REALITY_PUBLIC_KEY} sid=${REALITY_SHORT_ID} sni=${REALITY_SNI}"
 }
 
 _write_xray_locations() {
@@ -1023,7 +1289,7 @@ apply_firewall_rules() {
     _at_cleanup_legacy
 
     local port
-    for port in 22 80 443 8080; do
+    for port in 22 80 443 8080 "$PORT_VLESS_REALITY" "$PORT_SHADOWTLS"; do
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
             || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
             || log_warning "Could not open tcp/${port}."
@@ -1055,6 +1321,7 @@ update_script() {
     load_manifest
     local -a PROTECTED=(
         "${XRAY_DIR}/users.csv" "${XRAY_DIR}/config.json" "${XRAY_DIR}/credentials.env"
+        "${XRAY_DIR}/shadowtls.env"
         "${ASX_DIR}/cert.crt" "${ASX_DIR}/cert.key" "${ASX_DIR}/domain"
     )
     local snap_dir; snap_dir="$(mktemp -d /root/.asx_snap.XXXXXX)"; chmod 700 "$snap_dir"
@@ -1154,17 +1421,26 @@ update_script() {
         log_success "  config.json migration complete."
     fi
 
+    log_info "Ensuring Reality + ShadowTLS inbounds..."
+    ensure_reality_stls_inbounds "${XRAY_DIR}/config.json"
+
     log_info "Re-applying anti-torrent policy..."
     _migrate_xray_antitorrent "${XRAY_DIR}/config.json"
     apply_firewall_rules
 
-    log_info "Reloading Xray and Nginx..."
+    if [[ ! -x "$SHADOWTLS_BIN" ]]; then
+        install_shadowtls || log_warning "ShadowTLS install skipped/failed."
+    fi
+    configure_shadowtls || log_warning "ShadowTLS reconfigure failed."
+
+    log_info "Reloading Xray, ShadowTLS, and Nginx..."
     systemctl restart xray >/dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
+    systemctl restart shadow-tls >/dev/null 2>&1 && log_success "ShadowTLS restarted." || log_warning "ShadowTLS restart failed."
     if nginx -t >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 && log_success "Nginx reloaded."
     else log_warning "Nginx config test failed — NOT reloaded."; fi
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
-    log_success "Update complete. Version 4.3.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    log_success "Update complete. Version 4.4.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
     ui_pause
 }
 
@@ -1179,9 +1455,28 @@ CSV_DB="/usr/local/etc/xray/users.csv"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_API="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
+XRAY_DIR="/usr/local/etc/xray"
 ASX_DIR="/etc/AutoScriptX"
 CSV_LOCK="/run/lock/autoscriptx-csv.lock"
 CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
+PORT_VLESS_REALITY=8443
+PORT_SHADOWTLS=8444
+REALITY_SNI="www.iwantffc.com"
+REALITY_FLOW="xtls-rprx-vision"
+CREDS_ENV="${XRAY_DIR}/credentials.env"
+
+# Load Reality / ShadowTLS material written by configure_xray (0600).
+_load_asx_cred() {
+    local key="$1" file="${CREDS_ENV}"
+    [[ -f "$file" ]] || { printf ''; return 0; }
+    awk -F= -v k="$key" '$1==k {gsub(/^"|"$/,"",$2); print $2; exit}' "$file" 2>/dev/null || true
+}
+_asx_reality_pbk()  { _load_asx_cred REALITY_PUBLIC_KEY; }
+_asx_reality_sid()  { _load_asx_cred REALITY_SHORT_ID; }
+_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.iwantffc.com}"; }
+_asx_stls_pass()    { _load_asx_cred SHADOWTLS_PASSWORD; }
+_asx_port_reality() { local v; v="$(_load_asx_cred PORT_VLESS_REALITY)"; printf '%s' "${v:-$PORT_VLESS_REALITY}"; }
+_asx_port_stls()    { local v; v="$(_load_asx_cred PORT_SHADOWTLS)"; printf '%s' "${v:-$PORT_SHADOWTLS}"; }
 
 # ---------------------------------------------------------------------------
 # UI render layer. Presentation only - no business logic lives below.
@@ -1339,12 +1634,14 @@ show_header() {
     domain="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
     uptime_str="$(uptime -p 2>/dev/null || echo '?')"
     accounts="$(awk -F',' 'NR>1 && $1 != "" {c++} END{print c+0}' "$CSV_DB" 2>/dev/null || echo 0)"
-    if systemctl is-active --quiet xray 2>/dev/null; then core="on"; else core="off"; fi
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        if systemctl is-active --quiet shadow-tls 2>/dev/null; then core="on"; else core="warn"; fi
+    else core="off"; fi
     if iptables -nL ASX-TORRENT-IN >/dev/null 2>&1; then guard="armed"; else guard="unarmed"; fi
 
     ui_top
     ui_line "${g2}   A U T O S C R I P T X${nc}  ${g0}//${nc}  ${gw}CONTROL CONSOLE${nc}"
-    ui_line "${g0}   secure access gateway ${GL_DOT} v4.3.0-hardened${nc}"
+    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.0-hardened${nc}"
     ui_mid
     ui_kv "NODE"     "$domain"
     ui_kv "XRAY"     "$(_get_xray_ver)"
@@ -1377,11 +1674,18 @@ migrate_csv() {
 
 _add_client_by_tag() {
     local user="$1" uuid="$2" tpw="$3"
-    json_edit "$XRAY_CONF" "$CFG_LOCK" --arg user "$user" --arg uuid "$uuid" --arg tpw "$tpw" '
+    # Reality requires xtls-rprx-vision; all other VLESS tags keep flow empty.
+    # Tag tests are exact-first so vless-reality is never given flow="".
+    json_edit "$XRAY_CONF" "$CFG_LOCK"       --arg user "$user" --arg uuid "$uuid" --arg tpw "$tpw" --arg rflow "xtls-rprx-vision" '
       .inbounds |= map(
-        if   (.tag|test("vless"))  and .settings.clients then .settings.clients += [{id:$uuid,flow:"",email:$user}]
-        elif (.tag|test("vmess"))  and .settings.clients then .settings.clients += [{id:$uuid,alterId:0,email:$user}]
-        elif (.tag|test("trojan")) and .settings.clients then .settings.clients += [{password:$tpw,email:$user}]
+        if   .tag == "vless-reality" and .settings.clients
+          then .settings.clients += [{id:$uuid, flow:$rflow, email:$user}]
+        elif (.tag|test("vless")) and .settings.clients
+          then .settings.clients += [{id:$uuid, flow:"", email:$user}]
+        elif (.tag|test("vmess")) and .settings.clients
+          then .settings.clients += [{id:$uuid, alterId:0, email:$user}]
+        elif (.tag|test("trojan")) and .settings.clients
+          then .settings.clients += [{password:$tpw, email:$user}]
         else . end )'
 }
 repair_xhttp_clients() {
@@ -1468,6 +1772,43 @@ create_account() {
     echo -e "\n${blue}-- Plain xHTTP (80, NO TLS - traffic is cleartext) --${nc}"
     echo "vless://${u_uuid}@${DOMAIN}:80?encryption=none&type=xhttp&path=%2Fvless-xhttp&security=none&host=${DOMAIN}#${u_name}-VLESS-XHTTP"
     echo "vmess://${vx_b64}"
+
+    # --- VLESS Reality (xtls-rprx-vision) + ShadowTLS ---
+    local r_pbk r_sid r_sni r_port st_pass st_port r_host
+    r_pbk="$(_asx_reality_pbk)"
+    r_sid="$(_asx_reality_sid)"
+    r_sni="$(_asx_reality_sni)"
+    r_port="$(_asx_port_reality)"
+    st_pass="$(_asx_stls_pass)"
+    st_port="$(_asx_port_stls)"
+    # Prefer public IP for Reality/STLS direct TCP (SNI is camouflage, not cert host).
+    r_host="${PUBLIC_IP}"
+    [[ -n "$r_host" ]] || r_host="$DOMAIN"
+
+    if [[ -n "$r_pbk" && -n "$r_sid" ]]; then
+        echo -e "\n${blue}-- VLESS Reality (TCP ${r_port}, flow=xtls-rprx-vision, SNI ${r_sni}) --${nc}"
+        echo "vless://${u_uuid}@${r_host}:${r_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${r_sni}&fp=chrome&pbk=${r_pbk}&sid=${r_sid}&type=tcp&headerType=none#${u_name}-VLESS-REALITY"
+        echo -e "  pbk : ${green}${r_pbk}${nc}"
+        echo -e "  sid : ${green}${r_sid}${nc}"
+        echo -e "  dest: ${green}${r_sni}:443${nc}"
+    else
+        echo -e "\n${yellow}-- VLESS Reality: credentials.env missing pbk/sid (re-run configure / update) --${nc}"
+    fi
+
+    if [[ -n "$st_pass" ]]; then
+        echo -e "\n${blue}-- ShadowTLS v3 + VLESS (public ${st_port} -> local Xray TCP) --${nc}"
+        echo -e "  Server   : ${green}${r_host}${nc}"
+        echo -e "  Port     : ${green}${st_port}${nc}"
+        echo -e "  Password : ${green}${st_pass}${nc}"
+        echo -e "  SNI/TLS  : ${green}${r_sni}${nc}"
+        echo -e "  Backend  : VLESS TCP (encryption=none, flow=none)"
+        # Composite share link used by several panels/clients (STLS wrapper + VLESS uuid).
+        echo "shadowtls://v3:${st_pass}@${r_host}:${st_port}?sni=${r_sni}&peer=${r_sni}#${u_name}-ShadowTLS"
+        echo "vless://${u_uuid}@${r_host}:${st_port}?encryption=none&flow=&security=none&type=tcp&headerType=none&sni=${r_sni}#${u_name}-VLESS-via-ShadowTLS"
+        echo -e "  ${g0}Client note: enable ShadowTLS v3 plugin/outbound with password above, then chain VLESS UUID.${nc}"
+    else
+        echo -e "\n${yellow}-- ShadowTLS: password not found in credentials.env --${nc}"
+    fi
     echo ""
     ui_pause
 }
@@ -1599,7 +1940,7 @@ service_status() {
     show_header
     ui_screen "SERVICE MATRIX"
     local svc
-    for svc in xray nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor asx-torrent-watch; do
+    for svc in xray shadow-tls nginx dropbear stunnel4 squid fail2ban ws-proxy xray-limit-monitor asx-torrent-watch; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             ui_line "$(ui_pill on)  ${gw}${svc}${nc}"
         else
@@ -1612,7 +1953,7 @@ restart_services() {
     show_header
     ui_screen "SERVICE RESTART SEQUENCE"
     local svc
-    for svc in xray nginx dropbear stunnel4 squid fail2ban xray-limit-monitor asx-torrent-watch; do
+    for svc in xray shadow-tls nginx dropbear stunnel4 squid fail2ban xray-limit-monitor asx-torrent-watch; do
         if systemctl restart "$svc" >/dev/null 2>&1; then
             ui_line "${g2}[ RESTARTED ]${nc}  ${gw}${svc}${nc}"
         else
@@ -1778,19 +2119,20 @@ full_uninstall() {
     [[ "$c2" == "YES" ]] || { echo -e "${green}Aborted.${nc}"; ui_pause; return 0; }
 
     local svc
-    for svc in xray xray-limit-monitor asx-torrent-watch ws-proxy nginx dropbear stunnel4 squid fail2ban \
+    for svc in xray shadow-tls xray-limit-monitor asx-torrent-watch ws-proxy nginx dropbear stunnel4 squid fail2ban \
                badvpn-udpgw@7200 badvpn-udpgw@7300 netfilter-persistent; do
         systemctl stop "$svc" >/dev/null 2>&1 || true
         systemctl disable "$svc" >/dev/null 2>&1 || true
     done
-    rm -rf /etc/systemd/system/xray.service /etc/systemd/system/xray-limit-monitor.service \
+    rm -rf /etc/systemd/system/xray.service /etc/systemd/system/shadow-tls.service \
+           /etc/systemd/system/xray-limit-monitor.service \
            /etc/systemd/system/ws-proxy.service /etc/systemd/system/badvpn-udpgw@.service \
            /etc/systemd/system/nginx.service.d
     systemctl daemon-reload >/dev/null 2>&1 || true
     apt-get purge -y stunnel4 dropbear squid fail2ban nginx \
         netfilter-persistent iptables-persistent vnstat >/dev/null 2>&1 || true
     apt-get autoremove -y >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/xray /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
+    rm -f /usr/local/bin/xray /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat           /usr/local/bin/shadow-tls /usr/local/bin/shadow-tls-run
     rm -rf /usr/local/etc/xray /var/log/xray /etc/AutoScriptX /home/vps/public_html /root/.acme.sh
     rmdir /home/vps 2>/dev/null || true
     rm -f /etc/nginx/xray-locations.conf /etc/nginx/conf.d/xhttp-port80.conf \
@@ -1823,6 +2165,8 @@ full_uninstall() {
     done
     iptables -D INPUT -p tcp --dport 80  -j ACCEPT >/dev/null 2>&1 || true
     iptables -D INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || true
+    iptables -D INPUT -p tcp --dport 8444 -j ACCEPT >/dev/null 2>&1 || true
     rm -f /etc/iptables.up.rules
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     rm -f /etc/sysctl.d/99-disable-ipv6.conf; sysctl --system >/dev/null 2>&1 || true
@@ -2231,6 +2575,8 @@ main() {
     setup_ssl_cert
     install_xray
     configure_xray
+    install_shadowtls
+    configure_shadowtls
     configure_nginx
     setup_badvpn
     configure_stunnel
@@ -2239,7 +2585,8 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "Installation complete! AutoScriptX v4.3.0-hardened."
+    log_success "Installation complete! AutoScriptX v4.4.0-hardened (Reality + ShadowTLS)."
+    log_success "Reality :${PORT_VLESS_REALITY} (SNI ${REALITY_SNI}) | ShadowTLS :${PORT_SHADOWTLS}"
     log_success "Run 'autoscriptx' or 'asx' to start."
 }
 
