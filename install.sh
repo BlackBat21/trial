@@ -78,8 +78,8 @@ readonly PORT_VLESS_STLS=10007
 readonly SHADOWTLS_BIN="/usr/local/bin/shadow-tls"
 readonly SHADOWTLS_ENV="${XRAY_DIR}/shadowtls.env"
 # Primary camouflage / SNI destination for Reality + ShadowTLS handshakes
-readonly REALITY_SNI="www.iwantffc.com"
-readonly REALITY_DEST="www.iwantffc.com:443"
+readonly REALITY_SNI="www.iwanttfc.com"
+readonly REALITY_DEST="www.iwanttfc.com:443"
 readonly REALITY_FLOW="xtls-rprx-vision"
 # BitTorrent / DHT / public tracker port ranges (multiport limit: 15 slots)
 readonly AT_PORTS="6881:6999,51413,6969,2710,1337"
@@ -223,12 +223,82 @@ verify_release() {
 # ===========================================================================
 # INSTALL STEPS
 # ===========================================================================
+# True public IPv4 of this VPS. Never return RFC1918/link-local/CGNAT as "public".
+is_private_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
+    case "$ip" in
+        10.*|127.*|0.*|255.*) return 0 ;;
+        192.168.*) return 0 ;;
+        169.254.*) return 0 ;;
+        100.64.*|100.65.*|100.66.*|100.67.*|100.68.*|100.69.*|100.7[0-9].*|100.8[0-9].*|100.9[0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 0 ;; # CGNAT 100.64/10 rough
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolve the internet-facing IPv4. Order:
+#   1) cached ${ASX_DIR}/public_ip (if still public)
+#   2) multiple public echo services
+#   3) first non-private address from hostname -I
+#   4) last-resort: first hostname -I entry (logged as warning)
+get_public_ip() {
+    local ip="" cand cached svc
+    local -a services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ipv4.icanhazip.com"
+    )
+
+    if [[ -f "${ASX_DIR}/public_ip" ]]; then
+        cached="$(tr -d '[:space:]' < "${ASX_DIR}/public_ip" 2>/dev/null || true)"
+        if [[ -n "$cached" ]] && ! is_private_ipv4 "$cached"; then
+            printf '%s' "$cached"
+            return 0
+        fi
+    fi
+
+    for svc in "${services[@]}"; do
+        ip="$(curl -4 -fsSL -H "User-Agent: ${UA:-AutoScriptX-Deployment}" --max-time 5 "$svc" 2>/dev/null \
+            | tr -d '[:space:]' || true)"
+        if [[ -n "$ip" ]] && ! is_private_ipv4 "$ip"; then
+            mkdir -p "$ASX_DIR" 2>/dev/null || true
+            printf '%s\n' "$ip" > "${ASX_DIR}/public_ip" 2>/dev/null || true
+            chmod 644 "${ASX_DIR}/public_ip" 2>/dev/null || true
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+
+    # Prefer any non-private interface address before falling back to eth0 private VPC IP.
+    while read -r cand; do
+        cand="$(printf '%s' "$cand" | tr -d '[:space:]')"
+        [[ -z "$cand" ]] && continue
+        if ! is_private_ipv4 "$cand"; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    printf '%s' "${ip}"
+    return 0
+}
+
 setup_hosts() {
     log_info "Setting up hostname and hosts file..."
     localip="$(hostname -I | awk '{print $1}')"
-    public_ip="$(curl -fsSL -H "User-Agent: ${UA}" --max-time 5 https://api.ipify.org \
-        || curl -fsSL -H "User-Agent: ${UA}" --max-time 5 https://ifconfig.me || true)"
-    [[ -n "$public_ip" ]] || public_ip="$localip"
+    public_ip="$(get_public_ip)"
+    if is_private_ipv4 "$public_ip"; then
+        log_warning "Could not detect a public IPv4 (got ${public_ip:-empty}). Reality/STLS links may be wrong until outbound DNS/HTTP works."
+    else
+        log_success "Public IPv4 detected: ${public_ip}"
+    fi
+    mkdir -p "$ASX_DIR"
+    printf '%s\n' "$public_ip" > "${ASX_DIR}/public_ip"
+    chmod 644 "${ASX_DIR}/public_ip"
     hostname_v="$(hostname)"
     if ! grep -qE "[[:space:]]${hostname_v}(\$|[[:space:]])" /etc/hosts; then
         printf '%s %s\n' "$localip" "$hostname_v" >> /etc/hosts
@@ -1433,6 +1503,15 @@ update_script() {
     fi
     configure_shadowtls || log_warning "ShadowTLS reconfigure failed."
 
+    log_info "Refreshing cached public IPv4..."
+    rm -f "${ASX_DIR}/public_ip" 2>/dev/null || true
+    public_ip="$(get_public_ip)"
+    if is_private_ipv4 "$public_ip"; then
+        log_warning "Public IPv4 still looks private (${public_ip:-empty})."
+    else
+        log_success "Public IPv4: ${public_ip}"
+    fi
+
     log_info "Reloading Xray, ShadowTLS, and Nginx..."
     systemctl restart xray >/dev/null 2>&1 && log_success "Xray restarted." || log_warning "Xray restart failed."
     systemctl restart shadow-tls >/dev/null 2>&1 && log_success "ShadowTLS restarted." || log_warning "ShadowTLS restart failed."
@@ -1461,7 +1540,7 @@ CSV_LOCK="/run/lock/autoscriptx-csv.lock"
 CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 PORT_VLESS_REALITY=8443
 PORT_SHADOWTLS=8444
-REALITY_SNI="www.iwantffc.com"
+REALITY_SNI="www.iwanttfc.com"
 REALITY_FLOW="xtls-rprx-vision"
 CREDS_ENV="${XRAY_DIR}/credentials.env"
 
@@ -1473,10 +1552,69 @@ _load_asx_cred() {
 }
 _asx_reality_pbk()  { _load_asx_cred REALITY_PUBLIC_KEY; }
 _asx_reality_sid()  { _load_asx_cred REALITY_SHORT_ID; }
-_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.iwantffc.com}"; }
+_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.iwanttfc.com}"; }
 _asx_stls_pass()    { _load_asx_cred SHADOWTLS_PASSWORD; }
 _asx_port_reality() { local v; v="$(_load_asx_cred PORT_VLESS_REALITY)"; printf '%s' "${v:-$PORT_VLESS_REALITY}"; }
 _asx_port_stls()    { local v; v="$(_load_asx_cred PORT_SHADOWTLS)"; printf '%s' "${v:-$PORT_SHADOWTLS}"; }
+
+# True public IPv4 for share links / account cards. Rejects VPC/private addresses.
+is_private_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
+    case "$ip" in
+        10.*|127.*|0.*|255.*) return 0 ;;
+        192.168.*) return 0 ;;
+        169.254.*) return 0 ;;
+        100.64.*|100.65.*|100.66.*|100.67.*|100.68.*|100.69.*|100.7[0-9].*|100.8[0-9].*|100.9[0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+get_public_ip() {
+    local ip="" cand cached svc
+    local -a services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://checkip.amazonaws.com"
+        "https://ipv4.icanhazip.com"
+    )
+
+    if [[ -f "${ASX_DIR}/public_ip" ]]; then
+        cached="$(tr -d '[:space:]' < "${ASX_DIR}/public_ip" 2>/dev/null || true)"
+        if [[ -n "$cached" ]] && ! is_private_ipv4 "$cached"; then
+            printf '%s' "$cached"
+            return 0
+        fi
+    fi
+
+    for svc in "${services[@]}"; do
+        ip="$(curl -4 -fsSL --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$ip" ]] && ! is_private_ipv4 "$ip"; then
+            mkdir -p "$ASX_DIR" 2>/dev/null || true
+            printf '%s
+' "$ip" > "${ASX_DIR}/public_ip" 2>/dev/null || true
+            chmod 644 "${ASX_DIR}/public_ip" 2>/dev/null || true
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+
+    while read -r cand; do
+        cand="$(printf '%s' "$cand" | tr -d '[:space:]')"
+        [[ -z "$cand" ]] && continue
+        if ! is_private_ipv4 "$cand"; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done < <(hostname -I 2>/dev/null | tr ' ' '
+')
+
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    printf '%s' "${ip}"
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # UI render layer. Presentation only - no business logic lives below.
@@ -1705,7 +1843,8 @@ create_account() {
     show_header
     local DOMAIN PUBLIC_IP
     DOMAIN="$(cat "${ASX_DIR}/domain" 2>/dev/null || echo localhost)"
-    PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+    # Always the VPS internet IP — never the private VPC NIC (e.g. 10.x).
+    PUBLIC_IP="$(get_public_ip)"
     local u_name u_pass days limit_gb
     if command -v gum &>/dev/null; then
         u_name="$(gum input --placeholder username --prompt 'Username: ')"
@@ -1781,9 +1920,17 @@ create_account() {
     r_port="$(_asx_port_reality)"
     st_pass="$(_asx_stls_pass)"
     st_port="$(_asx_port_stls)"
-    # Prefer public IP for Reality/STLS direct TCP (SNI is camouflage, not cert host).
+    # Reality/ShadowTLS must target the server public IP (SNI stays REALITY_SNI).
     r_host="${PUBLIC_IP}"
-    [[ -n "$r_host" ]] || r_host="$DOMAIN"
+    if [[ -z "$r_host" ]] || is_private_ipv4 "$r_host"; then
+        # Last attempt without cache in case the cached file was a private IP.
+        rm -f "${ASX_DIR}/public_ip" 2>/dev/null || true
+        r_host="$(get_public_ip)"
+    fi
+    if [[ -z "$r_host" ]] || is_private_ipv4 "$r_host"; then
+        echo -e "${yellow}WARNING: could not resolve a public server IP (got '${r_host:-empty}').${nc}"
+        echo -e "${yellow}Fix network egress or set ${ASX_DIR}/public_ip manually, then recreate links.${nc}"
+    fi
 
     if [[ -n "$r_pbk" && -n "$r_sid" ]]; then
         echo -e "\n${blue}-- VLESS Reality (TCP ${r_port}, flow=xtls-rprx-vision, SNI ${r_sni}) --${nc}"
@@ -1972,8 +2119,9 @@ system_info() {
     ui_kv "RAM"    "$(free -h|awk '/^Mem/{print $3" used / "$2" total"}')"
     ui_kv "DISK"   "$(df -h /|awk 'NR==2{print $3" used / "$2" ("$5")"}')"
     lip="$(hostname -I|awk '{print $1}')"
-    pip="$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || echo "$lip")"
+    pip="$(get_public_ip)"
     ui_kv "IP"     "$pip"
+    ui_kv "LOCAL"  "$lip"
     ui_kv "DOMAIN" "$(cat "${ASX_DIR}/domain" 2>/dev/null || echo 'not set')"
     ui_kv "UPTIME" "$(uptime -p 2>/dev/null)"
     ui_bot; ui_pause
