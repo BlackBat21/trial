@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AutoScriptX Hybrid — Hardened Release
-# Version : 4.4.0-hardened (xHTTP + WS + VLESS Reality + ShadowTLS)
+# Version : 4.4.1-hardened (xHTTP + WS + VLESS Reality + ShadowTLS, Cloudflare dest, visible handshake logs)
 # Trust model (option B / split):
 #   REPO_RAW  (BlackBat21/trial)  -> install.sh self-update + SHA256SUMS
 #   ASSET_URL (ayanrajpoot10)     -> configs, binaries, helper scripts
@@ -78,11 +78,12 @@ readonly PORT_VLESS_STLS=10007
 readonly SHADOWTLS_BIN="/usr/local/bin/shadow-tls"
 readonly SHADOWTLS_ENV="${XRAY_DIR}/shadowtls.env"
 # Primary camouflage / SNI destination for Reality + ShadowTLS handshakes
-# Reality dest MUST be a real host that speaks TLS 1.3 and is reachable from the VPS.
-# Fake/non-resolving names (or sites without TLS1.3) break every client handshake.
-# Change via menu → r → "Change Reality dest + default SNI".
-readonly REALITY_SNI="www.microsoft.com"
-readonly REALITY_DEST="www.microsoft.com:443"
+# Reality dest MUST be a real TLS 1.3 host reachable from the VPS whose TLS
+# certificate record fits Reality's handshake copy buffer. www.microsoft.com
+# FAILS on 2026-era Xray (oversized OCSP-stapled cert record → handshake reset).
+# www.cloudflare.com is the proven-good default. Change via menu → r → option 5.
+readonly REALITY_SNI="www.cloudflare.com"
+readonly REALITY_DEST="www.cloudflare.com:443"
 readonly REALITY_FLOW="xtls-rprx-vision"
 # BitTorrent / DHT / public tracker port ranges (multiport limit: 15 slots)
 readonly AT_PORTS="6881:6999,51413,6969,2710,1337"
@@ -864,7 +865,7 @@ repair_reality_stls_clients() {
 repair_reality_dest() {
     local cfg="${1:-${XRAY_DIR}/config.json}"
     local creds="${XRAY_DIR}/credentials.env"
-    local dest host fallback="www.microsoft.com:443" fb_host="www.microsoft.com"
+    local dest host fallback="www.cloudflare.com:443" fb_host="www.cloudflare.com"
     [[ -f "$cfg" ]] || return 0
     jq -e '.inbounds[]|select(.tag=="vless-reality")' "$cfg" >/dev/null 2>&1 || return 0
 
@@ -974,9 +975,9 @@ ensure_reality_stls_inbounds() {
         [[ -n "$csni" ]] && use_sni="$csni"
     fi
     if ! _reality_dest_ok "$use_dest"; then
-        log_warning "  Configured Reality dest ${use_dest} is not reachable; using www.microsoft.com:443"
-        use_dest="www.microsoft.com:443"
-        use_sni="www.microsoft.com"
+        log_warning "  Configured Reality dest ${use_dest} is not reachable; using www.cloudflare.com:443"
+        use_dest="www.cloudflare.com:443"
+        use_sni="www.cloudflare.com"
     fi
 
     umask 077
@@ -1012,7 +1013,7 @@ ensure_reality_stls_inbounds() {
             streamSettings:{
               network:"tcp", security:"reality",
               realitySettings:{
-                show:false, dest:$dest, xver:0,
+                show:true, dest:$dest, xver:0,
                 serverNames:[$sni], privateKey:$priv, shortIds:["", $sid]
               }
             },
@@ -1028,13 +1029,15 @@ ensure_reality_stls_inbounds() {
               | .streamSettings.security="reality"
               | .streamSettings.network="tcp"
               | .streamSettings.realitySettings.dest=$dest
+              | .streamSettings.realitySettings.show=true
               | .streamSettings.realitySettings.privateKey=$priv
               | .streamSettings.realitySettings.shortIds=(["", $sid] | unique)
               | .streamSettings.realitySettings.serverNames=
                   ((.streamSettings.realitySettings.serverNames // []) + [$sni] | unique)
               | .sniffing={enabled:true, destOverride:["http","tls","quic"], metadataOnly:false, routeOnly:true}
-            else . end)' \
-          && log_success "  vless-reality inbound hardened (dest/SNI/keys/listen)."
+            else . end)
+          | .log.loglevel="info"' \
+          && log_success "  vless-reality inbound hardened (dest/SNI/keys/listen/logging)."
     fi
 
     if ! jq -e '.inbounds[]|select(.tag=="vless-stls")' "$cfg" >/dev/null 2>&1; then
@@ -1117,7 +1120,7 @@ configure_xray() {
       --argjson p_vx   "$PORT_VLESS_XHTTP"  --argjson p_mx "$PORT_VMESS_XHTTP" \
       --argjson p_vr   "$PORT_VLESS_REALITY" --argjson p_st "$PORT_VLESS_STLS" '
     {
-      log: { loglevel:"warning", access:"/var/log/xray/access.log", error:"/var/log/xray/error.log" },
+      log: { loglevel:"info", access:"/var/log/xray/access.log", error:"/var/log/xray/error.log" },
       stats: {},
       api: { tag:"api", services:["StatsService"] },
       policy: {
@@ -1151,7 +1154,7 @@ configure_xray() {
           streamSettings:{
             network:"tcp", security:"reality",
             realitySettings:{
-              show:false, dest:$rdest, xver:0,
+              show:true, dest:$rdest, xver:0,
               serverNames:[$rsni], privateKey:$rpriv, shortIds:["", $rsid]
             }
           },
@@ -1709,7 +1712,7 @@ update_script() {
     else log_warning "Nginx config test failed — NOT reloaded."; fi
 
     rm -rf "$snap_dir"; [[ -n "$_manifest" ]] && rm -f "$_manifest"
-    log_success "Update complete. Version 4.4.0-hardened. Users/UUIDs/certs/domain UNTOUCHED."
+    log_success "Update complete. Version 4.4.1-hardened. Users/UUIDs/certs/domain UNTOUCHED."
     # ui_pause lives only inside /usr/bin/menu. When --update-only is invoked
     # from the installer (or menu's do_update subprocess), calling it here
     # trips set -e with "command not found" (exit 127) after a successful update.
@@ -1738,7 +1741,7 @@ CSV_LOCK="/run/lock/autoscriptx-csv.lock"
 CFG_LOCK="/run/lock/autoscriptx-cfg.lock"
 PORT_VLESS_REALITY=8443
 PORT_SHADOWTLS=8444
-REALITY_SNI="www.microsoft.com"
+REALITY_SNI="www.cloudflare.com"
 REALITY_FLOW="xtls-rprx-vision"
 CREDS_ENV="${XRAY_DIR}/credentials.env"
 
@@ -1750,7 +1753,7 @@ _load_asx_cred() {
 }
 _asx_reality_pbk()  { _load_asx_cred REALITY_PUBLIC_KEY; }
 _asx_reality_sid()  { _load_asx_cred REALITY_SHORT_ID; }
-_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.microsoft.com}"; }
+_asx_reality_sni()  { local v; v="$(_load_asx_cred REALITY_SNI)"; printf '%s' "${v:-www.cloudflare.com}"; }
 _asx_stls_pass()    { _load_asx_cred SHADOWTLS_PASSWORD; }
 _asx_port_reality() { local v; v="$(_load_asx_cred PORT_VLESS_REALITY)"; printf '%s' "${v:-$PORT_VLESS_REALITY}"; }
 _asx_port_stls()    { local v; v="$(_load_asx_cred PORT_SHADOWTLS)"; printf '%s' "${v:-$PORT_SHADOWTLS}"; }
@@ -1977,7 +1980,7 @@ show_header() {
 
     ui_top
     ui_line "${g2}   A U T O S C R I P T X${nc}  ${g0}//${nc}  ${gw}CONTROL CONSOLE${nc}"
-    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.0-hardened${nc}"
+    ui_line "${g0}   secure access gateway ${GL_DOT} v4.4.1-hardened${nc}"
     ui_mid
     ui_kv "NODE"     "$domain"
     ui_kv "XRAY"     "$(_get_xray_ver)"
@@ -2596,12 +2599,11 @@ _reality_pick_sni() {
     local -a presets=(
         "$def_sni"
         "www.cloudflare.com"
-        "www.microsoft.com"
+        "dl.google.com"
         "www.apple.com"
         "www.samsung.com"
         "www.yahoo.com"
         "www.googletagmanager.com"
-        "dl.google.com"
         "gateway.icloud.com"
         "www.lovelive-anime.jp"
     )
@@ -2960,13 +2962,15 @@ reality_config_menu() {
                     if timeout 5 openssl s_client -connect "$d" -servername "${d%%:*}" </dev/null >/dev/null 2>&1; then
                         echo -e "  dest TLS  : ${green}OK${nc} ($d)"
                     else
-                        echo -e "  dest TLS  : ${red}FAIL${nc} ($d) — will auto-fix to microsoft.com if you confirm"
+                        echo -e "  dest TLS  : ${red}FAIL${nc} ($d) — will auto-fix to cloudflare.com if you confirm"
                     fi
                 fi
                 echo ""
-                echo "  Recent xray log (reality/invalid):"
-                journalctl -u xray -n 50 --no-pager 2>/dev/null | grep -iE 'reality|invalid|8443|failed' | tail -15 \
-                    || tail -20 /var/log/xray/error.log 2>/dev/null || echo "    (no log hits)"
+                echo "  Recent xray log (reality/invalid/handshake):"
+                journalctl -u xray -n 80 --no-pager 2>/dev/null | grep -iE 'reality|invalid|handshake|8443|failed' | tail -15 \
+                    || tail -30 /var/log/xray/error.log 2>/dev/null || echo "    (no log hits)"
+                echo ""
+                echo "  Live watch: journalctl -u xray -f   (then connect once from client)"
                 echo ""
                 read -rp "  Run auto-repair now? [y/N]: " fix
                 if [[ "$fix" =~ ^[Yy]$ ]]; then
@@ -3008,24 +3012,24 @@ reality_config_menu() {
                         echo -e "  ${yellow}Could not derive pbk (check xray x25519 -i)${nc}"
                     fi
 
-                    # 3) If dest TLS fails, switch to www.microsoft.com:443
+                    # 3) If dest TLS fails, switch to www.cloudflare.com:443
                     local dest host
                     dest="$(jq -r '.inbounds[]|select(.tag=="vless-reality")|.streamSettings.realitySettings.dest//empty' "$XRAY_CONF")"
                     host="${dest%%:*}"
                     if [[ -z "$dest" ]] || ! timeout 5 openssl s_client -connect "$dest" -servername "$host" </dev/null >/dev/null 2>&1; then
-                        json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "www.microsoft.com:443" --arg sni "www.microsoft.com" --arg sid "${sid}" '
+                        json_edit "$XRAY_CONF" "$CFG_LOCK" --arg dest "www.cloudflare.com:443" --arg sni "www.cloudflare.com" --arg sid "${sid}" '
                           .inbounds |= map(if .tag=="vless-reality" then
                             .streamSettings.realitySettings.dest=$dest
                             | .streamSettings.realitySettings.serverNames=
                                 ((.streamSettings.realitySettings.serverNames//[]) + [$sni] | unique)
                             | .streamSettings.realitySettings.shortIds=(["", $sid] | unique)
                           else . end)'
-                        sed -i 's|^REALITY_DEST=.*|REALITY_DEST="www.microsoft.com:443"|' "$CREDS_ENV" 2>/dev/null || true
-                        sed -i 's|^REALITY_SNI=.*|REALITY_SNI="www.microsoft.com"|' "$CREDS_ENV" 2>/dev/null || true
-                        grep -q '^REALITY_DEST=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_DEST="www.microsoft.com:443"' >> "$CREDS_ENV"
-                        grep -q '^REALITY_SNI=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_SNI="www.microsoft.com"' >> "$CREDS_ENV"
+                        sed -i 's|^REALITY_DEST=.*|REALITY_DEST="www.cloudflare.com:443"|' "$CREDS_ENV" 2>/dev/null || true
+                        sed -i 's|^REALITY_SNI=.*|REALITY_SNI="www.cloudflare.com"|' "$CREDS_ENV" 2>/dev/null || true
+                        grep -q '^REALITY_DEST=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_DEST="www.cloudflare.com:443"' >> "$CREDS_ENV"
+                        grep -q '^REALITY_SNI=' "$CREDS_ENV" 2>/dev/null || echo 'REALITY_SNI="www.cloudflare.com"' >> "$CREDS_ENV"
                         chmod 600 "$CREDS_ENV"
-                        echo -e "  ${green}Dest switched to www.microsoft.com:443 (client SNI must match)${nc}"
+                        echo -e "  ${green}Dest switched to www.cloudflare.com:443 (client SNI must match)${nc}"
                     else
                         echo -e "  ${green}Dest TLS OK: ${dest}${nc}"
                     fi
@@ -3461,7 +3465,7 @@ main() {
     install_scripts
     setup_cron_jobs
     final_cleanup
-    log_success "Installation complete! AutoScriptX v4.4.0-hardened (Reality + ShadowTLS)."
+    log_success "Installation complete! AutoScriptX v4.4.1-hardened (Reality + ShadowTLS)."
     log_success "Reality :${PORT_VLESS_REALITY} (SNI ${REALITY_SNI}) | ShadowTLS :${PORT_SHADOWTLS}"
     log_success "Run 'autoscriptx' or 'asx' to start."
 }
